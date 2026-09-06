@@ -355,7 +355,109 @@
         if (countEl) countEl.textContent = `${num(total)} matching`;
     }
 
-    /* ── render ── */
+    /* ── update dynamic content only (preserves toolbar & input focus) ── */
+    function updateContent() {
+        const main = document.getElementById('srMain');
+        if (!main) return;
+        // If shell not built yet, do full render
+        if (!main.querySelector('.ict-toolbar')) { render(); return; }
+
+        const s = SR.summary || {};
+        const items = sortedItems();
+        const total = items.length;
+        const pageStart = SR.page * SR.pageSize;
+        const pageRows = items.slice(pageStart, pageStart + SR.pageSize);
+        const totalPages = Math.max(1, Math.ceil(total / SR.pageSize));
+
+        const sevenDaysAgo = Date.now() - 7 * 86400000;
+        const recentAdj = SR.adjustments.filter(a => new Date(a.created_at).getTime() > sevenDaysAgo);
+        const recentIn = recentAdj.filter(a => a.adjustment_type === 'stock_in' || a.adjustment_type === 'bulk_in').reduce((s, a) => s + Math.abs(a.quantity_change), 0);
+        const recentOut = recentAdj.filter(a => a.adjustment_type === 'stock_out' || a.adjustment_type === 'bulk_out').reduce((s, a) => s + Math.abs(a.quantity_change), 0);
+
+        // Update page header
+        const headerP = main.querySelector('.ict-page-head p');
+        if (headerP) headerP.innerHTML = `Manual inventory tracking · ${num(s.total_skus || 0)} SKUs · ${num(s.total_units || 0)} units on hand${recentAdj.length ? ` · ${num(recentIn)} in / ${num(recentOut)} out (7d)` : ''}`;
+
+        // Update stat card values
+        const statVals = main.querySelectorAll('.ict-stat-value');
+        if (statVals.length >= 4) {
+            statVals[0].textContent = num(s.total_skus || 0);
+            statVals[1].textContent = num(s.total_units || 0);
+            statVals[2].textContent = num(s.reorder_needed || 0);
+            statVals[3].textContent = num(s.zero_stock || 0);
+        }
+
+        // Update matching count
+        const countEl = main.querySelector('.ict-toolbar-count');
+        if (countEl) countEl.textContent = `${num(total)} matching`;
+
+        // Update table card
+        const card = main.querySelector('.ict-card-flush');
+        if (card) {
+            card.innerHTML = `
+                <div class="ict-table-wrap">
+                    <table class="ict-table">
+                        <thead><tr>
+                            ${sortTh('Product', 'product_name')}
+                            ${sortTh('Category', 'category')}
+                            ${sortTh('Size', 'size')}
+                            <th>SKU Code</th>
+                            ${sortTh('Stock', 'quantity', 'right')}
+                            ${sortTh('Reorder', 'reorder_level', 'right')}
+                            <th>Status</th>
+                            ${sortTh('Updated', 'updated_at')}
+                        </tr></thead>
+                        <tbody>
+                            ${pageRows.length === 0 ? `<tr><td colspan="8"><div class="ict-empty">No inventory items match these filters.</div></td></tr>` : pageRows.map(i => {
+                                const isZero = i.quantity === 0;
+                                const needsReorder = !isZero && i.quantity <= i.reorder_level;
+                                const status = isZero ? pill('critical', 'ZERO') : needsReorder ? pill('attention', 'REORDER') : pill('healthy', 'OK');
+                                return `<tr class="${isZero ? 'sr-row-zero' : needsReorder ? 'sr-row-reorder' : ''}">
+                                    <td class="sr-product">${esc(i.product_name)}</td>
+                                    <td class="ict-muted">${esc(i.category || '—')}</td>
+                                    <td class="ict-muted">${esc(i.size)}</td>
+                                    <td class="ict-mono ict-muted"><code>${esc(i.sku_key)}</code></td>
+                                    <td class="ict-num ict-strong ${isZero ? 'ict-critical-text' : needsReorder ? 'ict-tone-attention' : ''}">${num(i.quantity)}</td>
+                                    <td class="ict-num ict-muted">${num(i.reorder_level)}</td>
+                                    <td>${status}</td>
+                                    <td class="ict-muted">${i.updated_at ? fmtDate(i.updated_at) : '—'}</td>
+                                </tr>`;
+                            }).join('')}
+                        </tbody>
+                    </table>
+                </div>
+                ${total > SR.pageSize ? `<div class="ict-pagination">
+                    <button class="ict-chip ${SR.page <= 0 ? 'disabled' : ''}" data-sr="page" data-dir="-1" ${SR.page <= 0 ? 'disabled' : ''}>← Prev</button>
+                    <span class="ict-page-info">Page ${SR.page + 1} of ${totalPages}</span>
+                    <button class="ict-chip ${SR.page >= totalPages - 1 ? 'disabled' : ''}" data-sr="page" data-dir="1" ${SR.page >= totalPages - 1 ? 'disabled' : ''}>Next →</button>
+                </div>` : ''}`;
+        }
+
+        // Update adjustments section
+        const adjCard = main.querySelector('.ict-card[style]');
+        if (adjCard) {
+            const adjDesc = adjCard.querySelector('p');
+            if (adjDesc) adjDesc.innerHTML = `Last ${SR.adjustments.length} inventory movements${recentAdj.length ? ` · ${num(recentIn)} IN / ${num(recentOut)} OUT in 7d` : ''}`;
+            const adjBody = adjCard.querySelector('.ict-table-wrap');
+            if (adjBody) adjBody.innerHTML = `<table class="ict-table">
+                <thead><tr><th>Date</th><th>SKU</th><th>Product</th><th>Size</th><th>Type</th><th class="ict-th-right">Change</th><th class="ict-th-right">Before</th><th class="ict-th-right">After</th><th>Reference</th></tr></thead>
+                <tbody>${SR.adjustments.length === 0 ? `<tr><td colspan="9"><div class="ict-empty">No adjustments recorded yet.</div></td></tr>` : SR.adjustments.slice(0, 20).map(a => `
+                    <tr>
+                        <td class="ict-muted">${fmtDateTime(a.created_at)}</td>
+                        <td class="ict-mono ict-muted"><code>${esc(a.sku_key)}</code></td>
+                        <td>${esc(a.product_name)}</td>
+                        <td class="ict-muted">${esc(a.size)}</td>
+                        <td>${pill(a.adjustment_type === 'stock_in' || a.adjustment_type === 'bulk_in' ? 'healthy' : a.adjustment_type === 'stock_out' || a.adjustment_type === 'bulk_out' ? 'critical' : 'info', a.adjustment_type.replace('_', ' '))}</td>
+                        <td class="ict-num ${a.quantity_change >= 0 ? 'ict-healthy-text' : 'ict-critical-text'}" style="font-weight:600">${a.quantity_change >= 0 ? '+' : ''}${num(a.quantity_change)}</td>
+                        <td class="ict-num ict-muted">${num(a.quantity_before)}</td>
+                        <td class="ict-num ict-strong">${num(a.quantity_after)}</td>
+                        <td class="ict-muted">${esc(a.reference || '—')}</td>
+                    </tr>`).join('')}</tbody>
+            </table>`;
+        }
+    }
+
+    /* ── render (builds full page shell — called only once) ── */
     function render() {
         const main = document.getElementById('srMain');
         if (!main) return;
@@ -372,7 +474,6 @@
         const pageRows = items.slice(pageStart, pageStart + SR.pageSize);
         const totalPages = Math.max(1, Math.ceil(total / SR.pageSize));
 
-        // Recent movement summary from adjustments (last 7 days)
         const sevenDaysAgo = Date.now() - 7 * 86400000;
         const recentAdj = SR.adjustments.filter(a => new Date(a.created_at).getTime() > sevenDaysAgo);
         const recentIn = recentAdj.filter(a => a.adjustment_type === 'stock_in' || a.adjustment_type === 'bulk_in').reduce((s, a) => s + Math.abs(a.quantity_change), 0);
@@ -380,33 +481,16 @@
 
         main.innerHTML = `
             <div class="sr-container">
-                <!-- Page header -->
                 <div class="ict-page-head">
                     <h2>Stock Room</h2>
                     <p>Manual inventory tracking · ${num(s.total_skus || 0)} SKUs · ${num(s.total_units || 0)} units on hand${recentAdj.length ? ` · ${num(recentIn)} in / ${num(recentOut)} out (7d)` : ''}</p>
                 </div>
-
-                <!-- Summary Cards (ICT style) -->
                 <div class="ict-mini-stats">
-                    <div class="ict-stat-card">
-                        <div class="ict-stat-value">${num(s.total_skus || 0)}</div>
-                        <div class="ict-stat-label">Total SKUs</div>
-                    </div>
-                    <div class="ict-stat-card">
-                        <div class="ict-stat-value">${num(s.total_units || 0)}</div>
-                        <div class="ict-stat-label">Total Units</div>
-                    </div>
-                    <div class="ict-stat-card">
-                        <div class="ict-stat-value ict-tone-attention">${num(s.reorder_needed || 0)}</div>
-                        <div class="ict-stat-label">Below Reorder</div>
-                    </div>
-                    <div class="ict-stat-card">
-                        <div class="ict-stat-value ict-tone-critical">${num(s.zero_stock || 0)}</div>
-                        <div class="ict-stat-label">Zero Stock</div>
-                    </div>
+                    <div class="ict-stat-card"><div class="ict-stat-value">${num(s.total_skus || 0)}</div><div class="ict-stat-label">Total SKUs</div></div>
+                    <div class="ict-stat-card"><div class="ict-stat-value">${num(s.total_units || 0)}</div><div class="ict-stat-label">Total Units</div></div>
+                    <div class="ict-stat-card"><div class="ict-stat-value ict-tone-attention">${num(s.reorder_needed || 0)}</div><div class="ict-stat-label">Below Reorder</div></div>
+                    <div class="ict-stat-card"><div class="ict-stat-value ict-tone-critical">${num(s.zero_stock || 0)}</div><div class="ict-stat-label">Zero Stock</div></div>
                 </div>
-
-                <!-- Toolbar -->
                 <div class="ict-toolbar">
                     <input type="text" class="ict-input" id="srFilterInput" placeholder="Search products, SKUs..." value="${esc(SR.filter)}" autocomplete="off">
                     <select class="ict-input" id="srCategoryFilter">
@@ -422,93 +506,22 @@
                     </select>
                     <span class="ict-toolbar-count">${num(total)} matching</span>
                     <div style="margin-left:auto;display:flex;gap:6px">
-                        <button class="btn sr-bulk-in-btn" data-sr="bulk-open" title="Add stock to multiple SKUs">
-                            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><path d="M12 5v14M5 12h14"/></svg>
-                            Bulk In
-                        </button>
-                        <button class="btn sr-bulk-out-btn" data-sr="bulk-out-open" title="Remove stock from multiple SKUs">
-                            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><path d="M5 12h14"/></svg>
-                            Bulk Out
-                        </button>
-                        <button class="ict-chip" data-sr="refresh" title="Refresh">
-                            <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="23 4 23 10 17 10"/><polyline points="1 20 1 14 7 14"/><path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15"/></svg>
-                        </button>
+                        <button class="btn sr-bulk-in-btn" data-sr="bulk-open" title="Add stock to multiple SKUs"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><path d="M12 5v14M5 12h14"/></svg> Bulk In</button>
+                        <button class="btn sr-bulk-out-btn" data-sr="bulk-out-open" title="Remove stock from multiple SKUs"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><path d="M5 12h14"/></svg> Bulk Out</button>
+                        <button class="ict-chip" data-sr="refresh" title="Refresh"><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="23 4 23 10 17 10"/><polyline points="1 20 1 14 7 14"/><path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15"/></svg></button>
                     </div>
                 </div>
-
-                <!-- Inventory Table (ICT style) -->
-                <div class="ict-card ict-card-flush">
-                    <div class="ict-table-wrap">
-                        <table class="ict-table">
-                            <thead><tr>
-                                ${sortTh('Product', 'product_name')}
-                                ${sortTh('Category', 'category')}
-                                ${sortTh('Size', 'size')}
-                                <th>SKU Code</th>
-                                ${sortTh('Stock', 'quantity', 'right')}
-                                ${sortTh('Reorder', 'reorder_level', 'right')}
-                                <th>Status</th>
-                                ${sortTh('Updated', 'updated_at')}
-                            </tr></thead>
-                            <tbody>
-                                ${pageRows.length === 0 ? `<tr><td colspan="8"><div class="ict-empty">No inventory items match these filters.</div></td></tr>` : pageRows.map(i => {
-                                    const isZero = i.quantity === 0;
-                                    const needsReorder = !isZero && i.quantity <= i.reorder_level;
-                                    const status = isZero ? pill('critical', 'ZERO') : needsReorder ? pill('attention', 'REORDER') : pill('healthy', 'OK');
-                                    return `<tr class="${isZero ? 'sr-row-zero' : needsReorder ? 'sr-row-reorder' : ''}">
-                                        <td class="sr-product">${esc(i.product_name)}</td>
-                                        <td class="ict-muted">${esc(i.category || '—')}</td>
-                                        <td class="ict-muted">${esc(i.size)}</td>
-                                        <td class="ict-mono ict-muted"><code>${esc(i.sku_key)}</code></td>
-                                        <td class="ict-num ict-strong ${isZero ? 'ict-critical-text' : needsReorder ? 'ict-tone-attention' : ''}">${num(i.quantity)}</td>
-                                        <td class="ict-num ict-muted">${num(i.reorder_level)}</td>
-                                        <td>${status}</td>
-                                        <td class="ict-muted">${i.updated_at ? fmtDate(i.updated_at) : '—'}</td>
-                                    </tr>`;
-                                }).join('')}
-                            </tbody>
-                        </table>
-                    </div>
-                    ${total > SR.pageSize ? `<div class="ict-pagination">
-                        <button class="ict-chip ${SR.page <= 0 ? 'disabled' : ''}" data-sr="page" data-dir="-1" ${SR.page <= 0 ? 'disabled' : ''}>← Prev</button>
-                        <span class="ict-page-info">Page ${SR.page + 1} of ${totalPages}</span>
-                        <button class="ict-chip ${SR.page >= totalPages - 1 ? 'disabled' : ''}" data-sr="page" data-dir="1" ${SR.page >= totalPages - 1 ? 'disabled' : ''}>Next →</button>
-                    </div>` : ''}
-                </div>
-
-                <!-- Recent Adjustments -->
+                <div class="ict-card ict-card-flush"></div>
                 <div class="ict-card" style="margin-top:16px">
                     <div style="padding:16px 20px 0">
                         <h3 style="margin:0 0 4px;font-size:1rem;font-weight:600;color:var(--ict-text)">Recent Adjustments</h3>
-                        <p style="margin:0 0 12px;font-size:0.82rem;color:var(--ict-text-muted)">Last ${SR.adjustments.length} inventory movements${recentAdj.length ? ` · ${num(recentIn)} IN / ${num(recentOut)} OUT in 7d` : ''}</p>
+                        <p style="margin:0 0 12px;font-size:0.82rem;color:var(--ict-text-muted)">Last ${SR.adjustments.length} inventory movements</p>
                     </div>
-                    <div class="ict-table-wrap">
-                        <table class="ict-table">
-                            <thead><tr>
-                                <th>Date</th><th>SKU</th><th>Product</th><th>Size</th><th>Type</th>
-                                <th class="ict-th-right">Change</th><th class="ict-th-right">Before</th><th class="ict-th-right">After</th><th>Reference</th>
-                            </tr></thead>
-                            <tbody>
-                                ${SR.adjustments.length === 0 ? `<tr><td colspan="9"><div class="ict-empty">No adjustments recorded yet.</div></td></tr>` : SR.adjustments.slice(0, 20).map(a => `
-                                    <tr>
-                                        <td class="ict-muted">${fmtDateTime(a.created_at)}</td>
-                                        <td class="ict-mono ict-muted"><code>${esc(a.sku_key)}</code></td>
-                                        <td>${esc(a.product_name)}</td>
-                                        <td class="ict-muted">${esc(a.size)}</td>
-                                        <td>${pill(a.adjustment_type === 'stock_in' || a.adjustment_type === 'bulk_in' ? 'healthy' : a.adjustment_type === 'stock_out' || a.adjustment_type === 'bulk_out' ? 'critical' : 'info', a.adjustment_type.replace('_', ' '))}</td>
-                                        <td class="ict-num ${a.quantity_change >= 0 ? 'ict-healthy-text' : 'ict-critical-text'}" style="font-weight:600">${a.quantity_change >= 0 ? '+' : ''}${num(a.quantity_change)}</td>
-                                        <td class="ict-num ict-muted">${num(a.quantity_before)}</td>
-                                        <td class="ict-num ict-strong">${num(a.quantity_after)}</td>
-                                        <td class="ict-muted">${esc(a.reference || '—')}</td>
-                                    </tr>
-                                `).join('')}
-                            </tbody>
-                        </table>
-                    </div>
+                    <div class="ict-table-wrap"></div>
                 </div>
             </div>`;
 
-        // Wire filter events (debounced)
+        // Wire filter events (debounced) — done once on shell creation
         const filterInput = main.querySelector('#srFilterInput');
         if (filterInput) {
             let debounce;
@@ -517,6 +530,9 @@
                 debounce = setTimeout(() => { SR.filter = e.target.value; applyFiltersAndRender(); }, 200);
             });
         }
+
+        // Populate dynamic sections
+        updateContent();
     }
 
     /* ── bulk modal HTML (injected once) ── */
@@ -610,7 +626,7 @@
             loadInventory();
             loadAdjustments();
         } else {
-            render(); // just re-render with cached data
+            updateContent(); // update stats/table only — preserves toolbar & input focus
         }
     }
 
