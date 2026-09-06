@@ -21,6 +21,7 @@
     /* ── state (persists across tab switches — memory smart) ── */
     const SR = {
         inventory: [],
+        allInventory: [],  // full dataset loaded once, filtered client-side
         summary: null,
         adjustments: [],
         loaded: false,        // has data been fetched at least once?
@@ -54,22 +55,41 @@
         if (SR.loading) return;
         if (SR.loaded && !force) return; // memory smart — skip if already loaded
         SR.loading = true;
-        render();
         try {
-            const params = new URLSearchParams();
-            if (SR.filter) params.set('product', SR.filter);
-            if (SR.categoryFilter) params.set('category', SR.categoryFilter);
-            if (SR.statusFilter === 'reorder') params.set('reorder_only', '1');
-            const data = await apiFetch(`/api/admin/inventory/manual?${params}`);
-            SR.inventory = data.items || [];
+            const data = await apiFetch('/api/admin/inventory/manual');
+            SR.allInventory = data.items || []; // full dataset for client-side filtering
             SR.summary = data.summary || {};
             SR.loaded = true;
         } catch (e) {
             console.error('Stock Room: load failed', e);
-            SR.inventory = [];
+            SR.allInventory = [];
         }
         SR.loading = false;
-        render();
+        applyFiltersAndRender();
+    }
+
+    /* ── client-side filter + sort + render (instant, no API call) ── */
+    function applyFiltersAndRender() {
+        const q = (SR.filter || '').toLowerCase();
+        let items = SR.allInventory || [];
+        if (q) {
+            items = items.filter(i =>
+                (i.product_name || '').toLowerCase().includes(q) ||
+                (i.sku_key || '').toLowerCase().includes(q) ||
+                (i.size || '').toLowerCase().includes(q)
+            );
+        }
+        if (SR.categoryFilter) {
+            items = items.filter(i => i.category === SR.categoryFilter);
+        }
+        if (SR.statusFilter === 'reorder') {
+            items = items.filter(i => i.quantity > 0 && i.quantity <= (i.reorder_level || 0));
+        } else if (SR.statusFilter === 'zero') {
+            items = items.filter(i => i.quantity === 0);
+        }
+        SR.inventory = items;
+        SR.page = 0;
+        renderTable();
     }
 
     async function loadAdjustments() {
@@ -103,7 +123,7 @@
         if (SR.sortKey === key) SR.sortDir = SR.sortDir === 'asc' ? 'desc' : 'asc';
         else { SR.sortKey = key; SR.sortDir = 'asc'; }
         SR.page = 0;
-        render();
+        renderTable();
     }
 
     /* ── bulk inventory-in ── */
@@ -279,12 +299,68 @@
     };
     const sortTh = (label, key) => `<th class="ict-th" data-sr="sort" data-key="${key}">${esc(label)}${sortArrow(key)}</th>`;
 
+    /* ── render table only (preserves toolbar & input focus) ── */
+    function renderTable() {
+        const main = document.getElementById('srMain');
+        if (!main) return;
+        const card = main.querySelector('.ict-card-flush');
+        if (!card) { render(); return; } // first load — do full render
+
+        const items = sortedItems();
+        const total = items.length;
+        const pageStart = SR.page * SR.pageSize;
+        const pageRows = items.slice(pageStart, pageStart + SR.pageSize);
+        const totalPages = Math.max(1, Math.ceil(total / SR.pageSize));
+
+        card.innerHTML = `
+            <div class="ict-table-wrap">
+                <table class="ict-table">
+                    <thead><tr>
+                        ${sortTh('Product', 'product_name')}
+                        ${sortTh('Category', 'category')}
+                        ${sortTh('Size', 'size')}
+                        <th>SKU Code</th>
+                        ${sortTh('Stock', 'quantity', 'right')}
+                        ${sortTh('Reorder', 'reorder_level', 'right')}
+                        <th>Status</th>
+                        ${sortTh('Updated', 'updated_at')}
+                    </tr></thead>
+                    <tbody>
+                        ${pageRows.length === 0 ? `<tr><td colspan="8"><div class="ict-empty">No inventory items match these filters.</div></td></tr>` : pageRows.map(i => {
+                            const isZero = i.quantity === 0;
+                            const needsReorder = !isZero && i.quantity <= i.reorder_level;
+                            const status = isZero ? pill('critical', 'ZERO') : needsReorder ? pill('attention', 'REORDER') : pill('healthy', 'OK');
+                            return `<tr class="${isZero ? 'sr-row-zero' : needsReorder ? 'sr-row-reorder' : ''}">
+                                <td class="sr-product">${esc(i.product_name)}</td>
+                                <td class="ict-muted">${esc(i.category || '—')}</td>
+                                <td class="ict-muted">${esc(i.size)}</td>
+                                <td class="ict-mono ict-muted"><code>${esc(i.sku_key)}</code></td>
+                                <td class="ict-num ict-strong ${isZero ? 'ict-critical-text' : needsReorder ? 'ict-tone-attention' : ''}">${num(i.quantity)}</td>
+                                <td class="ict-num ict-muted">${num(i.reorder_level)}</td>
+                                <td>${status}</td>
+                                <td class="ict-muted">${i.updated_at ? fmtDate(i.updated_at) : '—'}</td>
+                            </tr>`;
+                        }).join('')}
+                    </tbody>
+                </table>
+            </div>
+            ${total > SR.pageSize ? `<div class="ict-pagination">
+                <button class="ict-chip ${SR.page <= 0 ? 'disabled' : ''}" data-sr="page" data-dir="-1" ${SR.page <= 0 ? 'disabled' : ''}>← Prev</button>
+                <span class="ict-page-info">Page ${SR.page + 1} of ${totalPages}</span>
+                <button class="ict-chip ${SR.page >= totalPages - 1 ? 'disabled' : ''}" data-sr="page" data-dir="1" ${SR.page >= totalPages - 1 ? 'disabled' : ''}>Next →</button>
+            </div>` : ''}`;
+
+        // Update the matching count in toolbar
+        const countEl = main.querySelector('.ict-toolbar-count');
+        if (countEl) countEl.textContent = `${num(total)} matching`;
+    }
+
     /* ── render ── */
     function render() {
         const main = document.getElementById('srMain');
         if (!main) return;
 
-        if (SR.loading) {
+        if (SR.loading && !SR.loaded) {
             main.innerHTML = `<div class="sr-loading"><div class="inv-spinner"></div><span>Loading manual inventory...</span></div>`;
             return;
         }
@@ -438,7 +514,7 @@
             let debounce;
             filterInput.addEventListener('input', (e) => {
                 clearTimeout(debounce);
-                debounce = setTimeout(() => { SR.filter = e.target.value; SR.loaded = false; SR.page = 0; loadInventory(true); }, 300);
+                debounce = setTimeout(() => { SR.filter = e.target.value; applyFiltersAndRender(); }, 200);
             });
         }
     }
@@ -499,7 +575,7 @@
         } else if (action === 'page') {
             const dir = parseInt(el.dataset.dir, 10) || 0;
             SR.page = Math.max(0, SR.page + dir);
-            render();
+            renderTable();
         }
     });
 
@@ -520,8 +596,8 @@
         if (!view || view.style.display === 'none') return;
 
         const id = e.target.id;
-        if (id === 'srCategoryFilter') { SR.categoryFilter = e.target.value; SR.loaded = false; SR.page = 0; loadInventory(true); }
-        else if (id === 'srStatusFilter') { SR.statusFilter = e.target.value; SR.loaded = false; SR.page = 0; loadInventory(true); }
+        if (id === 'srCategoryFilter') { SR.categoryFilter = e.target.value; applyFiltersAndRender(); }
+        else if (id === 'srStatusFilter') { SR.statusFilter = e.target.value; applyFiltersAndRender(); }
         else if (id === 'srBulkRef') { SR.bulkReference = e.target.value; }
         else if (id === 'srBulkNotes') { SR.bulkNotes = e.target.value; }
     });
