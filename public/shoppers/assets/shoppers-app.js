@@ -7029,8 +7029,10 @@ setupTeamEvents();
 // This block only owns view show/hide and the sidebar entry point.
 // ==========================================
 function showInventoryView() {
+    const iv = document.getElementById('inventoryView');
+    if (iv.style.display === 'block') return; // already open — skip re-render (preserves Stock Room state)
     document.querySelector('.dashboard-main').style.display = 'none';
-    document.getElementById('inventoryView').style.display = 'block';
+    iv.style.display = 'block';
     window.InventoryTower?.open();
 }
 
