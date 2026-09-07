@@ -11,6 +11,7 @@ let lastKnownTicketIds = new Set();
 let unreadMessageCount = 0;
 let lastChatMessageCount = 0;
 let lastAiSuggestedReply = null;
+let currentChannelFilter = 'all'; // 'all', 'whatsapp', 'instagram'
 
 // ============================================================
 // INACTIVITY TIMEOUT — log out after 10 minutes of no user
@@ -327,7 +328,8 @@ async function portalApi(endpoint, method = 'GET', body = null) {
 // Tickets
 async function loadTickets(isPolling = false) {
     try {
-        const data = await portalApi(`/portal/${portalSlug}/tickets`);
+        const channelParam = currentChannelFilter !== 'all' ? `&channel=${currentChannelFilter}` : '';
+        const data = await portalApi(`/portal/${portalSlug}/tickets?1=1${channelParam}`);
         if (data.success) {
             const newTickets = data.tickets || [];
             const newTicketIds = new Set(newTickets.map(t => String(t.id)));
@@ -460,17 +462,24 @@ function renderTickets(tickets) {
 
     const newHtml = tickets.map(t => {
         const isUnread = !t.is_read;
+        const channel = t.channel || 'whatsapp';
+        const isIG = channel === 'instagram';
+        const channelBadge = `<span class="channel-badge ${channel}">${isIG ? 'IG' : 'WA'}</span>`;
+        const customerDisplay = isIG
+            ? (t.ig_username ? `@${escapeHtml(t.ig_username)}` : escapeHtml(t.customer_phone))
+            : escapeHtml(t.customer_phone);
         return `
-        <div class="ticket-item ${t.status === 'resolved' ? 'resolved' : ''} ${isUnread ? 'unread' : ''}" data-ticket-id="${t.id}" data-phone="${escapeJs(t.customer_phone)}" data-name="${escapeJs(t.customer_name || 'Customer')}" data-status="${t.status}">
+        <div class="ticket-item ${t.status === 'resolved' ? 'resolved' : ''} ${isUnread ? 'unread' : ''}" data-ticket-id="${t.id}" data-phone="${escapeJs(t.customer_phone)}" data-name="${escapeJs(t.customer_name || 'Customer')}" data-status="${t.status}" data-channel="${channel}">
             <div class="col-ticket-number">
                 <span class="ticket-number-badge">${escapeHtml(t.ticket_number || 'N/A')}</span>
+                ${channelBadge}
             </div>
             <div class="col-customer">
                 <div class="ticket-customer-name ${isUnread ? 'unread-name' : ''}">
                     ${isUnread ? '<span class="unread-dot"></span>' : ''}
                     ${escapeHtml(t.customer_name || 'Customer')}
                 </div>
-                <div class="ticket-customer-phone">${escapeHtml(t.customer_phone)}</div>
+                <div class="ticket-customer-phone">${isIG ? customerDisplay : escapeHtml(t.customer_phone)}</div>
             </div>
             <div class="col-message">${escapeHtml(truncate(t.message, 80))}</div>
             <div class="col-status">
@@ -493,27 +502,35 @@ function renderTickets(tickets) {
     list.querySelectorAll('.ticket-item').forEach(item => {
         item.addEventListener('click', (e) => {
             if (e.target.closest('button')) return;
-            openChat(item.dataset.ticketId, item.dataset.phone, item.dataset.name, item.dataset.status);
+            openChat(item.dataset.ticketId, item.dataset.phone, item.dataset.name, item.dataset.status, item.dataset.channel || 'whatsapp');
         });
     });
     list.querySelectorAll('.ticket-btn').forEach(btn => {
         btn.addEventListener('click', (e) => {
             e.stopPropagation();
             const item = btn.closest('.ticket-item');
-            openChat(item.dataset.ticketId, item.dataset.phone, item.dataset.name, item.dataset.status);
+            openChat(item.dataset.ticketId, item.dataset.phone, item.dataset.name, item.dataset.status, item.dataset.channel || 'whatsapp');
         });
     });
 }
 
 // Chat
-async function openChat(ticketId, phone, name, status) {
-    currentTicket = { id: ticketId, phone, name, status };
+async function openChat(ticketId, phone, name, status, channel = 'whatsapp') {
+    currentTicket = { id: ticketId, phone, name, status, channel };
 
     // Clear notification badge when opening a ticket
     clearNotificationBadge();
 
     document.getElementById('chatCustomerName').textContent = name;
-    document.getElementById('chatCustomerPhone').textContent = phone;
+
+    // Show channel-aware customer info
+    const phoneDisplay = document.getElementById('chatCustomerPhone');
+    if (channel === 'instagram') {
+        phoneDisplay.innerHTML = `${escapeHtml(phone)} <span class="chat-channel-badge instagram">Instagram</span>`;
+    } else {
+        phoneDisplay.innerHTML = `${escapeHtml(phone)} <span class="chat-channel-badge whatsapp">WhatsApp</span>`;
+    }
+
     document.getElementById('chatMessages').innerHTML = `
         <div class="chat-loading">
             <div class="spinner"></div>
@@ -944,6 +961,16 @@ document.addEventListener('DOMContentLoaded', () => {
     document.getElementById('timeFromFilter')?.addEventListener('change', filterTickets);
     document.getElementById('timeToFilter')?.addEventListener('change', filterTickets);
     document.getElementById('resetFiltersBtn')?.addEventListener('click', resetAllFilters);
+
+    // Channel filter buttons
+    document.querySelectorAll('.channel-btn').forEach(btn => {
+        btn.addEventListener('click', () => {
+            document.querySelectorAll('.channel-btn').forEach(b => b.classList.remove('active'));
+            btn.classList.add('active');
+            currentChannelFilter = btn.dataset.channel;
+            loadTickets();
+        });
+    });
 });
 
 // Toggle unread filter
@@ -972,6 +999,12 @@ function resetAllFilters() {
     if (timeFrom) timeFrom.value = '';
     if (timeTo) timeTo.value = '';
     if (searchInput) searchInput.value = '';
+
+    // Reset channel filter to 'All'
+    currentChannelFilter = 'all';
+    document.querySelectorAll('.channel-btn').forEach(b => b.classList.remove('active'));
+    const allBtn = document.querySelector('.channel-btn[data-channel="all"]');
+    if (allBtn) allBtn.classList.add('active');
     
     filterTickets();
 }

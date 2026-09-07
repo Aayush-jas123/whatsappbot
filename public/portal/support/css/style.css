@@ -1024,3 +1024,92 @@ body {
     color: var(--text-secondary);
     padding-bottom: 4px;
 }
+
+/* ── Channel Filter & Badges ──────────────────────────── */
+
+.channel-filter-group {
+    display: inline-flex;
+    gap: 2px;
+    background: var(--bg-card);
+    border-radius: var(--border-radius);
+    padding: 2px;
+    border: 1px solid var(--border);
+}
+
+.channel-btn {
+    padding: 4px 10px !important;
+    font-size: 12px !important;
+    font-weight: 500;
+    border: none !important;
+    border-radius: 6px !important;
+    background: transparent !important;
+    color: var(--text-secondary);
+    cursor: pointer;
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    transition: all 0.15s ease;
+}
+
+.channel-btn:hover {
+    background: var(--border) !important;
+}
+
+.channel-btn.active {
+    background: var(--primary) !important;
+    color: white !important;
+}
+
+.channel-dot {
+    width: 8px;
+    height: 8px;
+    border-radius: 50%;
+    display: inline-block;
+}
+
+.channel-dot.whatsapp {
+    background: #25D366;
+}
+
+.channel-dot.instagram {
+    background: linear-gradient(45deg, #f09433, #e6683c, #dc2743, #cc2366, #bc1888);
+}
+
+.channel-badge {
+    display: inline-block;
+    font-size: 9px;
+    font-weight: 700;
+    padding: 1px 5px;
+    border-radius: 4px;
+    letter-spacing: 0.5px;
+    margin-top: 2px;
+}
+
+.channel-badge.whatsapp {
+    background: #dcf8c6;
+    color: #128c3e;
+}
+
+.channel-badge.instagram {
+    background: #fce4ec;
+    color: #c2185b;
+}
+
+.chat-channel-badge {
+    display: inline-block;
+    font-size: 10px;
+    font-weight: 600;
+    padding: 2px 8px;
+    border-radius: 10px;
+    vertical-align: middle;
+}
+
+.chat-channel-badge.whatsapp {
+    background: #dcf8c6;
+    color: #128c3e;
+}
+
+.chat-channel-badge.instagram {
+    background: #fce4ec;
+    color: #c2185b;
+}

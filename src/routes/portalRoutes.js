@@ -130,6 +130,11 @@ async function getPortalTickets(portalId, portalType, portalConfig) {
 async function verifyPhoneInPortal(phone, portal) {
     const tickets = await getPortalTickets(portal.portalId, portal.type, portal.config);
     
+    // Instagram customers: phone is the raw IG user ID (numeric).
+    // Match via channel = 'instagram' AND ig_user_id = phone.
+    const isIG = tickets.some(t => (t.channel || 'whatsapp') === 'instagram' && t.ig_user_id === phone);
+    if (isIG) return true;
+
     // Normalize the input phone number
     const cleanPhone = phone.replace(/\D/g, '');
     const possibleFormats = [
@@ -221,11 +226,19 @@ router.get('/:slug/tickets', verifyPortalToken, async (req, res) => {
         }
 
         const portal = portals[0];
-        const { status } = req.query;
+        const { status, channel } = req.query;
         let tickets = await getPortalTickets(portal.id, portal.type, portal.config);
 
         if (status) {
             tickets = tickets.filter(t => t.status === status);
+        }
+
+        // Channel filter: 'whatsapp', 'instagram', or undefined for all
+        if (channel) {
+            tickets = tickets.filter(t => {
+                const ticketChannel = t.channel || 'whatsapp';
+                return ticketChannel === channel;
+            });
         }
 
         res.json({ success: true, tickets });
@@ -250,26 +263,63 @@ router.get('/:slug/chat/:phone', verifyPortalToken, async (req, res) => {
             return res.status(403).json({ error: 'Phone not associated with this portal' });
         }
 
-        const cleanPhone = phone.replace(/\D/g, '');
-        const formattedPhone = cleanPhone.startsWith('91') ? `+${cleanPhone}` : `+91${cleanPhone}`;
-
-        // Get customer info - try multiple phone format variations
-        const customerInfo = await dbAdapter.query(
-            `SELECT name, phone, email FROM customers 
-             WHERE phone = ? OR phone = ? OR phone = ? OR phone = ?
-             LIMIT 1`,
-            [formattedPhone, `+${cleanPhone}`, `91${cleanPhone}`, cleanPhone]
+        // Determine if this is an Instagram customer by checking ticket channel.
+        // phone param is the raw IG user ID for Instagram, or phone number for WhatsApp.
+        const igTicket = await dbAdapter.query(
+            `SELECT channel, ig_user_id FROM support_tickets 
+             WHERE ig_user_id = ? AND status != 'resolved'
+             ORDER BY created_at DESC LIMIT 1`,
+            [phone]
         );
+        const isInstagram = !!(igTicket?.[0]?.ig_user_id && (igTicket[0].channel || 'whatsapp') === 'instagram');
+        let formattedPhone, customerInfo, messages, channel = 'whatsapp';
 
-        // Get messages - try multiple phone format variations and get most recent 200
-        const messages = await dbAdapter.query(
-            `SELECT id, customer_phone, message_type, message_content, status, wa_message_id, created_at
-             FROM messages
-             WHERE customer_phone = ? OR customer_phone = ? OR customer_phone = ? OR customer_phone = ?
-             ORDER BY created_at DESC
-             LIMIT 200`,
-            [formattedPhone, `+${cleanPhone}`, `91${cleanPhone}`, cleanPhone]
-        );
+        if (isInstagram) {
+            // Instagram customer — phone is the raw IG user ID
+            const igUserId = phone;
+            channel = 'instagram';
+
+            // Get customer by IG PSID
+            customerInfo = await dbAdapter.query(
+                `SELECT name, phone, email, ig_username, ig_psid, primary_channel FROM customers 
+                 WHERE ig_psid = ? LIMIT 1`,
+                [igUserId]
+            );
+
+            // Get messages for this IG customer
+            messages = await dbAdapter.query(
+                `SELECT id, customer_phone, message_type, message_content, status, wa_message_id, channel, external_message_id, created_at
+                 FROM messages
+                 WHERE customer_phone = ?
+                 ORDER BY created_at DESC
+                 LIMIT 200`,
+                [igUserId]
+            );
+
+            formattedPhone = igUserId;
+        } else {
+            // WhatsApp customer — original logic
+            const cleanPhone = phone.replace(/\D/g, '');
+            formattedPhone = cleanPhone.startsWith('91') ? `+${cleanPhone}` : `+91${cleanPhone}`;
+
+            // Get customer info - try multiple phone format variations
+            customerInfo = await dbAdapter.query(
+                `SELECT name, phone, email FROM customers 
+                 WHERE phone = ? OR phone = ? OR phone = ? OR phone = ?
+                 LIMIT 1`,
+                [formattedPhone, `+${cleanPhone}`, `91${cleanPhone}`, cleanPhone]
+            );
+
+            // Get messages - try multiple phone format variations and get most recent 200
+            messages = await dbAdapter.query(
+                `SELECT id, customer_phone, message_type, message_content, status, wa_message_id, created_at
+                 FROM messages
+                 WHERE customer_phone = ? OR customer_phone = ? OR customer_phone = ? OR customer_phone = ?
+                 ORDER BY created_at DESC
+                 LIMIT 200`,
+                [formattedPhone, `+${cleanPhone}`, `91${cleanPhone}`, cleanPhone]
+            );
+        }
 
         const formattedMessages = messages.reverse().map(msg => ({
             id: msg.id,
@@ -277,20 +327,31 @@ router.get('/:slug/chat/:phone', verifyPortalToken, async (req, res) => {
             content: msg.message_content,
             status: msg.status,
             waMessageId: msg.wa_message_id,
+            channel: msg.channel || 'whatsapp',
+            externalMessageId: msg.external_message_id || null,
             timestamp: msg.created_at,
             isAdmin: msg.message_type === 'manual_reply' || msg.message_type === 'outgoing'
         }));
 
         // Mark ticket as read when chat is opened
-        await dbAdapter.query(
-            `UPDATE support_tickets SET is_read = true WHERE customer_phone IN (?, ?, ?, ?) AND is_read = false`,
-            [cleanPhone, `+${cleanPhone}`, `91${cleanPhone}`, `+91${cleanPhone}`]
-        );
+        if (isInstagram) {
+            await dbAdapter.query(
+                `UPDATE support_tickets SET is_read = true WHERE ig_user_id = ? AND is_read = false`,
+                [phone]
+            );
+        } else {
+            const cleanPhone = phone.replace(/\D/g, '');
+            await dbAdapter.query(
+                `UPDATE support_tickets SET is_read = true WHERE customer_phone IN (?, ?, ?, ?) AND is_read = false`,
+                [cleanPhone, `+${cleanPhone}`, `91${cleanPhone}`, `+91${cleanPhone}`]
+            );
+        }
 
         res.json({
             success: true,
             phone: formattedPhone,
-            customer: customerInfo[0] || null,
+            channel,
+            customer: customerInfo?.[0] || null,
             messages: formattedMessages
         });
     } catch (error) {
@@ -356,19 +417,38 @@ router.post('/:slug/chat/send', verifyPortalToken, async (req, res) => {
             return res.status(403).json({ error: 'Phone not associated with this portal' });
         }
 
-        const cleanPhone = phone.replace(/\D/g, '');
-        const formattedPhone = cleanPhone.startsWith('91') ? `+${cleanPhone}` : `+91${cleanPhone}`;
+        // Check if this is an Instagram ticket
+        const ticketRows = await dbAdapter.query(
+            `SELECT channel, ig_user_id FROM support_tickets 
+             WHERE customer_phone = ? AND status != 'resolved'
+             ORDER BY created_at DESC LIMIT 1`,
+            [phone]
+        );
+        const ticketChannel = ticketRows?.[0]?.channel || 'whatsapp';
+        const igUserId = ticketRows?.[0]?.ig_user_id;
 
         let result;
-        if (type === 'template' && req.body.templateName) {
-            const templateData = {
-                name: req.body.templateName,
-                language: { code: req.body.language || 'en_US' },
-                components: req.body.components || []
-            };
-            result = await whatsappService.sendTemplate(formattedPhone, templateData, 'manual_reply');
+
+        if (ticketChannel === 'instagram' && igUserId) {
+            // Route through Instagram
+            const instagramService = require('../services/instagramService');
+            const igResult = await instagramService.sendMessage(igUserId, message, 'manual_reply');
+            result = { messages: [{ id: igResult?.message_id || null }] };
         } else {
-            result = await whatsappService.sendMessage(formattedPhone, message, 'manual_reply');
+            // Route through WhatsApp (original logic)
+            const cleanPhone = phone.replace(/\D/g, '');
+            const formattedPhone = cleanPhone.startsWith('91') ? `+${cleanPhone}` : `+91${cleanPhone}`;
+
+            if (type === 'template' && req.body.templateName) {
+                const templateData = {
+                    name: req.body.templateName,
+                    language: { code: req.body.language || 'en_US' },
+                    components: req.body.components || []
+                };
+                result = await whatsappService.sendTemplate(formattedPhone, templateData, 'manual_reply');
+            } else {
+                result = await whatsappService.sendMessage(formattedPhone, message, 'manual_reply');
+            }
         }
 
         // AI learning: pair this human reply with the customer's latest question

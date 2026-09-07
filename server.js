@@ -209,6 +209,11 @@ app.use('/webhooks/zoho', zohoWebhookRoutes);
 const zohoRoutes = require('./src/routes/zohoRoutes');
 app.use('/api/admin/zoho', zohoRoutes);
 
+// Instagram Messaging Webhook (Meta Instagram Login)
+// Completely separate from the WhatsApp /webhook endpoint.
+const instagramWebhookRoutes = require('./src/routes/instagramWebhookRoutes');
+app.use(instagramWebhookRoutes);
+
 // Cron Jobs
 const abandonedCartCron = require('./src/services/abandonedCartCron');
 const reengagementCron = require('./src/services/reengagementCron');
@@ -675,6 +680,7 @@ async function startServer() {
             console.log('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━');
             console.log(`📡 Server running on port ${PORT}`);
             console.log(`🌐 Webhook URL: ${process.env.WEBHOOK_URL || `http://localhost:${PORT}`}/webhook`);
+            console.log(`📸 IG Webhook: ${process.env.APP_URL || `http://localhost:${PORT}`}/webhook/instagram`);
             console.log(`👨‍💼 Admin Dashboard: http://localhost:${PORT}/admin`);
             console.log('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━');
             console.log('');
