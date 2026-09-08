@@ -6896,7 +6896,9 @@ router.get('/inventory/movements', verifyToken, async (req, res) => {
         }
 
         // 2) Order-derived movements: delivered (OUT), RTO (IN), returns (IN), exchanges (IN/OUT)
-        const [deliveredRows, rtoRows, returnRows, exchangeRows] = await Promise.all([
+        //    + external returns server (Shopify portal submissions)
+        const windowDays = Math.max(1, Math.ceil((toDate - fromDate) / 86400000) + 1);
+        const [deliveredRows, rtoRows, returnRows, exchangeRows, rsPipeline] = await Promise.all([
             dbAdapter.query(`
                 SELECT s.items_json FROM store_shoppers s
                 INNER JOIN orders o ON o.order_id = s.order_id
@@ -6920,6 +6922,7 @@ router.get('/inventory/movements', verifyToken, async (req, res) => {
                 WHERE status IN ('pending_approval','initiated','pickup_scheduled','completed')
                   AND updated_at >= $1 AND updated_at <= $2
             `, [fromIso, toEndIso]),
+            fetchReturnsServerPipeline(windowDays),
         ]);
 
         // Delivered = stock OUT
@@ -7001,6 +7004,73 @@ router.get('/inventory/movements', verifyToken, async (req, res) => {
                     const sku = resolved.v.sku || `${resolved.p.title}-${resolved.v.title}`.replace(/[^a-zA-Z0-9]/g, '-').replace(/-+/g, '-').slice(0, 40);
                     const m = ensureMov(vKey, sku, displayName, color, size);
                     m.qty_out += qty; m.out_breakdown.exchange_out += qty;
+                }
+            }
+        }
+
+        // 3) External returns server — Shopify portal return/exchange requests
+        //    (separate system; no overlap with the local returns/exchanges tables)
+        if (rsPipeline.connected && Array.isArray(rsPipeline.requests)) {
+            for (const request of rsPipeline.requests) {
+                const items = Array.isArray(request.items) ? request.items : [];
+                if (items.length === 0) continue;
+                // Filter by date range using request.created_at
+                const reqDate = new Date(request.created_at);
+                if (reqDate < fromDate || reqDate > toDate) continue;
+
+                if (request.type === 'return') {
+                    // Return = stock IN
+                    for (const item of items) {
+                        const qty = Math.max(1, parseInt(item.quantity, 10) || 1);
+                        const resolved = resolveItem(item);
+                        if (resolved && resolved.v) {
+                            const vKey = `${resolved.p.id}:${resolved.v.id}`;
+                            const parts = String(resolved.v.title || '').split('/').map(x => x.trim()).filter(Boolean);
+                            const color = parts[0] || '';
+                            const size = parts.slice(1).join(' / ') || '';
+                            const displayName = resolved.v.title ? `${resolved.p.title} — ${resolved.v.title}` : resolved.p.title;
+                            const sku = resolved.v.sku || `${resolved.p.title}-${resolved.v.title}`.replace(/[^a-zA-Z0-9]/g, '-').replace(/-+/g, '-').slice(0, 40);
+                            const m = ensureMov(vKey, sku, displayName, color, size);
+                            m.qty_in += qty; m.in_breakdown.returns += qty;
+                        }
+                    }
+                } else if (request.type === 'exchange') {
+                    // Exchange: old item comes back (IN), replacement goes out (OUT)
+                    for (const item of items) {
+                        const qty = Math.max(1, parseInt(item.quantity, 10) || 1);
+                        // Old item = stock IN
+                        const resolved = resolveItem(item);
+                        if (resolved && resolved.v) {
+                            const vKey = `${resolved.p.id}:${resolved.v.id}`;
+                            const parts = String(resolved.v.title || '').split('/').map(x => x.trim()).filter(Boolean);
+                            const color = parts[0] || '';
+                            const size = parts.slice(1).join(' / ') || '';
+                            const displayName = resolved.v.title ? `${resolved.p.title} — ${resolved.v.title}` : resolved.p.title;
+                            const sku = resolved.v.sku || `${resolved.p.title}-${resolved.v.title}`.replace(/[^a-zA-Z0-9]/g, '-').replace(/-+/g, '-').slice(0, 40);
+                            const m = ensureMov(vKey, sku, displayName, color, size);
+                            m.qty_in += qty; m.in_breakdown.exchange_in += qty;
+                        }
+                        // Replacement item = stock OUT
+                        if (item.replacementProductTitle || item.replacementSku || item.replacementVariant) {
+                            const replItem = {
+                                title: item.replacementProductTitle || item.name || '',
+                                sku: item.replacementSku || '',
+                                variant: item.replacementVariant || '',
+                                quantity: item.quantity
+                            };
+                            const replResolved = resolveItem(replItem);
+                            if (replResolved && replResolved.v) {
+                                const rvKey = `${replResolved.p.id}:${replResolved.v.id}`;
+                                const rparts = String(replResolved.v.title || '').split('/').map(x => x.trim()).filter(Boolean);
+                                const rcolor = rparts[0] || '';
+                                const rsize = rparts.slice(1).join(' / ') || '';
+                                const rdisplayName = replResolved.v.title ? `${replResolved.p.title} — ${replResolved.v.title}` : replResolved.p.title;
+                                const rsku = replResolved.v.sku || `${replResolved.p.title}-${replResolved.v.title}`.replace(/[^a-zA-Z0-9]/g, '-').replace(/-+/g, '-').slice(0, 40);
+                                const m = ensureMov(rvKey, rsku, rdisplayName, rcolor, rsize);
+                                m.qty_out += qty; m.out_breakdown.exchange_out += qty;
+                            }
+                        }
+                    }
                 }
             }
         }
