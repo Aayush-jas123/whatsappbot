@@ -1,0 +1,237 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>OFFCOMFRT — Support Bot</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap" rel="stylesheet" />
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body {
+            font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+            background: #fafafa;
+            min-height: 100vh;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            justify-content: center;
+            color: #1a1a1a;
+        }
+        .hero {
+            text-align: center;
+            max-width: 520px;
+            padding: 40px 24px;
+        }
+        .hero-badge {
+            display: inline-block;
+            background: #000;
+            color: #fff;
+            font-size: 9px;
+            font-weight: 700;
+            letter-spacing: 2px;
+            text-transform: uppercase;
+            padding: 5px 14px;
+            border-radius: 100px;
+            margin-bottom: 28px;
+        }
+        .hero h1 {
+            font-size: 32px;
+            font-weight: 800;
+            letter-spacing: -0.5px;
+            margin-bottom: 10px;
+            line-height: 1.15;
+        }
+        .hero p {
+            font-size: 14px;
+            color: #999;
+            line-height: 1.6;
+            margin-bottom: 32px;
+            letter-spacing: 0.2px;
+        }
+        .hero-cta {
+            display: inline-flex;
+            align-items: center;
+            gap: 10px;
+            padding: 14px 28px;
+            background: linear-gradient(135deg, #1a1a1a, #000);
+            color: #fff;
+            border: none;
+            border-radius: 100px;
+            font-size: 13px;
+            font-weight: 600;
+            font-family: inherit;
+            cursor: pointer;
+            text-decoration: none;
+            transition: all 0.3s cubic-bezier(0.34, 1.56, 0.64, 1);
+            letter-spacing: 0.5px;
+        }
+        .hero-cta:hover {
+            transform: translateY(-2px);
+            box-shadow: 0 8px 24px rgba(0, 0, 0, 0.2);
+        }
+        .hero-cta svg {
+            width: 18px; height: 18px;
+            fill: none; stroke: #fff; stroke-width: 1.5;
+            stroke-linecap: round; stroke-linejoin: round;
+        }
+        .features {
+            display: grid;
+            grid-template-columns: repeat(2, 1fr);
+            gap: 12px;
+            margin-top: 48px;
+            width: 100%;
+            max-width: 440px;
+        }
+        .feature {
+            background: #fff;
+            border: 1px solid #eee;
+            border-radius: 14px;
+            padding: 18px;
+            text-align: left;
+            transition: all 0.25s ease;
+        }
+        .feature:hover {
+            border-color: #000;
+            transform: translateY(-2px);
+            box-shadow: 0 4px 12px rgba(0, 0, 0, 0.06);
+        }
+        .feature-label {
+            font-size: 9px;
+            font-weight: 700;
+            color: #ccc;
+            text-transform: uppercase;
+            letter-spacing: 1.5px;
+            margin-bottom: 8px;
+        }
+        .feature h3 {
+            font-size: 13px;
+            font-weight: 700;
+            margin-bottom: 3px;
+            color: #1a1a1a;
+        }
+        .feature p {
+            font-size: 11px;
+            color: #bbb;
+            line-height: 1.4;
+            margin: 0;
+            letter-spacing: 0.2px;
+        }
+        .embed-section {
+            margin-top: 48px;
+            width: 100%;
+            max-width: 520px;
+            text-align: left;
+        }
+        .embed-section h2 {
+            font-size: 9px;
+            font-weight: 700;
+            text-transform: uppercase;
+            letter-spacing: 2px;
+            color: #ccc;
+            margin-bottom: 10px;
+        }
+        .embed-code {
+            background: #111;
+            color: #888;
+            border-radius: 10px;
+            padding: 14px 18px;
+            font-family: 'SF Mono', Monaco, 'Cascadia Code', monospace;
+            font-size: 11px;
+            line-height: 1.6;
+            overflow-x: auto;
+            position: relative;
+        }
+        .embed-code .tag { color: #666; }
+        .embed-code .attr { color: #999; }
+        .embed-code .val { color: #aaa; }
+        .copy-btn {
+            position: absolute;
+            top: 8px;
+            right: 8px;
+            background: rgba(255,255,255,0.06);
+            border: 1px solid rgba(255,255,255,0.08);
+            border-radius: 6px;
+            color: #666;
+            font-size: 10px;
+            font-family: inherit;
+            font-weight: 600;
+            padding: 3px 8px;
+            cursor: pointer;
+            transition: all 0.2s;
+            letter-spacing: 0.5px;
+            text-transform: uppercase;
+        }
+        .copy-btn:hover { background: rgba(255,255,255,0.1); color: #999; }
+        @media (max-width: 480px) {
+            .hero h1 { font-size: 26px; }
+            .features { grid-template-columns: 1fr; }
+        }
+    </style>
+</head>
+<body>
+    <div class="hero">
+        <div class="hero-badge">Support Bot</div>
+        <h1>OFFCOMFRT</h1>
+        <p>Interactive button-driven support experience. Click the floating button to try it.</p>
+        <a href="#" class="hero-cta" id="open-bot-btn">
+            <svg viewBox="0 0 24 24"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></svg>
+            Open Bot
+        </a>
+
+        <div class="features">
+            <div class="feature">
+                <div class="feature-label">Tracking</div>
+                <h3>Track Order</h3>
+                <p>Real-time multi-carrier tracking with timeline</p>
+            </div>
+            <div class="feature">
+                <div class="feature-label">Returns</div>
+                <h3>Return / Exchange</h3>
+                <p>File returns and exchanges in seconds</p>
+            </div>
+            <div class="feature">
+                <div class="feature-label">Status</div>
+                <h3>Track Return</h3>
+                <p>Check the status of your return request</p>
+            </div>
+            <div class="feature">
+                <div class="feature-label">Help</div>
+                <h3>Contact Support</h3>
+                <p>Create a support ticket instantly</p>
+            </div>
+        </div>
+
+        <div class="embed-section">
+            <h2>Embed Code</h2>
+            <div class="embed-code" id="embed-code-block">
+                <button class="copy-btn" id="copy-embed-btn">Copy</button>
+                <span class="tag">&lt;script</span> <span class="attr">src</span>=<span class="val">"YOUR_SERVER_URL/widget/js/testbot-loader.js"</span> <span class="attr">defer</span><span class="tag">&gt;&lt;/script&gt;</span>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        window.__offcomfrt_testbot = {
+            apiUrl: window.location.origin,
+            brandName: 'OFFCOMFRT'
+        };
+
+        document.getElementById('open-bot-btn').addEventListener('click', function (e) {
+            e.preventDefault();
+            var btn = document.getElementById('offcomfrt-tb-btn');
+            if (btn) btn.click();
+        });
+
+        document.getElementById('copy-embed-btn').addEventListener('click', function () {
+            var code = '<script src="' + window.location.origin + '/widget/js/testbot-loader.js" defer><\/script>';
+            navigator.clipboard.writeText(code).then(function () {
+                document.getElementById('copy-embed-btn').textContent = 'Copied';
+                setTimeout(function () { document.getElementById('copy-embed-btn').textContent = 'Copy'; }, 2000);
+            });
+        });
+    </script>
+
+    <script src="/widget/js/testbot.js" defer></script>
+</body>
+</html>

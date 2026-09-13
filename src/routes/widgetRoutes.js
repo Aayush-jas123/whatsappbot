@@ -403,4 +403,94 @@ router.post('/ticket', async (req, res) => {
     }
 });
 
+// ---------- POST /api/widget/track-request ----------
+// Track return/exchange requests from external returns server + local tables
+
+router.post('/track-request', async (req, res) => {
+    try {
+        const { orderId } = req.body;
+        if (!orderId) {
+            return res.status(400).json({ error: 'Order ID is required' });
+        }
+
+        const cleanOrderId = String(orderId).replace(/^#/, '').trim();
+        const { dbAdapter } = require('../database/db');
+
+        // Fetch from external returns server
+        let requests = [];
+        const baseUrl = process.env.RETURNS_SERVER_URL;
+        const token = process.env.WHATSAPP_INTERNAL_TOKEN;
+        if (baseUrl) {
+            try {
+                const axios = require('axios');
+                const response = await axios.get(
+                    `${baseUrl.replace(/\/$/, '')}/api/internal/inventory-open-requests?window=90`,
+                    { headers: { 'x-internal-token': token || '' }, timeout: 15000 }
+                );
+                if (response.data?.success && Array.isArray(response.data.requests)) {
+                    requests = response.data.requests.filter(r =>
+                        String(r.order_number).replace(/^#/, '').trim() === cleanOrderId
+                    );
+                }
+            } catch (err) {
+                console.warn('[widget] returns server fetch failed:', err.message);
+            }
+        }
+
+        // Also check local tables
+        const returnRows = await dbAdapter.query(
+            `SELECT return_id, order_id, reason, status, pickup_scheduled_date, refund_amount, created_at
+             FROM returns WHERE order_id = ? ORDER BY created_at DESC LIMIT 5`,
+            [cleanOrderId]
+        );
+        const exchangeRows = await dbAdapter.query(
+            `SELECT exchange_id, order_id, reason, status, pickup_scheduled_date, created_at
+             FROM exchanges WHERE order_id = ? ORDER BY created_at DESC LIMIT 5`,
+            [cleanOrderId]
+        );
+
+        const localReturns = returnRows.map(r => ({
+            request_id: r.return_id,
+            order_number: r.order_id,
+            type: 'return',
+            status: r.status,
+            reason: r.reason,
+            items: [],
+            created_at: r.created_at
+        }));
+        const localExchanges = exchangeRows.map(r => ({
+            request_id: r.exchange_id,
+            order_number: r.order_id,
+            type: 'exchange',
+            status: r.status,
+            reason: r.reason,
+            items: [],
+            created_at: r.created_at
+        }));
+
+        const allRequests = [
+            ...requests.map(r => ({
+                request_id: r.request_id,
+                order_number: r.order_number,
+                type: r.type,
+                status: r.status,
+                reason: r.reason || null,
+                items: Array.isArray(r.items) ? r.items : [],
+                created_at: r.created_at
+            })),
+            ...localReturns,
+            ...localExchanges
+        ];
+
+        res.json({
+            orderId: cleanOrderId,
+            requests: allRequests,
+            count: allRequests.length
+        });
+    } catch (error) {
+        console.error('[widget] track-request error:', error.message);
+        res.status(500).json({ error: 'Failed to fetch request data' });
+    }
+});
+
 module.exports = router;

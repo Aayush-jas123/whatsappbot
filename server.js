@@ -449,6 +449,21 @@ app.get('/shoppers', (req, res) => {
     res.sendFile(path.join(__dirname, 'public', 'shoppers', 'index.html'));
 });
 
+// Test Bot — CSP override for inline event handlers and external resources
+app.use('/widget/testbot.html', helmet({
+    contentSecurityPolicy: {
+        directives: {
+            'script-src-attr': ["'unsafe-inline'"],
+            'img-src': ["'self'", 'data:', 'https:']
+        }
+    }
+}));
+
+// Serve Test Bot page
+app.get('/testbot', (req, res) => {
+    res.sendFile(path.join(__dirname, 'public', 'widget', 'testbot.html'));
+});
+
 // 404 handler
 app.use((req, res) => {
     res.status(404).json({ error: 'Not found' });
