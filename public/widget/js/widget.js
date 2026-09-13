@@ -26,9 +26,9 @@
 
     // Clear old chat history
     var storedVersion = sessionStorage.getItem('offcomfrt_version');
-    if (storedVersion !== '3') {
+    if (storedVersion !== '4') {
         sessionStorage.removeItem('offcomfrt_chat');
-        sessionStorage.setItem('offcomfrt_version', '3');
+        sessionStorage.setItem('offcomfrt_version', '4');
     }
 
     var chatHistory = JSON.parse(sessionStorage.getItem('offcomfrt_chat') || '[]');
@@ -39,8 +39,8 @@
         var style = document.createElement('style');
         style.id = 'offcomfrt-styles';
         style.textContent = [
-            /* Reset */
-            '#offcomfrt-widget *,#offcomfrt-widget *::before,#offcomfrt-widget *::after{box-sizing:border-box;margin:0;padding:0}',
+            /* Reset — only box-sizing, never touch padding/margin on components */
+            '#offcomfrt-widget *,#offcomfrt-widget *::before,#offcomfrt-widget *::after{box-sizing:border-box}',
 
             /* Floating Button */
             '#offcomfrt-widget-btn{position:fixed;bottom:28px;right:28px;width:62px;height:62px;border-radius:50%;background:linear-gradient(145deg,#1a1a1a,#000);border:2px solid rgba(255,255,255,0.08);cursor:pointer;display:flex;align-items:center;justify-content:center;box-shadow:0 8px 32px rgba(0,0,0,0.35),0 2px 8px rgba(0,0,0,0.2);z-index:99998;transition:all 0.35s cubic-bezier(0.34,1.56,0.64,1);animation:offcomfrt-float 3s ease-in-out infinite}',
@@ -54,142 +54,141 @@
             '#offcomfrt-widget.open{opacity:1;transform:translateY(0) scale(1);pointer-events:all}',
 
             /* Header */
-            '.offcomfrt-header{background:linear-gradient(135deg,#0a0a0a,#1a1a1a 50%,#0a0a0a);color:#fff;padding:24px 22px;display:flex;align-items:center;justify-content:space-between;flex-shrink:0;position:relative;overflow:hidden}',
-            '.offcomfrt-header-brand{display:flex;align-items:center;gap:14px}',
-            '.offcomfrt-header-avatar{width:48px;height:48px;border-radius:50%;background:#fff;display:flex;align-items:center;justify-content:center;position:relative;box-shadow:0 2px 8px rgba(0,0,0,0.3);overflow:hidden;border:2px solid rgba(255,255,255,0.2)}',
-            '.offcomfrt-header-avatar img{width:100%;height:100%;object-fit:cover}',
-            '.offcomfrt-header-avatar::after{content:"";position:absolute;bottom:2px;right:2px;width:10px;height:10px;background:#22c55e;border-radius:50%;border:2px solid #0a0a0a;box-shadow:0 0 8px rgba(34,197,94,0.5)}',
-            '.offcomfrt-header-info{display:flex;flex-direction:column;gap:3px}',
-            '.offcomfrt-header-title{font-size:18px;font-weight:700;letter-spacing:1.8px;text-transform:uppercase}',
-            '.offcomfrt-header-subtitle{font-size:13px;opacity:0.7;font-weight:500;display:flex;align-items:center;gap:6px}',
-            '.offcomfrt-header-subtitle::before{content:"";width:6px;height:6px;background:#22c55e;border-radius:50%;display:inline-block}',
-            '.offcomfrt-header-close{width:36px;height:36px;border-radius:50%;background:rgba(255,255,255,0.1);border:none;cursor:pointer;display:flex;align-items:center;justify-content:center;transition:all 0.25s ease}',
-            '.offcomfrt-header-close:hover{background:rgba(255,255,255,0.2);transform:rotate(90deg)}',
-            '.offcomfrt-header-close svg{width:18px;height:18px;stroke:#fff;stroke-width:2;stroke-linecap:round}',
+            '#offcomfrt-widget .ofc-header{background:linear-gradient(135deg,#0a0a0a,#1a1a1a 50%,#0a0a0a);color:#fff;padding:24px 22px;display:flex;align-items:center;justify-content:space-between;flex-shrink:0;position:relative;overflow:hidden}',
+            '#offcomfrt-widget .ofc-header-brand{display:flex;align-items:center;gap:14px}',
+            '#offcomfrt-widget .ofc-header-avatar{width:48px;height:48px;border-radius:50%;background:#fff;display:flex;align-items:center;justify-content:center;position:relative;box-shadow:0 2px 8px rgba(0,0,0,0.3);overflow:hidden;border:2px solid rgba(255,255,255,0.2)}',
+            '#offcomfrt-widget .ofc-header-avatar img{width:100%;height:100%;object-fit:cover}',
+            '#offcomfrt-widget .ofc-header-avatar::after{content:"";position:absolute;bottom:2px;right:2px;width:10px;height:10px;background:#22c55e;border-radius:50%;border:2px solid #0a0a0a;box-shadow:0 0 8px rgba(34,197,94,0.5)}',
+            '#offcomfrt-widget .ofc-header-info{display:flex;flex-direction:column;gap:3px}',
+            '#offcomfrt-widget .ofc-header-title{font-size:18px;font-weight:700;letter-spacing:1.8px;text-transform:uppercase}',
+            '#offcomfrt-widget .ofc-header-subtitle{font-size:13px;opacity:0.7;font-weight:500;display:flex;align-items:center;gap:6px}',
+            '#offcomfrt-widget .ofc-header-subtitle::before{content:"";width:6px;height:6px;background:#22c55e;border-radius:50%;display:inline-block}',
+            '#offcomfrt-widget .ofc-header-close{width:36px;height:36px;border-radius:50%;background:rgba(255,255,255,0.1);border:none;cursor:pointer;display:flex;align-items:center;justify-content:center;transition:all 0.25s ease}',
+            '#offcomfrt-widget .ofc-header-close:hover{background:rgba(255,255,255,0.2);transform:rotate(90deg)}',
+            '#offcomfrt-widget .ofc-header-close svg{width:18px;height:18px;stroke:#fff;stroke-width:2;stroke-linecap:round}',
 
             /* Chat Area */
-            '.offcomfrt-chat{flex:1;overflow-y:auto;padding:24px 16px;display:flex;flex-direction:column;gap:16px;scroll-behavior:smooth;background:#fafafa;min-height:0}',
-            '.offcomfrt-chat::-webkit-scrollbar{width:6px}',
-            '.offcomfrt-chat::-webkit-scrollbar-track{background:transparent}',
-            '.offcomfrt-chat::-webkit-scrollbar-thumb{background:rgba(0,0,0,0.15);border-radius:3px}',
+            '#offcomfrt-widget .ofc-chat{flex:1;overflow-y:auto;padding:24px 16px 20px;display:flex;flex-direction:column;gap:16px;scroll-behavior:smooth;background:#fafafa;min-height:0}',
+            '#offcomfrt-widget .ofc-chat::-webkit-scrollbar{width:6px}',
+            '#offcomfrt-widget .ofc-chat::-webkit-scrollbar-track{background:transparent}',
+            '#offcomfrt-widget .ofc-chat::-webkit-scrollbar-thumb{background:rgba(0,0,0,0.15);border-radius:3px}',
 
             /* Messages */
-            '#offcomfrt-widget .offcomfrt-msg-wrapper{display:flex;flex-direction:column;gap:4px;animation:offcomfrt-slideUp 0.35s cubic-bezier(0.16,1,0.3,1);padding:0 8px;margin:0 8px;width:calc(100% - 16px)}',
-            '#offcomfrt-widget .offcomfrt-align-left{align-items:flex-start}',
-            '#offcomfrt-widget .offcomfrt-align-right{align-items:flex-end}',
-            '@keyframes offcomfrt-slideUp{from{opacity:0;transform:translateY(8px) scale(0.98)}to{opacity:1;transform:translateY(0) scale(1)}}',
-            '.offcomfrt-msg{padding:16px 20px;border-radius:20px;font-size:14px;line-height:1.65;word-wrap:break-word;letter-spacing:0.01em}',
-            '.offcomfrt-msg-bot{align-self:flex-start;background:#fff;color:#1a1a1a;border-bottom-left-radius:8px;border:1px solid #e0e0e0;box-shadow:0 2px 8px rgba(0,0,0,0.06)}',
-            '.offcomfrt-msg-user{align-self:flex-end;background:linear-gradient(135deg,#1a1a1a,#000);color:#fff;border-bottom-right-radius:8px;border:1px solid #000;box-shadow:0 4px 12px rgba(0,0,0,0.2)}',
+            '#offcomfrt-widget .ofc-msg-wrap{display:flex;flex-direction:column;gap:4px;animation:ofc-slideUp 0.35s cubic-bezier(0.16,1,0.3,1)}',
+            '#offcomfrt-widget .ofc-align-left{align-items:flex-start}',
+            '#offcomfrt-widget .ofc-align-right{align-items:flex-end}',
+            '@keyframes ofc-slideUp{from{opacity:0;transform:translateY(8px) scale(0.98)}to{opacity:1;transform:translateY(0) scale(1)}}',
+            '#offcomfrt-widget .ofc-msg{padding:16px 20px;border-radius:20px;font-size:14px;line-height:1.65;word-wrap:break-word;letter-spacing:0.01em;max-width:88%}',
+            '#offcomfrt-widget .ofc-msg-bot{align-self:flex-start;background:#fff;color:#1a1a1a;border-bottom-left-radius:8px;border:1px solid #e0e0e0;box-shadow:0 2px 8px rgba(0,0,0,0.06)}',
+            '#offcomfrt-widget .ofc-msg-user{align-self:flex-end;background:linear-gradient(135deg,#1a1a1a,#000);color:#fff;border-bottom-right-radius:8px;border:1px solid #000;box-shadow:0 4px 12px rgba(0,0,0,0.2)}',
 
             /* Quick Actions */
-            '.offcomfrt-actions{display:flex;flex-wrap:wrap;gap:10px;padding:0 16px 12px;flex-shrink:0}',
-            '.offcomfrt-chip{padding:10px 18px;border-radius:24px;border:1.5px solid rgba(0,0,0,0.15);background:#fff;color:#1a1a1a;font-size:13px;font-weight:500;font-family:inherit;cursor:pointer;transition:all 0.25s cubic-bezier(0.34,1.56,0.64,1);letter-spacing:0.01em}',
-            '.offcomfrt-chip:hover{background:#000;color:#fff;border-color:#000;transform:translateY(-2px);box-shadow:0 4px 12px rgba(0,0,0,0.15)}',
-            '.offcomfrt-chip:active{transform:translateY(0) scale(0.96)}',
+            '#offcomfrt-widget .ofc-actions{display:flex;flex-wrap:wrap;gap:10px;padding:20px 16px 22px;flex-shrink:0;background:#fafafa;border-top:1px solid #e8e8e8}',
+            '#offcomfrt-widget .ofc-chip{padding:11px 20px;border-radius:24px;border:1.5px solid rgba(0,0,0,0.15);background:#fff;color:#1a1a1a;font-size:13px;font-weight:500;font-family:inherit;cursor:pointer;transition:all 0.25s cubic-bezier(0.34,1.56,0.64,1);letter-spacing:0.01em;white-space:nowrap}',
+            '#offcomfrt-widget .ofc-chip:hover{background:#000;color:#fff;border-color:#000;transform:translateY(-2px);box-shadow:0 4px 12px rgba(0,0,0,0.15)}',
+            '#offcomfrt-widget .ofc-chip:active{transform:translateY(0) scale(0.96)}',
 
             /* Input Area */
-            '.offcomfrt-input-area{padding:14px 16px 16px;border-top:2px solid #000;display:flex;align-items:center;gap:12px;flex-shrink:0;background:#fff}',
-            '.offcomfrt-input{flex:1;border:1.5px solid rgba(0,0,0,0.12);border-radius:28px;padding:12px 18px;font-size:14px;font-family:inherit;outline:none;transition:all 0.2s ease;background:#f8f9fa;color:#1a1a1a;min-height:44px;width:100%}',
-            '.offcomfrt-input:focus{border-color:rgba(0,0,0,0.3);background:#fff;box-shadow:0 0 0 4px rgba(0,0,0,0.06)}',
-            '.offcomfrt-input::placeholder{color:#aaa}',
-            '.offcomfrt-send-btn{width:44px;height:44px;border-radius:50%;background:linear-gradient(135deg,#1a1a1a,#000);border:none;cursor:pointer;display:flex;align-items:center;justify-content:center;transition:all 0.25s cubic-bezier(0.34,1.56,0.64,1);flex-shrink:0;box-shadow:0 4px 12px rgba(0,0,0,0.2)}',
-            '.offcomfrt-send-btn:hover{transform:scale(1.08)}',
-            '.offcomfrt-send-btn:active{transform:scale(0.92)}',
-            '.offcomfrt-send-btn svg{width:20px;height:20px;fill:none;stroke:#fff;stroke-width:2;stroke-linecap:round;stroke-linejoin:round}',
+            '#offcomfrt-widget .ofc-input-area{padding:16px 16px 18px;border-top:2px solid #000;display:flex;align-items:center;gap:12px;flex-shrink:0;background:#fff}',
+            '#offcomfrt-widget .ofc-input{flex:1;border:1.5px solid rgba(0,0,0,0.12);border-radius:28px;padding:12px 18px;font-size:14px;font-family:inherit;outline:none;transition:all 0.2s ease;background:#f8f9fa;color:#1a1a1a;min-height:44px;width:100%}',
+            '#offcomfrt-widget .ofc-input:focus{border-color:rgba(0,0,0,0.3);background:#fff;box-shadow:0 0 0 4px rgba(0,0,0,0.06)}',
+            '#offcomfrt-widget .ofc-input::placeholder{color:#aaa}',
+            '#offcomfrt-widget .ofc-send-btn{width:44px;height:44px;border-radius:50%;background:linear-gradient(135deg,#1a1a1a,#000);border:none;cursor:pointer;display:flex;align-items:center;justify-content:center;transition:all 0.25s cubic-bezier(0.34,1.56,0.64,1);flex-shrink:0;box-shadow:0 4px 12px rgba(0,0,0,0.2)}',
+            '#offcomfrt-widget .ofc-send-btn:hover{transform:scale(1.08)}',
+            '#offcomfrt-widget .ofc-send-btn:active{transform:scale(0.92)}',
+            '#offcomfrt-widget .ofc-send-btn svg{width:20px;height:20px;fill:none;stroke:#fff;stroke-width:2;stroke-linecap:round;stroke-linejoin:round}',
 
             /* Powered By */
-            '.offcomfrt-powered{text-align:center;padding:10px;font-size:10px;color:#999;letter-spacing:0.5px;flex-shrink:0;font-weight:600;text-transform:uppercase;background:#fff;border-top:1px solid #e5e5e5}',
+            '#offcomfrt-widget .ofc-powered{text-align:center;padding:10px;font-size:10px;color:#999;letter-spacing:0.5px;flex-shrink:0;font-weight:600;text-transform:uppercase;background:#fff;border-top:1px solid #e5e5e5}',
 
             /* Typing Indicator */
-            '.offcomfrt-typing{display:flex;gap:5px;padding:16px 20px;background:#fff;border-radius:20px;border-bottom-left-radius:8px;border:1px solid #e0e0e0;box-shadow:0 2px 8px rgba(0,0,0,0.06);align-self:flex-start}',
-            '.offcomfrt-typing-dot{width:7px;height:7px;border-radius:50%;background:#999;animation:offcomfrt-bounce 1.4s ease-in-out infinite}',
-            '.offcomfrt-typing-dot:nth-child(2){animation-delay:0.2s}',
-            '.offcomfrt-typing-dot:nth-child(3){animation-delay:0.4s}',
-            '@keyframes offcomfrt-bounce{0%,60%,100%{transform:translateY(0);opacity:0.5}30%{transform:translateY(-6px);opacity:1}}',
+            '#offcomfrt-widget .ofc-typing{display:flex;gap:5px;padding:16px 20px;background:#fff;border-radius:20px;border-bottom-left-radius:8px;border:1px solid #e0e0e0;box-shadow:0 2px 8px rgba(0,0,0,0.06);align-self:flex-start}',
+            '#offcomfrt-widget .ofc-typing-dot{width:7px;height:7px;border-radius:50%;background:#999;animation:ofc-bounce 1.4s ease-in-out infinite}',
+            '#offcomfrt-widget .ofc-typing-dot:nth-child(2){animation-delay:0.2s}',
+            '#offcomfrt-widget .ofc-typing-dot:nth-child(3){animation-delay:0.4s}',
+            '@keyframes ofc-bounce{0%,60%,100%{transform:translateY(0);opacity:0.5}30%{transform:translateY(-6px);opacity:1}}',
 
             /* Tracking Card */
-            '.offcomfrt-tracking-card{background:#fff;border:1px solid #e0e0e0;border-radius:16px;padding:20px;margin:4px 0;box-shadow:0 4px 16px rgba(0,0,0,0.06);animation:offcomfrt-slideUp 0.35s cubic-bezier(0.16,1,0.3,1);width:100%}',
-            '.offcomfrt-tracking-card-header{display:flex;justify-content:space-between;align-items:center;margin-bottom:16px;padding-bottom:14px;border-bottom:1px solid #f0f0f0}',
-            '.offcomfrt-tracking-carrier{font-size:11px;font-weight:600;color:#666;text-transform:uppercase;letter-spacing:0.8px}',
-            '.offcomfrt-tracking-status{font-size:11px;font-weight:600;padding:5px 12px;border-radius:12px;text-transform:uppercase;letter-spacing:0.5px}',
-            '.offcomfrt-status-delivered{background:#dcfce7;color:#16a34a}',
-            '.offcomfrt-status-transit{background:#dbeafe;color:#2563eb}',
-            '.offcomfrt-status-unknown{background:#f3f4f6;color:#6b7280}',
-            '.offcomfrt-tracking-row{display:flex;justify-content:space-between;align-items:center;padding:10px 0;border-bottom:1px solid #f5f5f5}',
-            '.offcomfrt-tracking-row:last-child{border-bottom:none}',
-            '.offcomfrt-tracking-row span:first-child{font-size:11px;font-weight:600;color:#999;text-transform:uppercase;letter-spacing:0.5px}',
-            '.offcomfrt-tracking-row span:last-child{font-size:13px;font-weight:500;color:#1a1a1a;text-align:right}',
-            '.offcomfrt-tracking-link{display:block;text-align:center;margin-top:16px;padding:12px;background:#f8f9fa;border-radius:12px;color:#1a1a1a;text-decoration:none;font-size:13px;font-weight:600;transition:all 0.2s ease;border:1px solid #e5e5e5}',
-            '.offcomfrt-tracking-link:hover{background:#000;color:#fff;border-color:#000}',
-            '.offcomfrt-timeline-title{font-size:11px;font-weight:700;color:#999;text-transform:uppercase;letter-spacing:0.8px;margin-top:16px}',
-            '.offcomfrt-timeline{margin-top:10px}',
-            '.offcomfrt-timeline-item{display:flex;gap:10px;padding:6px 0;border-bottom:1px solid #f7f7f7}',
-            '.offcomfrt-timeline-item:last-child{border-bottom:none}',
-            '.offcomfrt-timeline-dot{width:8px;height:8px;border-radius:50%;background:#1a1a1a;margin-top:4px;flex-shrink:0}',
-            '.offcomfrt-timeline-activity{font-size:13px;font-weight:500;color:#1a1a1a}',
-            '.offcomfrt-timeline-meta{font-size:11px;color:#999;margin-top:2px}',
+            '#offcomfrt-widget .ofc-tracking-card{background:#fff;border:1px solid #e0e0e0;border-radius:16px;padding:20px;margin:4px 0;box-shadow:0 4px 16px rgba(0,0,0,0.06);animation:ofc-slideUp 0.35s cubic-bezier(0.16,1,0.3,1);width:100%}',
+            '#offcomfrt-widget .ofc-tracking-card-header{display:flex;justify-content:space-between;align-items:center;margin-bottom:16px;padding-bottom:14px;border-bottom:1px solid #f0f0f0}',
+            '#offcomfrt-widget .ofc-tracking-carrier{font-size:11px;font-weight:600;color:#666;text-transform:uppercase;letter-spacing:0.8px}',
+            '#offcomfrt-widget .ofc-tracking-status{font-size:11px;font-weight:600;padding:5px 12px;border-radius:12px;text-transform:uppercase;letter-spacing:0.5px}',
+            '#offcomfrt-widget .ofc-status-delivered{background:#dcfce7;color:#16a34a}',
+            '#offcomfrt-widget .ofc-status-transit{background:#dbeafe;color:#2563eb}',
+            '#offcomfrt-widget .ofc-status-unknown{background:#f3f4f6;color:#6b7280}',
+            '#offcomfrt-widget .ofc-tracking-row{display:flex;justify-content:space-between;align-items:center;padding:10px 0;border-bottom:1px solid #f5f5f5}',
+            '#offcomfrt-widget .ofc-tracking-row:last-child{border-bottom:none}',
+            '#offcomfrt-widget .ofc-tracking-row span:first-child{font-size:11px;font-weight:600;color:#999;text-transform:uppercase;letter-spacing:0.5px}',
+            '#offcomfrt-widget .ofc-tracking-row span:last-child{font-size:13px;font-weight:500;color:#1a1a1a;text-align:right}',
+            '#offcomfrt-widget .ofc-tracking-link{display:block;text-align:center;margin-top:16px;padding:12px;background:#f8f9fa;border-radius:12px;color:#1a1a1a;text-decoration:none;font-size:13px;font-weight:600;transition:all 0.2s ease;border:1px solid #e5e5e5}',
+            '#offcomfrt-widget .ofc-tracking-link:hover{background:#000;color:#fff;border-color:#000}',
+            '#offcomfrt-widget .ofc-timeline-title{font-size:11px;font-weight:700;color:#999;text-transform:uppercase;letter-spacing:0.8px;margin-top:16px}',
+            '#offcomfrt-widget .ofc-timeline{margin-top:10px}',
+            '#offcomfrt-widget .ofc-timeline-item{display:flex;gap:10px;padding:6px 0;border-bottom:1px solid #f7f7f7}',
+            '#offcomfrt-widget .ofc-timeline-item:last-child{border-bottom:none}',
+            '#offcomfrt-widget .ofc-timeline-dot{width:8px;height:8px;border-radius:50%;background:#1a1a1a;margin-top:4px;flex-shrink:0}',
+            '#offcomfrt-widget .ofc-timeline-activity{font-size:13px;font-weight:500;color:#1a1a1a}',
+            '#offcomfrt-widget .ofc-timeline-meta{font-size:11px;color:#999;margin-top:2px}',
 
             /* Ticket Form */
-            '.offcomfrt-ticket-form{background:#fff;border:1px solid #e0e0e0;border-radius:16px;padding:20px;margin:4px 0;box-shadow:0 4px 16px rgba(0,0,0,0.06);animation:offcomfrt-slideUp 0.35s cubic-bezier(0.16,1,0.3,1);width:100%}',
-            '.offcomfrt-ticket-form h4{font-size:15px;font-weight:700;margin-bottom:16px;color:#1a1a1a}',
-            '.offcomfrt-form-group{margin-bottom:12px}',
-            '.offcomfrt-form-group label{display:block;font-size:11px;font-weight:600;color:#999;text-transform:uppercase;letter-spacing:0.5px;margin-bottom:6px}',
-            '.offcomfrt-ticket-form input,.offcomfrt-ticket-form textarea{width:100%;border:1.5px solid #e5e5e5;border-radius:12px;padding:12px 16px;font-size:13px;font-family:inherit;outline:none;transition:all 0.2s ease;background:#f8f9fa;color:#1a1a1a}',
-            '.offcomfrt-ticket-form input:focus,.offcomfrt-ticket-form textarea:focus{border-color:#000;background:#fff;box-shadow:0 0 0 3px rgba(0,0,0,0.06)}',
-            '.offcomfrt-ticket-form textarea{resize:vertical;min-height:80px}',
-            '.offcomfrt-form-submit{width:100%;padding:14px;background:linear-gradient(135deg,#1a1a1a,#000);color:#fff;border:none;border-radius:12px;font-size:14px;font-weight:600;font-family:inherit;cursor:pointer;transition:all 0.25s;letter-spacing:0.5px;margin-top:4px}',
-            '.offcomfrt-form-submit:hover{transform:translateY(-2px);box-shadow:0 6px 16px rgba(0,0,0,0.2)}',
-            '.offcomfrt-form-submit:active{transform:translateY(0) scale(0.98)}',
-            '.offcomfrt-form-submit:disabled{opacity:0.6;cursor:not-allowed;transform:none}',
+            '#offcomfrt-widget .ofc-ticket-form{background:#fff;border:1px solid #e0e0e0;border-radius:16px;padding:20px;margin:4px 0;box-shadow:0 4px 16px rgba(0,0,0,0.06);animation:ofc-slideUp 0.35s cubic-bezier(0.16,1,0.3,1);width:100%}',
+            '#offcomfrt-widget .ofc-ticket-form h4{font-size:15px;font-weight:700;margin-bottom:16px;color:#1a1a1a}',
+            '#offcomfrt-widget .ofc-form-group{margin-bottom:12px}',
+            '#offcomfrt-widget .ofc-form-group label{display:block;font-size:11px;font-weight:600;color:#999;text-transform:uppercase;letter-spacing:0.5px;margin-bottom:6px}',
+            '#offcomfrt-widget .ofc-ticket-form input,#offcomfrt-widget .ofc-ticket-form textarea{width:100%;border:1.5px solid #e5e5e5;border-radius:12px;padding:12px 16px;font-size:13px;font-family:inherit;outline:none;transition:all 0.2s ease;background:#f8f9fa;color:#1a1a1a}',
+            '#offcomfrt-widget .ofc-ticket-form input:focus,#offcomfrt-widget .ofc-ticket-form textarea:focus{border-color:#000;background:#fff;box-shadow:0 0 0 3px rgba(0,0,0,0.06)}',
+            '#offcomfrt-widget .ofc-ticket-form textarea{resize:vertical;min-height:80px}',
+            '#offcomfrt-widget .ofc-form-submit{width:100%;padding:14px;background:linear-gradient(135deg,#1a1a1a,#000);color:#fff;border:none;border-radius:12px;font-size:14px;font-weight:600;font-family:inherit;cursor:pointer;transition:all 0.25s;letter-spacing:0.5px;margin-top:4px}',
+            '#offcomfrt-widget .ofc-form-submit:hover{transform:translateY(-2px);box-shadow:0 6px 16px rgba(0,0,0,0.2)}',
+            '#offcomfrt-widget .ofc-form-submit:active{transform:translateY(0) scale(0.98)}',
+            '#offcomfrt-widget .ofc-form-submit:disabled{opacity:0.6;cursor:not-allowed;transform:none}',
 
             /* Ticket Confirmation */
-            '.offcomfrt-ticket-confirmation{background:#fff;border:1px solid #e0e0e0;border-radius:16px;padding:28px 24px;margin:4px 0;text-align:center;box-shadow:0 4px 16px rgba(0,0,0,0.06);animation:offcomfrt-slideUp 0.35s cubic-bezier(0.16,1,0.3,1);width:100%}',
-            '.offcomfrt-ticket-confirm-icon{width:52px;height:52px;border-radius:50%;background:linear-gradient(135deg,#dcfce7,#bbf7d0);display:flex;align-items:center;justify-content:center;margin:0 auto 16px}',
-            '.offcomfrt-ticket-confirm-icon svg{width:26px;height:26px;stroke:#16a34a;stroke-width:2.5;fill:none;stroke-linecap:round;stroke-linejoin:round}',
-            '.offcomfrt-ticket-confirmation h4{font-size:17px;font-weight:700;margin-bottom:8px;color:#1a1a1a}',
-            '.offcomfrt-ticket-confirmation p{font-size:13px;color:#666;margin-bottom:16px;line-height:1.5}',
-            '.offcomfrt-ticket-number{display:inline-block;background:#f3f4f6;padding:8px 16px;border-radius:8px;font-size:14px;font-weight:600;color:#1a1a1a;margin-bottom:16px;font-family:"SF Mono",Monaco,monospace}',
-            '.offcomfrt-whatsapp-btn{display:inline-flex;align-items:center;gap:8px;padding:14px 24px;background:#25d366;color:#fff;border:none;border-radius:12px;font-size:14px;font-weight:600;font-family:inherit;cursor:pointer;text-decoration:none;transition:all 0.25s;box-shadow:0 4px 12px rgba(37,211,102,0.3)}',
-            '.offcomfrt-whatsapp-btn:hover{transform:translateY(-2px);box-shadow:0 6px 16px rgba(37,211,102,0.4)}',
-            '.offcomfrt-whatsapp-btn svg{width:18px;height:18px;fill:currentColor}',
+            '#offcomfrt-widget .ofc-ticket-confirmation{background:#fff;border:1px solid #e0e0e0;border-radius:16px;padding:28px 24px;margin:4px 0;text-align:center;box-shadow:0 4px 16px rgba(0,0,0,0.06);animation:ofc-slideUp 0.35s cubic-bezier(0.16,1,0.3,1);width:100%}',
+            '#offcomfrt-widget .ofc-ticket-confirm-icon{width:52px;height:52px;border-radius:50%;background:linear-gradient(135deg,#dcfce7,#bbf7d0);display:flex;align-items:center;justify-content:center;margin:0 auto 16px}',
+            '#offcomfrt-widget .ofc-ticket-confirm-icon svg{width:26px;height:26px;stroke:#16a34a;stroke-width:2.5;fill:none;stroke-linecap:round;stroke-linejoin:round}',
+            '#offcomfrt-widget .ofc-ticket-confirmation h4{font-size:17px;font-weight:700;margin-bottom:8px;color:#1a1a1a}',
+            '#offcomfrt-widget .ofc-ticket-confirmation p{font-size:13px;color:#666;margin-bottom:16px;line-height:1.5}',
+            '#offcomfrt-widget .ofc-ticket-number{display:inline-block;background:#f3f4f6;padding:8px 16px;border-radius:8px;font-size:14px;font-weight:600;color:#1a1a1a;margin-bottom:16px;font-family:"SF Mono",Monaco,monospace}',
+            '#offcomfrt-widget .ofc-whatsapp-btn{display:inline-flex;align-items:center;gap:8px;padding:14px 24px;background:#25d366;color:#fff;border:none;border-radius:12px;font-size:14px;font-weight:600;font-family:inherit;cursor:pointer;text-decoration:none;transition:all 0.25s;box-shadow:0 4px 12px rgba(37,211,102,0.3)}',
+            '#offcomfrt-widget .ofc-whatsapp-btn:hover{transform:translateY(-2px);box-shadow:0 6px 16px rgba(37,211,102,0.4)}',
+            '#offcomfrt-widget .ofc-whatsapp-btn svg{width:18px;height:18px;fill:currentColor}',
 
             /* Rich Message Formatting */
-            '.offcomfrt-msg-bot strong{font-weight:700}',
-            '.offcomfrt-msg-bot em{font-style:italic}',
-            '.offcomfrt-msg-bot ul,.offcomfrt-msg-bot ol{margin:6px 0;padding-left:18px}',
-            '.offcomfrt-msg-bot li{margin:2px 0}',
-            '.offcomfrt-msg-bot br+br{display:none}',
+            '#offcomfrt-widget .ofc-msg-bot strong{font-weight:700}',
+            '#offcomfrt-widget .ofc-msg-bot em{font-style:italic}',
+            '#offcomfrt-widget .ofc-msg-bot ul,#offcomfrt-widget .ofc-msg-bot ol{margin:6px 0;padding-left:18px}',
+            '#offcomfrt-widget .ofc-msg-bot li{margin:2px 0}',
+            '#offcomfrt-widget .ofc-msg-bot br+br{display:none}',
 
             /* Return/Exchange Status Card */
-            '.offcomfrt-return-card{background:#fff;border:1px solid #e0e0e0;border-radius:16px;padding:20px;margin:4px 0;box-shadow:0 4px 16px rgba(0,0,0,0.06);animation:offcomfrt-slideUp 0.35s cubic-bezier(0.16,1,0.3,1);width:100%}',
-            '.offcomfrt-return-card-header{display:flex;justify-content:space-between;align-items:center;margin-bottom:14px;padding-bottom:12px;border-bottom:1px solid #f0f0f0}',
-            '.offcomfrt-return-type{font-size:11px;font-weight:600;color:#666;text-transform:uppercase;letter-spacing:0.8px}',
-            '.offcomfrt-return-status{font-size:11px;font-weight:600;padding:5px 12px;border-radius:12px;text-transform:uppercase;letter-spacing:0.5px}',
-            '.offcomfrt-return-approved{background:#dcfce7;color:#16a34a}',
-            '.offcomfrt-return-pending{background:#fef3c7;color:#d97706}',
-            '.offcomfrt-return-rejected{background:#fee2e2;color:#dc2626}',
-            '.offcomfrt-return-row{display:flex;justify-content:space-between;padding:8px 0;border-bottom:1px solid #f5f5f5;font-size:13px}',
-            '.offcomfrt-return-row:last-child{border-bottom:none}',
-            '.offcomfrt-return-row .label{color:#999;font-size:11px;text-transform:uppercase;letter-spacing:0.5px}',
-            '.offcomfrt-return-row .value{color:#1a1a1a;font-weight:500}',
+            '#offcomfrt-widget .ofc-return-card{background:#fff;border:1px solid #e0e0e0;border-radius:16px;padding:20px;margin:4px 0;box-shadow:0 4px 16px rgba(0,0,0,0.06);animation:ofc-slideUp 0.35s cubic-bezier(0.16,1,0.3,1);width:100%}',
+            '#offcomfrt-widget .ofc-return-card-header{display:flex;justify-content:space-between;align-items:center;margin-bottom:14px;padding-bottom:12px;border-bottom:1px solid #f0f0f0}',
+            '#offcomfrt-widget .ofc-return-type{font-size:11px;font-weight:600;color:#666;text-transform:uppercase;letter-spacing:0.8px}',
+            '#offcomfrt-widget .ofc-return-status{font-size:11px;font-weight:600;padding:5px 12px;border-radius:12px;text-transform:uppercase;letter-spacing:0.5px}',
+            '#offcomfrt-widget .ofc-return-approved{background:#dcfce7;color:#16a34a}',
+            '#offcomfrt-widget .ofc-return-pending{background:#fef3c7;color:#d97706}',
+            '#offcomfrt-widget .ofc-return-rejected{background:#fee2e2;color:#dc2626}',
+            '#offcomfrt-widget .ofc-return-row{display:flex;justify-content:space-between;padding:8px 0;border-bottom:1px solid #f5f5f5;font-size:13px}',
+            '#offcomfrt-widget .ofc-return-row:last-child{border-bottom:none}',
+            '#offcomfrt-widget .ofc-return-row .label{color:#999;font-size:11px;text-transform:uppercase;letter-spacing:0.5px}',
+            '#offcomfrt-widget .ofc-return-row .value{color:#1a1a1a;font-weight:500}',
 
             /* Resolution Card */
-            '.offcomfrt-resolution-card{background:linear-gradient(135deg,#f0fdf4,#dcfce7);border:1px solid #bbf7d0;border-radius:16px;padding:24px;margin:4px 0;text-align:center;box-shadow:0 4px 16px rgba(0,0,0,0.06);animation:offcomfrt-slideUp 0.35s cubic-bezier(0.16,1,0.3,1);width:100%}',
-            '.offcomfrt-resolution-icon{width:44px;height:44px;border-radius:50%;background:#22c55e;display:flex;align-items:center;justify-content:center;margin:0 auto 12px}',
-            '.offcomfrt-resolution-icon svg{width:22px;height:22px;stroke:#fff;stroke-width:2.5;fill:none;stroke-linecap:round;stroke-linejoin:round}',
-            '.offcomfrt-resolution-card h4{font-size:15px;font-weight:700;color:#16a34a;margin-bottom:6px}',
-            '.offcomfrt-resolution-card p{font-size:13px;color:#4b5563;line-height:1.5}',
+            '#offcomfrt-widget .ofc-resolution-card{background:linear-gradient(135deg,#f0fdf4,#dcfce7);border:1px solid #bbf7d0;border-radius:16px;padding:24px;margin:4px 0;text-align:center;box-shadow:0 4px 16px rgba(0,0,0,0.06);animation:ofc-slideUp 0.35s cubic-bezier(0.16,1,0.3,1);width:100%}',
+            '#offcomfrt-widget .ofc-resolution-icon{width:44px;height:44px;border-radius:50%;background:#22c55e;display:flex;align-items:center;justify-content:center;margin:0 auto 12px}',
+            '#offcomfrt-widget .ofc-resolution-icon svg{width:22px;height:22px;stroke:#fff;stroke-width:2.5;fill:none;stroke-linecap:round;stroke-linejoin:round}',
+            '#offcomfrt-widget .ofc-resolution-card h4{font-size:15px;font-weight:700;color:#16a34a;margin-bottom:6px}',
+            '#offcomfrt-widget .ofc-resolution-card p{font-size:13px;color:#4b5563;line-height:1.5}',
 
             /* Mobile */
             '@media(max-width:480px){',
             '#offcomfrt-widget{bottom:0;right:0;left:0;width:100%;height:90vh;max-height:750px;border-radius:24px 24px 0 0;border:none;border-top:2px solid #000;box-shadow:0 -12px 48px rgba(0,0,0,0.2)}',
             '#offcomfrt-widget-btn{bottom:20px;right:20px;width:56px;height:56px}',
-            '.offcomfrt-header{padding:20px 16px}',
-            '.offcomfrt-chat{padding:20px 12px;gap:14px}',
-            '#offcomfrt-widget .offcomfrt-msg-wrapper{padding:0 6px;margin:0 6px;width:calc(100% - 12px)}',
-            '.offcomfrt-actions{padding:0 12px 10px}',
-            '.offcomfrt-input-area{padding:12px 12px 14px}',
+            '#offcomfrt-widget .ofc-header{padding:20px 16px}',
+            '#offcomfrt-widget .ofc-chat{padding:20px 12px 16px;gap:14px}',
+            '#offcomfrt-widget .ofc-actions{padding:20px 12px 22px}',
+            '#offcomfrt-widget .ofc-input-area{padding:14px 12px 16px}',
             '}'
         ].join('\n');
         document.head.appendChild(style);
@@ -212,42 +211,42 @@
         var widget = document.createElement('div');
         widget.id = 'offcomfrt-widget';
         widget.innerHTML =
-            '<div class="offcomfrt-header">' +
-                '<div class="offcomfrt-header-brand">' +
-                    '<div class="offcomfrt-header-avatar">' +
+            '<div class="ofc-header">' +
+                '<div class="ofc-header-brand">' +
+                    '<div class="ofc-header-avatar">' +
                         '<img src="' + API_URL + '/widget/logo.jpg" alt="' + BRAND_NAME + '" />' +
                     '</div>' +
-                    '<div class="offcomfrt-header-info">' +
-                        '<span class="offcomfrt-header-title">' + BRAND_NAME + '</span>' +
-                        '<span class="offcomfrt-header-subtitle">Online now</span>' +
+                    '<div class="ofc-header-info">' +
+                        '<span class="ofc-header-title">' + BRAND_NAME + '</span>' +
+                        '<span class="ofc-header-subtitle">Online now</span>' +
                     '</div>' +
                 '</div>' +
-                '<button class="offcomfrt-header-close" aria-label="Close">' +
+                '<button class="ofc-header-close" aria-label="Close">' +
                     '<svg viewBox="0 0 24 24">' +
                         '<line x1="18" y1="6" x2="6" y2="18"/>' +
                         '<line x1="6" y1="6" x2="18" y2="18"/>' +
                     '</svg>' +
                 '</button>' +
             '</div>' +
-            '<div class="offcomfrt-chat" id="offcomfrt-chat"></div>' +
-            '<div class="offcomfrt-actions" id="offcomfrt-actions"></div>' +
-            '<div class="offcomfrt-input-area">' +
-                '<input type="text" class="offcomfrt-input" id="offcomfrt-input" placeholder="Type a message..." autocomplete="off" />' +
-                '<button class="offcomfrt-send-btn" id="offcomfrt-send-btn" aria-label="Send">' +
+            '<div class="ofc-chat" id="ofc-chat"></div>' +
+            '<div class="ofc-actions" id="ofc-actions"></div>' +
+            '<div class="ofc-input-area">' +
+                '<input type="text" class="ofc-input" id="ofc-input" placeholder="Type a message..." autocomplete="off" />' +
+                '<button class="ofc-send-btn" id="ofc-send-btn" aria-label="Send">' +
                     '<svg viewBox="0 0 24 24">' +
                         '<line x1="22" y1="2" x2="11" y2="13"/>' +
                         '<polygon points="22 2 15 22 11 13 2 9 22 2"/>' +
                     '</svg>' +
                 '</button>' +
             '</div>' +
-            '<div class="offcomfrt-powered">Powered by ' + BRAND_NAME + '</div>';
+            '<div class="ofc-powered">Powered by ' + BRAND_NAME + '</div>';
 
         document.body.appendChild(widget);
 
         // Event listeners
-        widget.querySelector('.offcomfrt-header-close').addEventListener('click', closeWidget);
-        widget.querySelector('#offcomfrt-send-btn').addEventListener('click', handleSend);
-        widget.querySelector('#offcomfrt-input').addEventListener('keydown', function (e) {
+        widget.querySelector('.ofc-header-close').addEventListener('click', closeWidget);
+        widget.querySelector('#ofc-send-btn').addEventListener('click', handleSend);
+        widget.querySelector('#ofc-input').addEventListener('keydown', function (e) {
             if (e.key === 'Enter' && !e.shiftKey) {
                 e.preventDefault();
                 handleSend();
@@ -287,7 +286,7 @@
         btn.style.display = 'none';
         isOpen = true;
         setTimeout(function () {
-            document.getElementById('offcomfrt-input').focus();
+            document.getElementById('ofc-input').focus();
         }, 300);
     }
 
@@ -307,7 +306,7 @@
     }
 
     function showQuickActions() {
-        var actionsEl = document.getElementById('offcomfrt-actions');
+        var actionsEl = document.getElementById('ofc-actions');
         actionsEl.innerHTML = '';
         var actions = [
             { label: 'Track Order', action: 'track' },
@@ -319,7 +318,7 @@
         ];
         actions.forEach(function (a) {
             var chip = document.createElement('button');
-            chip.className = 'offcomfrt-chip';
+            chip.className = 'ofc-chip';
             chip.textContent = a.label;
             chip.addEventListener('click', function () {
                 handleQuickAction(a.action);
@@ -329,7 +328,7 @@
     }
 
     function hideQuickActions() {
-        document.getElementById('offcomfrt-actions').innerHTML = '';
+        document.getElementById('ofc-actions').innerHTML = '';
     }
 
     function handleQuickAction(action) {
@@ -355,13 +354,13 @@
     }
 
     function setInputPlaceholder(text) {
-        document.getElementById('offcomfrt-input').placeholder = text;
+        document.getElementById('ofc-input').placeholder = text;
     }
 
     // ---------- Message Handling ----------
 
     function handleSend() {
-        var input = document.getElementById('offcomfrt-input');
+        var input = document.getElementById('ofc-input');
         var text = input.value.trim();
         if (!text || isTyping) return;
 
@@ -378,11 +377,11 @@
     }
 
     function addUserMessage(text, save) {
-        var chat = document.getElementById('offcomfrt-chat');
+        var chat = document.getElementById('ofc-chat');
         var wrapper = document.createElement('div');
-        wrapper.className = 'offcomfrt-msg-wrapper offcomfrt-align-right';
+        wrapper.className = 'ofc-msg-wrap ofc-align-right';
         var msg = document.createElement('div');
-        msg.className = 'offcomfrt-msg offcomfrt-msg-user';
+        msg.className = 'ofc-msg ofc-msg-user';
         msg.textContent = text;
         wrapper.appendChild(msg);
         chat.appendChild(wrapper);
@@ -394,11 +393,11 @@
     }
 
     function addBotMessage(text, save) {
-        var chat = document.getElementById('offcomfrt-chat');
+        var chat = document.getElementById('ofc-chat');
         var wrapper = document.createElement('div');
-        wrapper.className = 'offcomfrt-msg-wrapper offcomfrt-align-left';
+        wrapper.className = 'ofc-msg-wrap ofc-align-left';
         var msg = document.createElement('div');
-        msg.className = 'offcomfrt-msg offcomfrt-msg-bot';
+        msg.className = 'ofc-msg ofc-msg-bot';
         msg.innerHTML = formatBotMessage(text);
         wrapper.appendChild(msg);
         chat.appendChild(wrapper);
@@ -409,20 +408,11 @@
         }
     }
 
-    /**
-     * Convert simple markdown-like formatting to HTML:
-     * **bold** → <strong>, *italic* → <em>,
-     * - item → <li> (grouped into <ul>),
-     * \n → <br>
-     */
     function formatBotMessage(text) {
         if (!text) return '';
         var escaped = escapeHtml(text);
-        // Bold: **text**
         escaped = escaped.replace(/\*\*(.+?)\*\*/g, '<strong>$1</strong>');
-        // Italic: *text*
         escaped = escaped.replace(/\*(.+?)\*/g, '<em>$1</em>');
-        // Lists: lines starting with "- "
         var lines = escaped.split('\n');
         var html = '';
         var inList = false;
@@ -443,18 +433,18 @@
 
     function showTyping() {
         isTyping = true;
-        var chat = document.getElementById('offcomfrt-chat');
+        var chat = document.getElementById('ofc-chat');
         var typing = document.createElement('div');
-        typing.className = 'offcomfrt-typing';
-        typing.id = 'offcomfrt-typing';
-        typing.innerHTML = '<div class="offcomfrt-typing-dot"></div><div class="offcomfrt-typing-dot"></div><div class="offcomfrt-typing-dot"></div>';
+        typing.className = 'ofc-typing';
+        typing.id = 'ofc-typing';
+        typing.innerHTML = '<div class="ofc-typing-dot"></div><div class="ofc-typing-dot"></div><div class="ofc-typing-dot"></div>';
         chat.appendChild(typing);
         scrollToBottom();
     }
 
     function hideTyping() {
         isTyping = false;
-        var typing = document.getElementById('offcomfrt-typing');
+        var typing = document.getElementById('ofc-typing');
         if (typing) typing.remove();
     }
 
@@ -473,7 +463,6 @@
                 if (data.reply) {
                     addBotMessage(data.reply);
                 }
-                // Handle rich card responses from the AI
                 if (data.cardType === 'return' && data.cardData) {
                     addReturnCard(data.cardData);
                 } else if (data.cardType === 'resolution' && data.cardData) {
@@ -491,16 +480,16 @@
     }
 
     function showTicketSuggestion() {
-        var chat = document.getElementById('offcomfrt-chat');
+        var chat = document.getElementById('ofc-chat');
         var wrapper = document.createElement('div');
-        wrapper.className = 'offcomfrt-msg-wrapper offcomfrt-align-left';
+        wrapper.className = 'ofc-msg-wrap ofc-align-left';
         var msg = document.createElement('div');
-        msg.className = 'offcomfrt-msg offcomfrt-msg-bot';
-        msg.innerHTML = 'Would you like to speak with a human agent? <button class="offcomfrt-chip" id="offcomfrt-suggest-ticket-btn" style="margin-left:6px;font-size:11px;padding:4px 12px;">Create Ticket</button>';
+        msg.className = 'ofc-msg ofc-msg-bot';
+        msg.innerHTML = 'Would you like to speak with a human agent? <button class="ofc-chip" id="ofc-suggest-ticket-btn" style="margin-left:6px;font-size:11px;padding:4px 12px;">Create Ticket</button>';
         wrapper.appendChild(msg);
         chat.appendChild(wrapper);
         scrollToBottom();
-        document.getElementById('offcomfrt-suggest-ticket-btn').addEventListener('click', showTicketForm);
+        document.getElementById('ofc-suggest-ticket-btn').addEventListener('click', showTicketForm);
     }
 
     // ---------- Order Tracking ----------
@@ -510,7 +499,6 @@
         var body = { sessionId: sessionId };
         var cleaned = query.replace(/\s/g, '');
         if (/^#?\d{4,9}$/.test(cleaned)) {
-            // Order ID (4-5 digit OFFCOMFRT order numbers) — AWB resolved internally
             body.orderId = cleaned.replace(/^#/, '');
         } else if (/^\d{10,}$/.test(cleaned)) {
             body.awb = cleaned;
@@ -533,8 +521,6 @@
                     showQuickActions();
                 } else {
                     addTrackingCard(data);
-                    // Let the AI know tracking just happened so follow-up
-                    // questions ("is it out for delivery?") share the context.
                     notifyAIOfTracking(data);
                 }
             })
@@ -545,11 +531,6 @@
             });
     }
 
-    /**
-     * Silently record the direct-tracking exchange into the AI session so
-     * follow-up questions ("when will it arrive?") know the order + status
-     * without asking the customer for the order number again.
-     */
     function notifyAIOfTracking(data) {
         var orderId = String(data.orderId || '').replace(/^#/, '').trim();
         var summary = 'Tracking shown for order ' + (orderId || 'the customer\'s order')
@@ -563,76 +544,75 @@
                 botMessage: summary,
                 entities: /^\d{3,6}$/.test(orderId) ? { orderId: orderId } : {}
             })
-        }).catch(function () { /* non-critical — never block the UI on this */ });
+        }).catch(function () { });
     }
 
     function addTrackingCard(data, save) {
-        var chat = document.getElementById('offcomfrt-chat');
+        var chat = document.getElementById('ofc-chat');
         var wrapper = document.createElement('div');
-        wrapper.className = 'offcomfrt-msg-wrapper offcomfrt-align-left';
+        wrapper.className = 'ofc-msg-wrap ofc-align-left';
 
         var card = document.createElement('div');
-        card.className = 'offcomfrt-tracking-card';
+        card.className = 'ofc-tracking-card';
 
         var statusText = data.status || 'Unknown';
-        var statusClass = 'offcomfrt-status-unknown';
-        if (/delivered/i.test(statusText)) statusClass = 'offcomfrt-status-delivered';
-        else if (/transit|shipped|dispatched|in.?transit|out.?for.?delivery/i.test(statusText)) statusClass = 'offcomfrt-status-transit';
+        var statusClass = 'ofc-status-unknown';
+        if (/delivered/i.test(statusText)) statusClass = 'ofc-status-delivered';
+        else if (/transit|shipped|dispatched|in.?transit|out.?for.?delivery/i.test(statusText)) statusClass = 'ofc-status-transit';
 
         var carrierName = data.carrierName || 'Carrier';
         if (carrierName.toUpperCase() === 'SHIPROCKET') carrierName = 'Shiprocket';
         else if (carrierName.toUpperCase() === 'DELHIVERY') carrierName = 'Delhivery';
         else if (carrierName.toUpperCase() === 'EKART') carrierName = 'Ekart';
 
-        var html = '<div class="offcomfrt-tracking-card-header">';
-        html += '<span class="offcomfrt-tracking-carrier">' + escapeHtml(carrierName) + '</span>';
-        html += '<span class="offcomfrt-tracking-status ' + statusClass + '">' + escapeHtml(statusText) + '</span>';
+        var html = '<div class="ofc-tracking-card-header">';
+        html += '<span class="ofc-tracking-carrier">' + escapeHtml(carrierName) + '</span>';
+        html += '<span class="ofc-tracking-status ' + statusClass + '">' + escapeHtml(statusText) + '</span>';
         html += '</div>';
 
         if (data.orderId) {
-            html += '<div class="offcomfrt-tracking-row"><span>Order Number</span><span>' + escapeHtml(data.orderId) + '</span></div>';
+            html += '<div class="ofc-tracking-row"><span>Order Number</span><span>' + escapeHtml(data.orderId) + '</span></div>';
         }
         if (data.awb) {
-            html += '<div class="offcomfrt-tracking-row"><span>AWB Number</span><span>' + escapeHtml(data.awb) + '</span></div>';
+            html += '<div class="ofc-tracking-row"><span>AWB Number</span><span>' + escapeHtml(data.awb) + '</span></div>';
         }
         if (data.location) {
-            html += '<div class="offcomfrt-tracking-row"><span>Current Location</span><span>' + escapeHtml(data.location) + '</span></div>';
+            html += '<div class="ofc-tracking-row"><span>Current Location</span><span>' + escapeHtml(data.location) + '</span></div>';
         }
         if (data.shippedDate) {
-            html += '<div class="offcomfrt-tracking-row"><span>Shipped Date</span><span>' + escapeHtml(data.shippedDate) + '</span></div>';
+            html += '<div class="ofc-tracking-row"><span>Shipped Date</span><span>' + escapeHtml(data.shippedDate) + '</span></div>';
         }
         if (data.expectedDelivery) {
-            html += '<div class="offcomfrt-tracking-row"><span>Expected Delivery</span><span>' + escapeHtml(data.expectedDelivery) + '</span></div>';
+            html += '<div class="ofc-tracking-row"><span>Expected Delivery</span><span>' + escapeHtml(data.expectedDelivery) + '</span></div>';
         }
         if (data.deliveredDate) {
-            html += '<div class="offcomfrt-tracking-row"><span>Delivered Date</span><span>' + escapeHtml(data.deliveredDate) + '</span></div>';
+            html += '<div class="ofc-tracking-row"><span>Delivered Date</span><span>' + escapeHtml(data.deliveredDate) + '</span></div>';
         }
         if (data.note) {
-            html += '<div class="offcomfrt-tracking-row"><span></span><span style="color:#666;font-style:italic;font-size:12px;">' + escapeHtml(data.note) + '</span></div>';
+            html += '<div class="ofc-tracking-row"><span></span><span style="color:#666;font-style:italic;font-size:12px;">' + escapeHtml(data.note) + '</span></div>';
         }
 
-        // Shipment timeline (most recent scans first)
         if (data.timeline && data.timeline.length) {
-            html += '<div class="offcomfrt-timeline-title">Shipment Timeline</div>';
-            html += '<div class="offcomfrt-timeline">';
+            html += '<div class="ofc-timeline-title">Shipment Timeline</div>';
+            html += '<div class="ofc-timeline">';
             var items = data.timeline.slice();
             items.sort(function (a, b) { return (Date.parse(b.date || '') || 0) - (Date.parse(a.date || '') || 0); });
             items = items.slice(0, 8);
             items.forEach(function (t) {
                 var label = t.activity || t.status || 'Update';
                 var meta = [t.date, t.location].filter(Boolean).join(' &middot; ');
-                html += '<div class="offcomfrt-timeline-item">';
-                html += '<div class="offcomfrt-timeline-dot"></div>';
-                html += '<div class="offcomfrt-timeline-text">';
-                html += '<div class="offcomfrt-timeline-activity">' + escapeHtml(label) + '</div>';
-                if (meta) html += '<div class="offcomfrt-timeline-meta">' + escapeHtml(meta) + '</div>';
+                html += '<div class="ofc-timeline-item">';
+                html += '<div class="ofc-timeline-dot"></div>';
+                html += '<div class="ofc-timeline-text">';
+                html += '<div class="ofc-timeline-activity">' + escapeHtml(label) + '</div>';
+                if (meta) html += '<div class="ofc-timeline-meta">' + escapeHtml(meta) + '</div>';
                 html += '</div></div>';
             });
             html += '</div>';
         }
 
         if (data.trackingUrl) {
-            html += '<a href="' + escapeHtml(data.trackingUrl) + '" target="_blank" class="offcomfrt-tracking-link">Track Live &rarr;</a>';
+            html += '<a href="' + escapeHtml(data.trackingUrl) + '" target="_blank" class="ofc-tracking-link">Track Live &rarr;</a>';
         }
 
         card.innerHTML = html;
@@ -649,42 +629,42 @@
     // ---------- Return/Exchange Status Card ----------
 
     function addReturnCard(data, save) {
-        var chat = document.getElementById('offcomfrt-chat');
+        var chat = document.getElementById('ofc-chat');
         var wrapper = document.createElement('div');
-        wrapper.className = 'offcomfrt-msg-wrapper offcomfrt-align-left';
+        wrapper.className = 'ofc-msg-wrap ofc-align-left';
 
         var card = document.createElement('div');
-        card.className = 'offcomfrt-return-card';
+        card.className = 'ofc-return-card';
 
         var statusText = data.status || 'Pending';
-        var statusClass = 'offcomfrt-return-pending';
-        if (/approved|completed|picked.?up/i.test(statusText)) statusClass = 'offcomfrt-return-approved';
-        else if (/rejected|denied|cancelled/i.test(statusText)) statusClass = 'offcomfrt-return-rejected';
+        var statusClass = 'ofc-return-pending';
+        if (/approved|completed|picked.?up/i.test(statusText)) statusClass = 'ofc-return-approved';
+        else if (/rejected|denied|cancelled/i.test(statusText)) statusClass = 'ofc-return-rejected';
 
         var typeLabel = data.type || 'Return';
 
-        var html = '<div class="offcomfrt-return-card-header">';
-        html += '<span class="offcomfrt-return-type">' + escapeHtml(typeLabel) + '</span>';
-        html += '<span class="offcomfrt-return-status ' + statusClass + '">' + escapeHtml(statusText) + '</span>';
+        var html = '<div class="ofc-return-card-header">';
+        html += '<span class="ofc-return-type">' + escapeHtml(typeLabel) + '</span>';
+        html += '<span class="ofc-return-status ' + statusClass + '">' + escapeHtml(statusText) + '</span>';
         html += '</div>';
 
         if (data.orderId) {
-            html += '<div class="offcomfrt-return-row"><span class="label">Order</span><span class="value">#' + escapeHtml(data.orderId) + '</span></div>';
+            html += '<div class="ofc-return-row"><span class="label">Order</span><span class="value">#' + escapeHtml(data.orderId) + '</span></div>';
         }
         if (data.returnId) {
-            html += '<div class="offcomfrt-return-row"><span class="label">Return ID</span><span class="value">' + escapeHtml(data.returnId) + '</span></div>';
+            html += '<div class="ofc-return-row"><span class="label">Return ID</span><span class="value">' + escapeHtml(data.returnId) + '</span></div>';
         }
         if (data.reason) {
-            html += '<div class="offcomfrt-return-row"><span class="label">Reason</span><span class="value">' + escapeHtml(data.reason) + '</span></div>';
+            html += '<div class="ofc-return-row"><span class="label">Reason</span><span class="value">' + escapeHtml(data.reason) + '</span></div>';
         }
         if (data.refundAmount) {
-            html += '<div class="offcomfrt-return-row"><span class="label">Refund</span><span class="value" style="color:#16a34a;font-weight:700;">' + escapeHtml(data.refundAmount) + '</span></div>';
+            html += '<div class="ofc-return-row"><span class="label">Refund</span><span class="value" style="color:#16a34a;font-weight:700;">' + escapeHtml(data.refundAmount) + '</span></div>';
         }
         if (data.eta) {
-            html += '<div class="offcomfrt-return-row"><span class="label">Expected</span><span class="value">' + escapeHtml(data.eta) + '</span></div>';
+            html += '<div class="ofc-return-row"><span class="label">Expected</span><span class="value">' + escapeHtml(data.eta) + '</span></div>';
         }
         if (data.note) {
-            html += '<div class="offcomfrt-return-row"><span class="label"></span><span class="value" style="color:#666;font-style:italic;font-size:12px;">' + escapeHtml(data.note) + '</span></div>';
+            html += '<div class="ofc-return-row"><span class="label"></span><span class="value" style="color:#666;font-style:italic;font-size:12px;">' + escapeHtml(data.note) + '</span></div>';
         }
 
         card.innerHTML = html;
@@ -701,14 +681,14 @@
     // ---------- Resolution Confirmation Card ----------
 
     function addResolutionCard(data, save) {
-        var chat = document.getElementById('offcomfrt-chat');
+        var chat = document.getElementById('ofc-chat');
         var wrapper = document.createElement('div');
-        wrapper.className = 'offcomfrt-msg-wrapper offcomfrt-align-left';
+        wrapper.className = 'ofc-msg-wrap ofc-align-left';
 
         var card = document.createElement('div');
-        card.className = 'offcomfrt-resolution-card';
+        card.className = 'ofc-resolution-card';
 
-        var html = '<div class="offcomfrt-resolution-icon">' +
+        var html = '<div class="ofc-resolution-icon">' +
             '<svg viewBox="0 0 24 24"><polyline points="20 6 9 17 4 12"/></svg>' +
             '</div>';
         html += '<h4>' + escapeHtml(data.title || 'Issue Resolved') + '</h4>';
@@ -734,45 +714,45 @@
 
     function showTicketForm() {
         hideQuickActions();
-        var chat = document.getElementById('offcomfrt-chat');
+        var chat = document.getElementById('ofc-chat');
         var form = document.createElement('div');
-        form.className = 'offcomfrt-ticket-form';
-        form.id = 'offcomfrt-ticket-form';
+        form.className = 'ofc-ticket-form';
+        form.id = 'ofc-ticket-form';
         form.innerHTML =
             '<h4>Contact Support</h4>' +
-            '<div class="offcomfrt-form-group">' +
+            '<div class="ofc-form-group">' +
                 '<label>Name</label>' +
-                '<input type="text" id="offcomfrt-t-name" value="' + escapeHtml(CUSTOMER_NAME) + '" placeholder="Your name" />' +
+                '<input type="text" id="ofc-t-name" value="' + escapeHtml(CUSTOMER_NAME) + '" placeholder="Your name" />' +
             '</div>' +
-            '<div class="offcomfrt-form-group">' +
+            '<div class="ofc-form-group">' +
                 '<label>Phone</label>' +
-                '<input type="tel" id="offcomfrt-t-phone" value="' + escapeHtml(CUSTOMER_PHONE) + '" placeholder="+91..." />' +
+                '<input type="tel" id="ofc-t-phone" value="' + escapeHtml(CUSTOMER_PHONE) + '" placeholder="+91..." />' +
             '</div>' +
-            '<div class="offcomfrt-form-group">' +
+            '<div class="ofc-form-group">' +
                 '<label>Email (optional)</label>' +
-                '<input type="email" id="offcomfrt-t-email" value="' + escapeHtml(CUSTOMER_EMAIL) + '" placeholder="you@example.com" />' +
+                '<input type="email" id="ofc-t-email" value="' + escapeHtml(CUSTOMER_EMAIL) + '" placeholder="you@example.com" />' +
             '</div>' +
-            '<div class="offcomfrt-form-group">' +
+            '<div class="ofc-form-group">' +
                 '<label>Issue</label>' +
-                '<textarea id="offcomfrt-t-message" placeholder="Describe your issue..."></textarea>' +
+                '<textarea id="ofc-t-message" placeholder="Describe your issue..."></textarea>' +
             '</div>' +
-            '<button class="offcomfrt-form-submit" id="offcomfrt-t-submit">Submit Ticket</button>';
+            '<button class="ofc-form-submit" id="ofc-t-submit">Submit Ticket</button>';
         chat.appendChild(form);
         scrollToBottom();
 
-        document.getElementById('offcomfrt-t-submit').addEventListener('click', submitTicket);
+        document.getElementById('ofc-t-submit').addEventListener('click', submitTicket);
     }
 
     function submitTicket() {
-        var name = document.getElementById('offcomfrt-t-name').value.trim();
-        var phone = document.getElementById('offcomfrt-t-phone').value.trim();
-        var email = document.getElementById('offcomfrt-t-email').value.trim();
-        var message = document.getElementById('offcomfrt-t-message').value.trim();
+        var name = document.getElementById('ofc-t-name').value.trim();
+        var phone = document.getElementById('ofc-t-phone').value.trim();
+        var email = document.getElementById('ofc-t-email').value.trim();
+        var message = document.getElementById('ofc-t-message').value.trim();
 
         if (!message) { alert('Please describe your issue.'); return; }
         if (!phone && !email) { alert('Please provide your phone number or email.'); return; }
 
-        var submitBtn = document.getElementById('offcomfrt-t-submit');
+        var submitBtn = document.getElementById('ofc-t-submit');
         submitBtn.disabled = true;
         submitBtn.textContent = 'Submitting...';
 
@@ -783,7 +763,7 @@
         })
             .then(function (res) { return res.json(); })
             .then(function (data) {
-                var form = document.getElementById('offcomfrt-ticket-form');
+                var form = document.getElementById('ofc-ticket-form');
                 if (form) form.remove();
 
                 if (data.success) {
@@ -804,21 +784,21 @@
     }
 
     function addTicketConfirmation(data, save) {
-        var chat = document.getElementById('offcomfrt-chat');
+        var chat = document.getElementById('ofc-chat');
         var wrapper = document.createElement('div');
-        wrapper.className = 'offcomfrt-msg-wrapper offcomfrt-align-left';
+        wrapper.className = 'ofc-msg-wrap ofc-align-left';
 
         var confirm = document.createElement('div');
-        confirm.className = 'offcomfrt-ticket-confirmation';
+        confirm.className = 'ofc-ticket-confirmation';
         confirm.innerHTML =
-            '<div class="offcomfrt-ticket-confirm-icon">' +
+            '<div class="ofc-ticket-confirm-icon">' +
                 '<svg viewBox="0 0 24 24"><polyline points="20 6 9 17 4 12"/></svg>' +
             '</div>' +
             '<h4>Ticket Created</h4>' +
             '<p>Your support ticket has been received.</p>' +
-            '<div class="offcomfrt-ticket-number">' + escapeHtml(data.ticketNumber) + '</div>' +
+            '<div class="ofc-ticket-number">' + escapeHtml(data.ticketNumber) + '</div>' +
             '<br/><br/>' +
-            '<a href="' + escapeHtml(data.whatsappLink) + '" target="_blank" class="offcomfrt-whatsapp-btn">' +
+            '<a href="' + escapeHtml(data.whatsappLink) + '" target="_blank" class="ofc-whatsapp-btn">' +
                 '<svg viewBox="0 0 24 24"><path d="M17.472 14.382c-.297-.149-1.758-.867-2.03-.967-.273-.099-.471-.148-.67.15-.197.297-.767.966-.94 1.164-.173.199-.347.223-.644.075-.297-.15-1.255-.463-2.39-1.475-.883-.788-1.48-1.761-1.653-2.059-.173-.297-.018-.458.13-.606.134-.133.298-.347.446-.52.149-.174.198-.298.298-.497.099-.198.05-.371-.025-.52-.075-.149-.669-1.612-.916-2.207-.242-.579-.487-.5-.669-.51-.173-.008-.371-.01-.57-.01-.198 0-.52.074-.792.372-.272.297-1.04 1.016-1.04 2.479 0 1.462 1.065 2.875 1.213 3.074.149.198 2.096 3.2 5.077 4.487.709.306 1.262.489 1.694.625.712.227 1.36.195 1.871.118.571-.085 1.758-.719 2.006-1.413.248-.694.248-1.289.173-1.413-.074-.124-.272-.198-.57-.347z"/><path d="M12 2C6.477 2 2 6.477 2 12c0 1.89.525 3.66 1.438 5.168L2 22l4.832-1.438A9.955 9.955 0 0 0 12 22c5.523 0 10-4.477 10-10S17.523 2 12 2z"/></svg>' +
                 'Continue on WhatsApp' +
             '</a>';
@@ -835,7 +815,7 @@
     // ---------- Utilities ----------
 
     function scrollToBottom() {
-        var chat = document.getElementById('offcomfrt-chat');
+        var chat = document.getElementById('ofc-chat');
         if (chat) {
             setTimeout(function () {
                 chat.scrollTop = chat.scrollHeight;
@@ -847,7 +827,7 @@
         if (chatHistory.length > 20) {
             chatHistory = chatHistory.slice(-20);
         }
-        sessionStorage.setItem('offcomfrt_chat', JSON.stringify(chatHistory));
+        sessionStorage.setItem('ofc_chat', JSON.stringify(chatHistory));
     }
 
     function escapeHtml(text) {
