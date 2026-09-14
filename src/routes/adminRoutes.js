@@ -1514,7 +1514,7 @@ function timeRangeSqlClause(config, col = 'created_at') {
 
 router.get('/support-tickets', verifyToken, async (req, res) => {
     try {
-        const { status, is_read, date_from, date_to, time_from, time_to, search, portal, sort, urgent, urgent_filter } = req.query;
+        const { status, is_read, date_from, date_to, time_from, time_to, search, portal, sort, urgent, urgent_filter, channel } = req.query;
         const page = Math.max(1, parseInt(req.query.page, 10) || 1);
         const limit = Math.min(500, Math.max(1, parseInt(req.query.limit, 10) || 50));
         const offset = (page - 1) * limit;
@@ -1608,6 +1608,11 @@ router.get('/support-tickets', verifyToken, async (req, res) => {
             }
         }
 
+        if (channel) {
+            conditions.push('channel = ?');
+            params.push(channel);
+        }
+
         // Urgent keywords arrive regardless of whether the urgent filter is on —
         // they feed the "urgent" stat card, and filter the list only when urgent_filter=1
         const urgentActive = urgent_filter === '1' || urgent_filter === 'true';
@@ -1628,7 +1633,7 @@ router.get('/support-tickets', verifyToken, async (req, res) => {
         // the full conversation separately. Keeps each page well under the response cap.
         const buildDataSql = (withOrderId) => `SELECT id, ticket_number, customer_phone, customer_name,
                 LEFT(message, 600) AS message, status, is_read, portal_id, sentiment,
-                ai_scenario, ai_confidence, source${withOrderId ? ', order_id' : ''}, created_at, updated_at
+                ai_scenario, ai_confidence, source, channel${withOrderId ? ', order_id' : ''}, created_at, updated_at
             FROM support_tickets${whereSql}
             ORDER BY ${orderSql}
             LIMIT ? OFFSET ?`;

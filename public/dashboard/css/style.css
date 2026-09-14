@@ -3214,6 +3214,69 @@ textarea {
     pointer-events: none;
 }
 
+/* Channel Toggle */
+.channel-toggle-group {
+    display: inline-flex;
+    gap: 1px;
+    background: var(--border);
+    border-radius: 8px;
+    padding: 2px;
+}
+
+.channel-toggle {
+    display: inline-flex;
+    align-items: center;
+    gap: 5px;
+    padding: 5px 12px;
+    background: transparent;
+    border: none;
+    border-radius: 6px;
+    color: var(--text-secondary);
+    font-size: 12px;
+    font-weight: 500;
+    cursor: pointer;
+    transition: all 0.2s ease;
+}
+
+.channel-toggle:hover {
+    color: var(--text-primary);
+    background: var(--bg-hover);
+}
+
+.channel-toggle.active {
+    background: var(--bg-card);
+    color: var(--text-primary);
+    box-shadow: 0 1px 3px rgba(0,0,0,0.08);
+}
+
+.ch-icon-all {
+    color: var(--text-secondary);
+}
+
+.ch-icon-wa {
+    color: #25D366;
+}
+
+.ch-icon-ig {
+    color: #E1306C;
+}
+
+/* Ticket Channel Icon */
+.ticket-channel-icon {
+    display: inline-flex;
+    align-items: center;
+    margin-left: 6px;
+    vertical-align: middle;
+}
+
+.ticket-channel-icon.ch-icon-wa {
+    color: #25D366;
+}
+
+.ticket-channel-icon.ch-icon-ig {
+    color: #E1306C;
+}
+
 /* Quick Presets */
 .quick-presets {
     display: flex;
