@@ -449,6 +449,12 @@ app.get('/shoppers', (req, res) => {
     res.sendFile(path.join(__dirname, 'public', 'shoppers', 'index.html'));
 });
 
+// Widget assets — allow cross-origin loading (e.g. Shopify storefront)
+app.use('/widget', helmet({
+    crossOriginResourcePolicy: { policy: 'cross-origin' },
+    contentSecurityPolicy: false
+}));
+
 // Test Bot — CSP override for inline event handlers and external resources
 app.use('/widget/testbot.html', helmet({
     contentSecurityPolicy: {
@@ -458,7 +464,7 @@ app.use('/widget/testbot.html', helmet({
             'script-src-attr': ["'unsafe-inline'"],
             'style-src': ["'self'", "'unsafe-inline'", 'https://fonts.googleapis.com'],
             'font-src': ["'self'", 'https://fonts.gstatic.com'],
-            'img-src': ["'self'", 'data:', 'https:'],
+            'img-src': ["'self'", 'data:', 'https:' ],
             'connect-src': ["'self'", 'https://whatsappbot-4l4b.onrender.com']
         }
     }
