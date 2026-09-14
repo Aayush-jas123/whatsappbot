@@ -145,6 +145,13 @@ app.use('/shoppers', helmet({
     }
 }));
 
+// Widget assets — allow cross-origin loading (e.g. Shopify storefront)
+// Must run before express.static so headers are set before files are served.
+app.use('/widget', helmet({
+    crossOriginResourcePolicy: { policy: 'cross-origin' },
+    contentSecurityPolicy: false
+}));
+
 // Serve static files (admin dashboard)
 // HTML must always revalidate so deploys ship fresh markup immediately;
 // versioned assets (?v= busters) handle long-lived caching.
@@ -448,12 +455,6 @@ app.get('/admin', (req, res) => {
 app.get('/shoppers', (req, res) => {
     res.sendFile(path.join(__dirname, 'public', 'shoppers', 'index.html'));
 });
-
-// Widget assets — allow cross-origin loading (e.g. Shopify storefront)
-app.use('/widget', helmet({
-    crossOriginResourcePolicy: { policy: 'cross-origin' },
-    contentSecurityPolicy: false
-}));
 
 // Test Bot — CSP override for inline event handlers and external resources
 app.use('/widget/testbot.html', helmet({
