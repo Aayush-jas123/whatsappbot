@@ -73,73 +73,73 @@ const INTENTS = {
 // markdown (*bold*). Instagram doesn't support markdown in DMs.
 
 const IG_FAQ = {
-    return: `⚫ OFFCOMFRT — RETURN POLICY
+    return: `OFFCOMFRT — RETURN POLICY
 
-▫️ We accept return requests within 2 days of delivery.
+We accept return requests within 2 days of delivery.
 
-▫️ How to initiate:
-▫️ Visit our returns page on the website.
+How to initiate:
+  Visit our returns page on the website.
 
-▫️ Process:
-▫️ Submit return request
-▫️ Team reviews within 24-48 hours
-▫️ Pickup at your doorstep
-▫️ Store credit within 5-7 business days
+Process:
+  - Submit return request
+  - Team reviews within 24-48 hours
+  - Pickup at your doorstep
+  - Store credit within 5-7 business days
 
-▫️ Conditions:
-▫️ Items unused, tags attached
-▫️ Original packaging required`,
+Conditions:
+  - Items unused, tags attached
+  - Original packaging required`,
 
-    exchange: `⚫ OFFCOMFRT — SIZE EXCHANGE
+    exchange: `OFFCOMFRT — SIZE EXCHANGE
 
-▫️ Free size exchanges within 2 days of delivery.
+Free size exchanges within 2 days of delivery.
 
-▫️ Visit our Exchange page on the website.
+Visit our Exchange page on the website.
 
-▫️ Process:
-▫️ Select order and new size
-▫️ We pick up the old item
-▫️ New size shipped after quality check
+Process:
+  - Select order and new size
+  - We pick up the old item
+  - New size shipped after quality check
 
-▫️ Subject to stock availability.`,
+Subject to stock availability.`,
 
-    shipping: `⚫ OFFCOMFRT — SHIPPING & DELIVERY
+    shipping: `OFFCOMFRT — SHIPPING & DELIVERY
 
-▫️ Metro cities: 2-3 business days
-▫️ Other cities: 4-6 business days
-▫️ Remote areas: 6-8 business days
+Metro cities: 2-3 business days
+Other cities: 4-6 business days
+Remote areas: 6-8 business days
 
-▫️ Free shipping on orders above Rs.999
-▫️ Rs.99 for orders below Rs.999
+Free shipping on orders above Rs.999
+Rs.99 for orders below Rs.999
 
-▫️ Send your Order ID for real-time tracking.`,
+Send your Order ID for real-time tracking.`,
 
-    payment: `⚫ OFFCOMFRT — PAYMENT METHODS
+    payment: `OFFCOMFRT — PAYMENT METHODS
 
-▫️ Credit/Debit Cards
-▫️ UPI (GPay, PhonePe, Paytm)
-▫️ Net Banking
-▫️ Digital Wallets
-▫️ Cash on Delivery (COD)
+Credit/Debit Cards
+UPI (GPay, PhonePe, Paytm)
+Net Banking
+Digital Wallets
+Cash on Delivery (COD)
 
-▫️ COD available up to Rs.5,000
-▫️ Rs.50 COD handling charge`,
+COD available up to Rs.5,000
+Rs.50 COD handling charge`,
 
-    product_info: `⚫ OFFCOMFRT — PRODUCT INFO
+    product_info: `OFFCOMFRT — PRODUCT INFO
 
-▫️ 100% Premium Cotton
-▫️ Pre-shrunk fabric
-▫️ Colourfast dyes
-▫️ OEKO-TEX certified
+100% Premium Cotton
+Pre-shrunk fabric
+Colourfast dyes
+OEKO-TEX certified
 
-▫️ Care: Machine wash cold, tumble dry low`,
+Care: Machine wash cold, tumble dry low`,
 
-    cancellation: `⚫ OFFCOMFRT — CANCELLATION
+    cancellation: `OFFCOMFRT — CANCELLATION
 
-▫️ Before Shipping: Free cancellation
-▫️ After Shipping: Cannot cancel (return after delivery instead)
+Before Shipping: Free cancellation
+After Shipping: Cannot cancel (return after delivery instead)
 
-▫️ Send your Order ID and type "cancel" to proceed.`
+Send your Order ID and type "cancel" to proceed.`
 };
 
 // ─── Bot Engine Class ─────────────────────────────────────────
@@ -282,12 +282,12 @@ class IGBotEngine {
 
         await instagramService.sendQuickReplies(
             igUserId,
-            `👋 ${greeting} Welcome to OffComfrt!\n\nI can help you with:\n📦 Track your order\n🔄 Returns & Exchanges\n❓ FAQs\n🎧 Contact support\n\nWhat would you like help with?`,
+            `${greeting} Welcome to OffComfrt!\n\nI can help you with:\n  Track your order\n  Returns & Exchanges\n  FAQs\n  Contact support\n\nWhat would you like help with?`,
             [
-                { title: '📦 Track Order', payload: 'track_order' },
-                { title: '🔄 Return', payload: 'return' },
-                { title: '🔁 Exchange', payload: 'exchange' },
-                { title: '🎧 Support', payload: 'support' }
+                { title: 'Track Order', payload: 'track_order' },
+                { title: 'Return', payload: 'return' },
+                { title: 'Exchange', payload: 'exchange' },
+                { title: 'Support', payload: 'support' }
             ]
         );
 
@@ -299,7 +299,7 @@ class IGBotEngine {
     async _askForOrderId(igUserId, flow) {
         await instagramService.sendMessage(
             igUserId,
-            '📦 Track Your Order\n\n▫️ Please send your Order ID (e.g., ORD-2024-001) or AWB number.\n\n▫️ You can also find it in your order confirmation email.'
+            'Track Your Order\n\nPlease send your Order ID (e.g., ORD-2024-001) or AWB number.\n\nYou can also find it in your order confirmation email.'
         );
         await instagramService.setBotState(igUserId, 'awaiting_order_id');
     }
@@ -319,24 +319,24 @@ class IGBotEngine {
         if (!orders || orders.length === 0) {
             await instagramService.sendMessage(
                 igUserId,
-                '❌ Order not found.\n\n▫️ Please check the Order ID and try again.\n▫️ You can also type "support" to talk to our team.'
+                'Order not found.\n\nPlease check the Order ID and try again.\nYou can also type "support" to talk to our team.'
             );
             return;
         }
 
         const order = orders[0];
-        const statusEmoji = this._getStatusEmoji(order.status);
+        const statusLabel = this._getStatusText(order.status);
 
-        const trackingMsg = `📦 ORDER STATUS
+        const trackingMsg = `ORDER STATUS
 
-${statusEmoji} Order: ${order.order_id}
-▫️ Status: ${order.status || 'Processing'}
-${order.awb ? `▫️ AWB: ${order.awb}` : ''}
-${order.courier_name ? `▫️ Courier: ${order.courier_name}` : ''}
-${order.expected_delivery ? `▫️ Expected: ${new Date(order.expected_delivery).toLocaleDateString('en-IN')}` : ''}
-${order.tracking_url ? `▫️ Track: ${order.tracking_url}` : ''}
+Order: ${order.order_id}
+  Status: ${order.status || 'Processing'}${statusLabel ? ` (${statusLabel})` : ''}
+${order.awb ? `  AWB: ${order.awb}` : ''}
+${order.courier_name ? `  Courier: ${order.courier_name}` : ''}
+${order.expected_delivery ? `  Expected: ${new Date(order.expected_delivery).toLocaleDateString('en-IN')}` : ''}
+${order.tracking_url ? `  Track: ${order.tracking_url}` : ''}
 
-▫️ Need help? Type "support" to contact us.`;
+Need help? Type "support" to contact us.`;
 
         await instagramService.sendMessage(igUserId, trackingMsg);
     }
@@ -346,7 +346,7 @@ ${order.tracking_url ? `▫️ Track: ${order.tracking_url}` : ''}
     async _handleReturn(igUserId) {
         await instagramService.sendMessage(
             igUserId,
-            IG_FAQ.return + '\n\n▫️ To start a return, please send your Order ID.'
+            IG_FAQ.return + '\n\nTo start a return, please send your Order ID.'
         );
         await instagramService.setBotState(igUserId, 'awaiting_return_order_id', { flow: 'return' });
     }
@@ -354,7 +354,7 @@ ${order.tracking_url ? `▫️ Track: ${order.tracking_url}` : ''}
     async _handleExchange(igUserId) {
         await instagramService.sendMessage(
             igUserId,
-            IG_FAQ.exchange + '\n\n▫️ To start an exchange, please send your Order ID.'
+            IG_FAQ.exchange + '\n\nTo start an exchange, please send your Order ID.'
         );
         await instagramService.setBotState(igUserId, 'awaiting_return_order_id', { flow: 'exchange' });
     }
@@ -372,7 +372,7 @@ ${order.tracking_url ? `▫️ Track: ${order.tracking_url}` : ''}
         if (!orders || orders.length === 0) {
             await instagramService.sendMessage(
                 igUserId,
-                '❌ Order not found. Please check the Order ID and try again.'
+                'Order not found. Please check the Order ID and try again.'
             );
             return;
         }
@@ -386,7 +386,7 @@ ${order.tracking_url ? `▫️ Track: ${order.tracking_url}` : ''}
         if (daysSinceOrder > 2) {
             await instagramService.sendMessage(
                 igUserId,
-                `❌ Sorry, the return/exchange window (2 days from delivery) has expired for this order.\n\n▫️ Type "support" if you need further assistance.`
+                `Sorry, the return/exchange window (2 days from delivery) has expired for this order.\n\nType "support" if you need further assistance.`
             );
             return;
         }
@@ -424,7 +424,7 @@ ${order.tracking_url ? `▫️ Track: ${order.tracking_url}` : ''}
         const flowLabel = flow === 'exchange' ? 'Exchange' : 'Return';
         await instagramService.sendMessage(
             igUserId,
-            `✅ ${flowLabel} Request Created\n\n▫️ Order: ${order.order_id}\n▫️ Ticket: ${ticketNumber}\n\n▫️ Our team will review and respond within 24 hours.\n▫️ You can continue chatting here for updates.`
+            `${flowLabel} Request Created\n\nOrder: ${order.order_id}\nTicket: ${ticketNumber}\n\nOur team will review and respond within 24 hours.\nYou can continue chatting here for updates.`
         );
     }
 
@@ -456,7 +456,7 @@ ${order.tracking_url ? `▫️ Track: ${order.tracking_url}` : ''}
         if (existingTicket && existingTicket.length > 0) {
             await instagramService.sendMessage(
                 igUserId,
-                `You already have an open ticket: ${existingTicket[0].ticket_number}\n\n▫️ Please describe your issue and our team will respond.\n▫️ You can message us right here.`
+                `You already have an open ticket: ${existingTicket[0].ticket_number}\n\nPlease describe your issue and our team will respond.\nYou can message us right here.`
             );
             await instagramService.escalateToHuman(igUserId, existingTicket[0].id);
             await instagramService.setBotState(igUserId, 'idle');
@@ -466,7 +466,7 @@ ${order.tracking_url ? `▫️ Track: ${order.tracking_url}` : ''}
         // Ask user to describe their issue
         await instagramService.sendMessage(
             igUserId,
-            '🎧 Contact Support\n\n▫️ Please describe your issue below and we\'ll create a support ticket.\n▫️ Our team will respond within 24 hours.'
+            'Contact Support\n\nPlease describe your issue below and we\'ll create a support ticket.\nOur team will respond within 24 hours.'
         );
         await instagramService.setBotState(igUserId, 'awaiting_support_description');
     }
@@ -513,7 +513,7 @@ ${order.tracking_url ? `▫️ Track: ${order.tracking_url}` : ''}
 
         await instagramService.sendMessage(
             igUserId,
-            `⚫ OFFCOMFRT — SUPPORT\n\n▫️ Thank you, ${customerName}.\n▫️ Your ticket has been created.\n▫️ Ticket Number: ${ticketNumber}\n\n▫️ Our team will respond within 24 hours.\n▫️ You can continue messaging us here for updates.`
+            `OFFCOMFRT — SUPPORT\n\nThank you, ${customerName}.\nYour ticket has been created.\nTicket Number: ${ticketNumber}\n\nOur team will respond within 24 hours.\nYou can continue messaging us here for updates.`
         );
 
         console.log(`[IG BOT] Created support ticket ${ticketNumber} for IG user ${igUserId}`);
@@ -531,12 +531,12 @@ ${order.tracking_url ? `▫️ Track: ${order.tracking_url}` : ''}
             igUserId,
             'I\'m not sure I understood that. Here\'s what I can help with:',
             [
-                { title: '📦 Track Order', payload: 'track_order' },
-                { title: '🔄 Return', payload: 'return' },
-                { title: '🔁 Exchange', payload: 'exchange' },
-                { title: '❓ Shipping', payload: 'shipping' },
-                { title: '💳 Payment', payload: 'payment' },
-                { title: '🎧 Support', payload: 'support' }
+                { title: 'Track Order', payload: 'track_order' },
+                { title: 'Return', payload: 'return' },
+                { title: 'Exchange', payload: 'exchange' },
+                { title: 'Shipping', payload: 'shipping' },
+                { title: 'Payment', payload: 'payment' },
+                { title: 'Support', payload: 'support' }
             ]
         );
     }
@@ -583,17 +583,17 @@ ${order.tracking_url ? `▫️ Track: ${order.tracking_url}` : ''}
         return `IG-${yy}${mm}${dd}-${Math.floor(Math.random() * 9000 + 1000)}`;
     }
 
-    _getStatusEmoji(status) {
+    _getStatusText(status) {
         const statusMap = {
-            'pending': '🟡',
-            'confirmed': '🔵',
-            'shipped': '🚚',
-            'in_transit': '🚚',
-            'delivered': '✅',
-            'cancelled': '❌',
-            'returned': '🔄'
+            'pending': 'Pending',
+            'confirmed': 'Confirmed',
+            'shipped': 'Shipped',
+            'in_transit': 'In Transit',
+            'delivered': 'Delivered',
+            'cancelled': 'Cancelled',
+            'returned': 'Returned'
         };
-        return statusMap[status?.toLowerCase()] || '📦';
+        return statusMap[status?.toLowerCase()] || '';
     }
 }
 

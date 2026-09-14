@@ -201,7 +201,7 @@ async function handleTextMessage(senderId, message, timestamp) {
             console.log('[IG] Bot engine not yet available — sending default response');
             await instagramService.sendMessage(
                 senderId,
-                '👋 Thanks for reaching out to OffComfrt!\n\n▫️ Our team will get back to you shortly.\n▫️ For urgent queries, please WhatsApp us.'
+                'Thanks for reaching out to OffComfrt!\n\nOur team will get back to you shortly.\nFor urgent queries, please WhatsApp us.'
             );
         } else {
             throw err;
@@ -253,7 +253,7 @@ async function handleAttachment(senderId, message, timestamp) {
         if (err.code === 'MODULE_NOT_FOUND') {
             await instagramService.sendMessage(
                 senderId,
-                '📸 Thanks for the image! Our support team will review it shortly.'
+                'Thanks for the image! Our support team will review it shortly.'
             );
         } else {
             throw err;
@@ -283,7 +283,7 @@ async function handleReferral(senderId, referral, timestamp) {
         if (err.code === 'MODULE_NOT_FOUND') {
             await instagramService.sendMessage(
                 senderId,
-                '👋 Welcome to OffComfrt! How can we help you today?'
+                'Welcome to OffComfrt! How can we help you today?'
             );
         } else {
             throw err;
@@ -313,7 +313,7 @@ async function handlePostback(senderId, postback, timestamp) {
         if (err.code === 'MODULE_NOT_FOUND') {
             await instagramService.sendMessage(
                 senderId,
-                '👋 Welcome to OffComfrt!\n\n▫️ I can help you with:\n▫️ 📦 Track your order\n▫️ 🔄 Returns & Exchanges\n▫️ ❓ FAQs\n▫️ 🎧 Contact support\n\nHow can I help you?'
+                'Welcome to OffComfrt!\n\nI can help you with:\n  Track your order\n  Returns & Exchanges\n  FAQs\n  Contact support\n\nHow can I help you?'
             );
         } else {
             throw err;
