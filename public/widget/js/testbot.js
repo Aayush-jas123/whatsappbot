@@ -342,7 +342,7 @@
             flowContext.supportTopic = topic;
             addUserMessage(topic);
             flowState = 'awaiting_support_message';
-            addBotMessage('Please describe your issue briefly and we will create a ticket for you.');
+            addBotMessage('I will try to help you right away. Please describe your issue briefly.');
             setInputPlaceholder('Describe your issue...');
             return;
         }
@@ -350,6 +350,8 @@
         else if (action === 'file_return') startFileReturn();
         else if (action === 'track_request') startTrackRequest();
         else if (action === 'contact_support') startContactSupport();
+        else if (action === 'create_support_ticket') startCreateTicket();
+        else if (action === 'retry_support') retrySupportQuestion();
         else if (action === 'main_menu' || action === 'return_home') showMainMenuAgain();
         else if (action === 'track_another') startTrackOrder();
     }
@@ -506,6 +508,67 @@
             { label: 'Delivery Problem', action: 'support_delivery' },
             { label: 'Other', action: 'support_other' }
         ]);
+    }
+
+    // After AI tries to resolve and user wants to escalate directly
+    function startCreateTicket() {
+        flowState = 'awaiting_ticket_message';
+        addBotMessage('Please describe your issue briefly and we will create a support ticket for you.', [
+            { label: 'Back to Menu', action: 'main_menu' }
+        ]);
+        setInputPlaceholder('Describe your issue...');
+    }
+
+    // User wants to ask another question to the AI
+    function retrySupportQuestion() {
+        flowState = 'awaiting_support_message';
+        addBotMessage('Sure, go ahead — describe your question and I will try to help.');
+        setInputPlaceholder('Type your question...');
+    }
+
+    function doResolveWithAI(message) {
+        flowState = 'resolving_with_ai';
+        showTyping();
+
+        fetch(API_URL + '/api/widget/chat', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+                sessionId: sessionId,
+                message: '[' + (flowContext.supportTopic || 'General') + '] ' + message
+            })
+        })
+        .then(function (r) { return r.json(); })
+        .then(function (data) {
+            hideTyping();
+            var aiReply = data.reply || 'I was unable to process your request.';
+            var needsEscalation = data.suggestedAction === 'create_ticket';
+
+            if (needsEscalation) {
+                addBotMessage(aiReply + '\n\nWould you like to create a support ticket so our team can assist you further?', [
+                    { label: 'Create Ticket', action: 'create_support_ticket', primary: true },
+                    { label: 'Try Another Question', action: 'retry_support' },
+                    { label: 'Menu', action: 'main_menu' }
+                ]);
+            } else {
+                addBotMessage(aiReply, [
+                    { label: 'Create Ticket', action: 'create_support_ticket' },
+                    { label: 'Try Another Question', action: 'retry_support' },
+                    { label: 'Menu', action: 'main_menu' }
+                ]);
+            }
+            setInputMode('text');
+            flowState = 'idle';
+        })
+        .catch(function () {
+            hideTyping();
+            addBotMessage('I could not connect to our support assistant. Would you like to create a ticket instead?', [
+                { label: 'Create Ticket', action: 'create_support_ticket', primary: true },
+                { label: 'Menu', action: 'main_menu' }
+            ]);
+            setInputMode('text');
+            flowState = 'idle';
+        });
     }
 
     function doCreateSupportTicket(message) {
@@ -677,6 +740,9 @@
         } else if (flowState === 'awaiting_request_track_id') {
             doTrackRequest(text);
         } else if (flowState === 'awaiting_support_message') {
+            addUserMessage(text);
+            doResolveWithAI(text);
+        } else if (flowState === 'awaiting_ticket_message') {
             addUserMessage(text);
             doCreateSupportTicket(text);
         } else {
