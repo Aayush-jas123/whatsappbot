@@ -282,7 +282,16 @@ class IGBotEngine {
 
         await instagramService.sendQuickReplies(
             igUserId,
-            `${greeting} Welcome to OffComfrt!\n\nI can help you with:\n  Track your order\n  Returns & Exchanges\n  FAQs\n  Contact support\n\nWhat would you like help with?`,
+            `${greeting} Welcome to OffComfrt!
+
+I can help you with:
+
+• Track your order
+• Returns & Exchanges
+• FAQs
+• Contact support
+
+What would you like help with?`,
             [
                 { title: 'Track Order', payload: 'track_order' },
                 { title: 'Return', payload: 'return' },
@@ -299,7 +308,11 @@ class IGBotEngine {
     async _askForOrderId(igUserId, flow) {
         await instagramService.sendMessage(
             igUserId,
-            'Track Your Order\n\nPlease send your Order ID (e.g., ORD-2024-001) or AWB number.\n\nYou can also find it in your order confirmation email.'
+            `Track Your Order
+
+Please send your Order ID (e.g., ORD-2024-001) or AWB number.
+
+You can also find it in your order confirmation email.`
         );
         await instagramService.setBotState(igUserId, 'awaiting_order_id');
     }
@@ -319,7 +332,11 @@ class IGBotEngine {
         if (!orders || orders.length === 0) {
             await instagramService.sendMessage(
                 igUserId,
-                'Order not found.\n\nPlease check the Order ID and try again.\nYou can also type "support" to talk to our team.'
+                `Order not found.
+
+Please check the Order ID and try again.
+
+You can also type "support" to talk to our team.`
             );
             return;
         }
@@ -424,7 +441,14 @@ Need help? Type "support" to contact us.`;
         const flowLabel = flow === 'exchange' ? 'Exchange' : 'Return';
         await instagramService.sendMessage(
             igUserId,
-            `${flowLabel} Request Created\n\nOrder: ${order.order_id}\nTicket: ${ticketNumber}\n\nOur team will review and respond within 24 hours.\nYou can continue chatting here for updates.`
+            `${flowLabel} Request Created
+
+Order: ${order.order_id}
+Ticket: ${ticketNumber}
+
+Our team will review and respond within 24 hours.
+
+You can continue chatting here for updates.`
         );
     }
 
@@ -456,7 +480,11 @@ Need help? Type "support" to contact us.`;
         if (existingTicket && existingTicket.length > 0) {
             await instagramService.sendMessage(
                 igUserId,
-                `You already have an open ticket: ${existingTicket[0].ticket_number}\n\nPlease describe your issue and our team will respond.\nYou can message us right here.`
+                `You already have an open ticket: ${existingTicket[0].ticket_number}
+
+Please describe your issue and our team will respond.
+
+You can message us right here.`
             );
             await instagramService.escalateToHuman(igUserId, existingTicket[0].id);
             await instagramService.setBotState(igUserId, 'idle');
@@ -466,7 +494,11 @@ Need help? Type "support" to contact us.`;
         // Ask user to describe their issue
         await instagramService.sendMessage(
             igUserId,
-            'Contact Support\n\nPlease describe your issue below and we\'ll create a support ticket.\nOur team will respond within 24 hours.'
+            `Contact Support
+
+Please describe your issue below and we'll create a support ticket.
+
+Our team will respond within 24 hours.`
         );
         await instagramService.setBotState(igUserId, 'awaiting_support_description');
     }
@@ -513,7 +545,17 @@ Need help? Type "support" to contact us.`;
 
         await instagramService.sendMessage(
             igUserId,
-            `OFFCOMFRT — SUPPORT\n\nThank you, ${customerName}.\nYour ticket has been created.\nTicket Number: ${ticketNumber}\n\nOur team will respond within 24 hours.\nYou can continue messaging us here for updates.`
+            `OFFCOMFRT — SUPPORT
+
+Thank you, ${customerName}.
+
+Your ticket has been created.
+
+Ticket Number: ${ticketNumber}
+
+Our team will respond within 24 hours.
+
+You can continue messaging us here for updates.`
         );
 
         console.log(`[IG BOT] Created support ticket ${ticketNumber} for IG user ${igUserId}`);
