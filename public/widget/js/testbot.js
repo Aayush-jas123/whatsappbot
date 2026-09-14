@@ -501,22 +501,30 @@
 
     // ========== FLOW 4: CONTACT SUPPORT ==========
     function startContactSupport() {
-        flowState = 'awaiting_support_topic';
-        addBotMessage('What do you need help with?', [
-            { label: 'Order Issue', action: 'support_order_issue' },
-            { label: 'Product Question', action: 'support_product' },
-            { label: 'Delivery Problem', action: 'support_delivery' },
-            { label: 'Other', action: 'support_other' }
+        flowState = 'awaiting_ticket_order_id';
+        flowContext = {};
+        setInputMode('order');
+        addBotMessage('Please enter your *order number* so we can pull up your details.', [
+            { label: 'Back to Menu', action: 'main_menu' }
         ]);
     }
 
     // After AI tries to resolve and user wants to escalate directly
     function startCreateTicket() {
-        flowState = 'awaiting_ticket_message';
-        addBotMessage('Please describe your issue briefly and we will create a support ticket for you.', [
-            { label: 'Back to Menu', action: 'main_menu' }
-        ]);
-        setInputPlaceholder('Describe your issue...');
+        if (flowContext.orderId) {
+            // Already have order ID from this session — go straight to issue description
+            flowState = 'awaiting_ticket_message';
+            addBotMessage('Please describe your issue briefly and we will create a support ticket for you.', [
+                { label: 'Back to Menu', action: 'main_menu' }
+            ]);
+            setInputPlaceholder('Describe your issue...');
+        } else {
+            flowState = 'awaiting_ticket_order_id';
+            setInputMode('order');
+            addBotMessage('Let me pull up your order first. Please enter your *order number*.', [
+                { label: 'Back to Menu', action: 'main_menu' }
+            ]);
+        }
     }
 
     // User wants to ask another question to the AI
@@ -535,7 +543,7 @@
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({
                 sessionId: sessionId,
-                message: '[' + (flowContext.supportTopic || 'General') + '] ' + message
+                message: (flowContext.orderId ? '[Order #' + flowContext.orderId + '] ' : '') + '[' + (flowContext.supportTopic || 'General') + '] ' + message
             })
         })
         .then(function (r) { return r.json(); })
@@ -581,7 +589,8 @@
             body: JSON.stringify({
                 name: CUSTOMER_NAME || 'Customer',
                 phone: CUSTOMER_PHONE || '',
-                message: '[' + (flowContext.supportTopic || 'General') + '] ' + message
+                message: '[' + (flowContext.supportTopic || 'General') + '] ' + message,
+                orderId: flowContext.orderId || null
             })
         })
         .then(function (r) { return r.json(); })
@@ -734,7 +743,20 @@
         if (!text || isTyping) return;
         input.value = '';
 
-        if (flowState === 'awaiting_order_id') {
+        if (flowState === 'awaiting_ticket_order_id') {
+            addUserMessage(text);
+            var cleaned = text.replace(/^#/, '').replace(/\s/g, '').trim();
+            flowContext.orderId = cleaned;
+            // Now ask for the topic
+            flowState = 'awaiting_support_topic';
+            setInputMode('text');
+            addBotMessage('Got it — Order *#' + cleaned + '*. What do you need help with?', [
+                { label: 'Order Issue', action: 'support_order_issue' },
+                { label: 'Product Question', action: 'support_product' },
+                { label: 'Delivery Problem', action: 'support_delivery' },
+                { label: 'Other', action: 'support_other' }
+            ]);
+        } else if (flowState === 'awaiting_order_id') {
             addUserMessage(text);
             doTrackOrder(text);
         } else if (flowState === 'awaiting_request_track_id') {
