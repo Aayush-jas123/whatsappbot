@@ -36,6 +36,15 @@
     // ---------- Inject CSS ----------
     function injectStyles() {
         if (document.getElementById('offcomfrt-styles')) return;
+
+        // Load Archive Narrow from Google Fonts
+        if (!document.querySelector('link[href*="fonts.googleapis.com/css2?family=Archive"]')) {
+            var link = document.createElement('link');
+            link.rel = 'stylesheet';
+            link.href = 'https://fonts.googleapis.com/css2?family=Archive+Narrow:wght@400;500;600;700&display=swap';
+            document.head.appendChild(link);
+        }
+
         var style = document.createElement('style');
         style.id = 'offcomfrt-styles';
         style.textContent = [
@@ -50,7 +59,7 @@
             '#offcomfrt-widget-btn svg{width:26px;height:26px;fill:none;stroke:#fff;stroke-width:2;stroke-linecap:round;stroke-linejoin:round}',
 
             /* Widget Container */
-            '#offcomfrt-widget{position:fixed;bottom:28px;right:28px;width:420px;height:700px;max-height:calc(100vh - 56px);background:#fff;border-radius:24px;border:2px solid #000;box-shadow:0 32px 100px rgba(0,0,0,0.25),0 12px 40px rgba(0,0,0,0.15);z-index:99999;display:flex;flex-direction:column;overflow:hidden;font-family:"Inter",-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;opacity:0;transform:translateY(16px) scale(0.92);pointer-events:none;transition:all 0.4s cubic-bezier(0.16,1,0.3,1)}',
+            '#offcomfrt-widget{position:fixed;bottom:28px;right:28px;width:420px;height:700px;max-height:calc(100vh - 56px);background:#fff;border-radius:24px;border:2px solid #000;box-shadow:0 32px 100px rgba(0,0,0,0.25),0 12px 40px rgba(0,0,0,0.15);z-index:99999;display:flex;flex-direction:column;overflow:hidden;font-family:"Archive Narrow",-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;opacity:0;transform:translateY(16px) scale(0.92);pointer-events:none;transition:all 0.4s cubic-bezier(0.16,1,0.3,1)}',
             '#offcomfrt-widget.open{opacity:1;transform:translateY(0) scale(1);pointer-events:all}',
 
             /* Header */

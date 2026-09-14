@@ -39,11 +39,11 @@
         window.__offcomfrt_testbot.apiUrl = baseUrl;
     }
 
-    // Load Inter font (skip if already loaded by main widget)
-    if (!document.querySelector('link[href*="fonts.googleapis.com/css2?family=Inter"]')) {
+    // Load Archive Narrow font (skip if already loaded by main widget)
+    if (!document.querySelector('link[href*="fonts.googleapis.com/css2?family=Archive"]')) {
         var fontLink = document.createElement('link');
         fontLink.rel = 'stylesheet';
-        fontLink.href = 'https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap';
+        fontLink.href = 'https://fonts.googleapis.com/css2?family=Archive+Narrow:wght@400;500;600;700&display=swap';
         document.head.appendChild(fontLink);
     }
 
