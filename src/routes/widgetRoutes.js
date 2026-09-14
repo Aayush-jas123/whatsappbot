@@ -386,10 +386,6 @@ router.post('/ticket', async (req, res) => {
             return res.status(400).json({ error: 'Message is required' });
         }
 
-        if (!phone && !email) {
-            return res.status(400).json({ error: 'Phone or email is required' });
-        }
-
         const result = await createWidgetTicket({ name, phone, email, message, orderId });
 
         res.json({

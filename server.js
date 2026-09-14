@@ -453,8 +453,13 @@ app.get('/shoppers', (req, res) => {
 app.use('/widget/testbot.html', helmet({
     contentSecurityPolicy: {
         directives: {
+            'default-src': ["'self'"],
+            'script-src': ["'self'", "'unsafe-inline'"],
             'script-src-attr': ["'unsafe-inline'"],
-            'img-src': ["'self'", 'data:', 'https:']
+            'style-src': ["'self'", "'unsafe-inline'", 'https://fonts.googleapis.com'],
+            'font-src': ["'self'", 'https://fonts.gstatic.com'],
+            'img-src': ["'self'", 'data:', 'https:'],
+            'connect-src': ["'self'", 'https://whatsappbot-4l4b.onrender.com']
         }
     }
 }));
