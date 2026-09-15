@@ -5376,7 +5376,21 @@ router.get('/ai/usage', verifyToken, async (req, res) => {
         });
     } catch (error) {
         console.error('AI usage error:', error.message);
-        res.status(500).json({ success: false, error: 'Failed to fetch AI usage' });
+        try {
+            const { getConfig, isConfigured } = require('../services/ai/aiClient');
+            const cfg = getConfig();
+            res.json({
+                success: true,
+                configured: isConfigured(),
+                provider: cfg.provider,
+                model: cfg.model,
+                daily: [],
+                totals: { requests: 0, costUsd: 0, promptTokens: 0, completionTokens: 0 },
+                warning: 'Metrics temporarily unavailable due to network/database latency'
+            });
+        } catch {
+            res.status(500).json({ success: false, error: 'Failed to fetch AI usage' });
+        }
     }
 });
 
@@ -5396,9 +5410,10 @@ router.get('/ai/history', verifyToken, async (req, res) => {
     try {
         const aiStore = require('../services/ai/aiStore');
         const history = await aiStore.getChatHistory(req.admin?.username || 'admin');
-        res.json({ success: true, history });
+        res.json({ success: true, history: history || [] });
     } catch (error) {
-        res.status(500).json({ success: false, error: 'Failed to load history' });
+        console.warn('AI history load error:', error.message);
+        res.json({ success: true, history: [] });
     }
 });
 

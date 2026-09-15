@@ -45,6 +45,20 @@
     .ai-cp-msg { max-width: 85%; padding: 9px 12px; border-radius: 12px; font-size: 13px; line-height: 1.45; white-space: pre-wrap; word-wrap: break-word; }
     .ai-cp-msg.user { align-self: flex-end; background: #6366f1; color: #fff; border-bottom-right-radius: 4px; }
     .ai-cp-msg.assistant { align-self: flex-start; background: #fff; color: #1e293b; border: 1px solid #e2e8f0; border-bottom-left-radius: 4px; }
+    .ai-cp-msg.assistant strong { color: #0f172a; font-weight: 600; }
+    .ai-cp-msg.assistant em { color: #64748b; font-style: italic; }
+    .ai-cp-msg.assistant .chat-code { font-size: 11px; background: #f1f5f9; padding: 2px 5px; border-radius: 4px; font-family: monospace; color: #0284c7; }
+    .ai-cp-msg.assistant .chat-list-item { padding-left: 2px; margin: 2px 0; }
+    .ai-cp-msg.assistant .chat-meta-footer { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 8px; padding-top: 6px; border-top: 1px dashed #cbd5e1; }
+    .ai-cp-msg.assistant .chat-meta-pill { display: inline-flex; align-items: center; gap: 5px; background: #eff6ff; border: 1px solid #bfdbfe; color: #1e40af; font-size: 11px; font-weight: 500; padding: 3px 8px; border-radius: 16px; }
+    .ai-cp-msg.assistant .chat-denom-pill { display: inline-flex; align-items: center; gap: 5px; background: #f8fafc; border: 1px solid #e2e8f0; color: #475569; font-size: 11px; padding: 3px 8px; border-radius: 16px; }
+    .ai-cp-msg.assistant .tier-badge { display: inline-flex; align-items: center; font-size: 9.5px; font-weight: 700; padding: 1.5px 6px; border-radius: 4px; margin: 0 3px 2px 0; vertical-align: middle; }
+    .ai-cp-msg.assistant .tier-verified { background: #dcfce7; color: #166534; border: 1px solid #bbf7d0; }
+    .ai-cp-msg.assistant .tier-policy { background: #e0f2fe; color: #0369a1; border: 1px solid #bae6fd; }
+    .ai-cp-msg.assistant .tier-pattern { background: #fef3c7; color: #92400e; border: 1px solid #fde68a; }
+    .ai-cp-msg.assistant .tier-anomaly { background: #fee2e2; color: #b91c1c; border: 1px solid #fecaca; }
+    .ai-cp-msg.assistant .tier-inference { background: #f3e8ff; color: #6b21a8; border: 1px solid #e9d5ff; }
+    .ai-cp-msg.assistant .tier-recommendation { background: #ccfbf1; color: #0f766e; border: 1px solid #99f6e4; }
     .ai-cp-msg.system { align-self: center; background: transparent; color: #64748b; font-size: 12px; text-align: center; }
     .ai-cp-typing { align-self: flex-start; color: #64748b; font-size: 12px; padding: 4px 8px; }
     .ai-cp-confirm { align-self: stretch; background: #fffbeb; border: 1px solid #fbbf24; border-radius: 10px; padding: 12px; font-size: 13px; }
@@ -124,11 +138,62 @@
     let panelBusy = false;
     let historyLoaded = false;
 
+    function escapeHtml(str) {
+        return String(str).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+    }
+
+    function renderRichContent(text) {
+        if (!text) return '';
+        let html = escapeHtml(text);
+
+        let footerMeta = '';
+        html = html.replace(/(?:^|\n)\*?Data as of:\s*([^*<\n\r]+?)\*?(?=\n|$)/gi, (match, p1) => {
+            const clean = p1.replace(/\s*\(Live Database\)/i, '').trim();
+            footerMeta += `<div class="chat-meta-pill" title="Verified Live Database Record"><svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/></svg> <span>Live Data: ${clean}</span> <span style="display:inline-block;width:5px;height:5px;border-radius:50%;background:#16a34a;margin:0 2px;"></span> <span style="color:#16a34a;font-weight:700;font-size:9.5px;">LIVE DB</span></div>`;
+            return '';
+        });
+
+        html = html.replace(/(?:^|\n)\*?Denominator:\s*([^*<\n\r]+?)\*?(?=\n|$)/gi, (match, p1) => {
+            footerMeta += `<div class="chat-denom-pill"><svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="18" height="18" rx="2"/><path d="M7 12h10"/></svg> <span>Denominator: ${p1.trim()}</span></div>`;
+            return '';
+        });
+
+        html = html.replace(/\[VERIFIED FACT\]/g, '<span class="tier-badge tier-verified">✓ VERIFIED FACT</span>');
+        html = html.replace(/\[POLICY\]/g, '<span class="tier-badge tier-policy">📋 POLICY</span>');
+        html = html.replace(/\[PATTERN\]/g, '<span class="tier-badge tier-pattern">📈 PATTERN</span>');
+        html = html.replace(/\[ANOMALY(?:\s*-\s*HIGH RATE)?\]/g, '<span class="tier-badge tier-anomaly">⚠️ ANOMALY</span>');
+        html = html.replace(/\[INFERENCE\]/g, '<span class="tier-badge tier-inference">💡 INFERENCE</span>');
+        html = html.replace(/\[RECOMMENDATION\]/g, '<span class="tier-badge tier-recommendation">🎯 RECOMMENDATION</span>');
+        html = html.replace(/\[ACTION COMPLETED\]/g, '<span class="tier-badge tier-verified">✓ ACTION COMPLETED</span>');
+        html = html.replace(/\[ACTION REQUIRED\]/g, '<span class="tier-badge tier-anomaly">⚡ ACTION REQUIRED</span>');
+
+        html = html.replace(/\*\*([^*]+)\*\*/g, '<strong>$1</strong>');
+        html = html.replace(/\*([^*]+)\*/g, '<em>$1</em>');
+        html = html.replace(/`([^`]+)`/g, '<code class="chat-code">$1</code>');
+        html = html.replace(/\{(\w+):[^}]+\}/g, match => `<code class="chat-code">${match}</code>`);
+
+        html = html.replace(/^[•\-\*]\s+(.+)$/gm, '<div class="chat-list-item">&#8226; $1</div>');
+        html = html.replace(/^(\d+)\.\s+(.+)$/gm, '<div class="chat-list-item"><strong>$1.</strong> $2</div>');
+
+        html = html.replace(/\n\n+/g, '<div style="height:6px;"></div>');
+        html = html.replace(/\n/g, '<br>');
+        html = html.replace(/<\/div><br>/g, '</div>');
+
+        if (footerMeta) {
+            html += `<div class="chat-meta-footer">${footerMeta}</div>`;
+        }
+        return html;
+    }
+
     function addMsg(role, text) {
         const messages = document.getElementById('aiCpMessages');
         const div = document.createElement('div');
         div.className = `ai-cp-msg ${role}`;
-        div.textContent = text;
+        if (role === 'assistant') {
+            div.innerHTML = renderRichContent(text);
+        } else {
+            div.textContent = text;
+        }
         messages.appendChild(div);
         messages.scrollTop = messages.scrollHeight;
         return div;

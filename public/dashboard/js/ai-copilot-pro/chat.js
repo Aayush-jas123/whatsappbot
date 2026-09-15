@@ -59,6 +59,64 @@
     /* Save conversation btn */
     .chat-save-btn { align-self: flex-end; background: none; border: 1px solid var(--border); color: var(--text-muted); font-size: 11px; padding: 4px 10px; border-radius: 12px; cursor: pointer; margin-top: -4px; }
     .chat-save-btn:hover { color: var(--accent-hover); border-color: var(--accent); }
+
+    /* Markdown elements & Typography */
+    .chat-msg strong { color: #ffffff; font-weight: 600; }
+    .chat-msg em { color: var(--text-secondary); font-style: italic; }
+    .chat-code { font-size: 11.5px; background: rgba(255,255,255,0.08); padding: 2px 6px; border-radius: 4px; font-family: monospace; color: #38bdf8; }
+    .chat-list-item { padding-left: 4px; margin: 3px 0; line-height: 1.5; }
+    .chat-list-item .list-num { font-weight: 600; color: var(--accent-hover); margin-right: 4px; }
+    .chat-paragraph-gap { height: 6px; }
+
+    /* Modern Timestamp & Denominator Footer Pills */
+    .chat-meta-footer { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 10px; padding-top: 8px; border-top: 1px dashed rgba(255,255,255,0.1); }
+    .chat-meta-pill {
+        display: inline-flex;
+        align-items: center;
+        gap: 6px;
+        background: rgba(99, 102, 241, 0.12);
+        border: 1px solid rgba(99, 102, 241, 0.28);
+        color: #c7d2fe;
+        font-size: 11px;
+        font-weight: 500;
+        padding: 4px 10px;
+        border-radius: 20px;
+    }
+    .chat-meta-pill svg { color: #818cf8; flex-shrink: 0; }
+    .chat-meta-pill .meta-dot { width: 5px; height: 5px; border-radius: 50%; background: #22c55e; }
+    .chat-meta-pill .meta-tag { color: #22c55e; font-weight: 600; font-size: 10px; text-transform: uppercase; }
+
+    .chat-denom-pill {
+        display: inline-flex;
+        align-items: center;
+        gap: 6px;
+        background: rgba(255, 255, 255, 0.05);
+        border: 1px solid var(--border);
+        color: var(--text-secondary);
+        font-size: 11px;
+        padding: 4px 10px;
+        border-radius: 20px;
+    }
+    .chat-denom-pill svg { color: var(--text-muted); flex-shrink: 0; }
+
+    /* Phase 14 8-tier Classification Badges */
+    .tier-badge {
+        display: inline-flex;
+        align-items: center;
+        font-size: 10px;
+        font-weight: 700;
+        letter-spacing: 0.02em;
+        padding: 2px 7px;
+        border-radius: 4px;
+        margin: 0 4px 2px 0;
+        vertical-align: middle;
+    }
+    .tier-verified { background: rgba(34, 197, 94, 0.15); color: #4ade80; border: 1px solid rgba(34, 197, 94, 0.3); }
+    .tier-policy { background: rgba(56, 189, 248, 0.15); color: #38bdf8; border: 1px solid rgba(56, 189, 248, 0.3); }
+    .tier-pattern { background: rgba(251, 191, 36, 0.15); color: #fbbf24; border: 1px solid rgba(251, 191, 36, 0.3); }
+    .tier-anomaly { background: rgba(239, 68, 68, 0.15); color: #f87171; border: 1px solid rgba(239, 68, 68, 0.3); }
+    .tier-inference { background: rgba(168, 85, 247, 0.15); color: #c084fc; border: 1px solid rgba(168, 85, 247, 0.3); }
+    .tier-recommendation { background: rgba(20, 184, 166, 0.15); color: #2dd4bf; border: 1px solid rgba(20, 184, 166, 0.3); }
     `;
     document.head.appendChild(style);
 
@@ -116,11 +174,57 @@
     }
 
     function renderRichContent(text) {
+        if (!text) return '';
         let html = escapeHtml(text);
-        // Convert simple dash lists
-        html = html.replace(/^- (.+)$/gm, '<span style="display:block;padding-left:12px;">&#8226; $1</span>');
-        // Detect inline JSON tables (tool results)
-        html = html.replace(/\{(\w+):[^}]+\}/g, match => `<code style="font-size:11px;background:var(--bg-input);padding:2px 6px;border-radius:4px;">${match}</code>`);
+
+        // 1. Convert timestamp footers: "*Data as of: ...*" or "Data as of: ..."
+        let footerMeta = '';
+        html = html.replace(/(?:^|\n)\*?Data as of:\s*([^*<\n\r]+?)\*?(?=\n|$)/gi, (match, p1) => {
+            const clean = p1.replace(/\s*\(Live Database\)/i, '').trim();
+            footerMeta += `<div class="chat-meta-pill" title="Verified Live Database Record"><svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/></svg> <span>Live Data: ${clean}</span> <span class="meta-dot"></span> <span class="meta-tag">Live DB</span></div>`;
+            return '';
+        });
+
+        // 2. Convert Denominator lines: "*Denominator: ...*" or "Denominator: ..."
+        html = html.replace(/(?:^|\n)\*?Denominator:\s*([^*<\n\r]+?)\*?(?=\n|$)/gi, (match, p1) => {
+            footerMeta += `<div class="chat-denom-pill"><svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="18" height="18" rx="2"/><path d="M7 12h10"/></svg> <span>Denominator: ${p1.trim()}</span></div>`;
+            return '';
+        });
+
+        // 3. Phase 14 8-tier Classification Badges
+        html = html.replace(/\[VERIFIED FACT\]/g, '<span class="tier-badge tier-verified">✓ VERIFIED FACT</span>');
+        html = html.replace(/\[POLICY\]/g, '<span class="tier-badge tier-policy">📋 POLICY</span>');
+        html = html.replace(/\[PATTERN\]/g, '<span class="tier-badge tier-pattern">📈 PATTERN</span>');
+        html = html.replace(/\[ANOMALY(?:\s*-\s*HIGH RATE)?\]/g, '<span class="tier-badge tier-anomaly">⚠️ ANOMALY</span>');
+        html = html.replace(/\[INFERENCE\]/g, '<span class="tier-badge tier-inference">💡 INFERENCE</span>');
+        html = html.replace(/\[RECOMMENDATION\]/g, '<span class="tier-badge tier-recommendation">🎯 RECOMMENDATION</span>');
+        html = html.replace(/\[ACTION COMPLETED\]/g, '<span class="tier-badge tier-verified">✓ ACTION COMPLETED</span>');
+        html = html.replace(/\[ACTION REQUIRED\]/g, '<span class="tier-badge tier-anomaly">⚡ ACTION REQUIRED</span>');
+
+        // 4. Bold: **text**
+        html = html.replace(/\*\*([^*]+)\*\*/g, '<strong>$1</strong>');
+
+        // 5. Italic: *text*
+        html = html.replace(/\*([^*]+)\*/g, '<em>$1</em>');
+
+        // 6. Inline code or JSON tables: `code` or {key: value}
+        html = html.replace(/`([^`]+)`/g, '<code class="chat-code">$1</code>');
+        html = html.replace(/\{(\w+):[^}]+\}/g, match => `<code class="chat-code">${match}</code>`);
+
+        // 7. Bullet lists and numbered lists
+        html = html.replace(/^[•\-\*]\s+(.+)$/gm, '<div class="chat-list-item">&#8226; $1</div>');
+        html = html.replace(/^(\d+)\.\s+(.+)$/gm, '<div class="chat-list-item"><span class="list-num">$1.</span> $2</div>');
+
+        // 8. Line breaks and paragraphs
+        html = html.replace(/\n\n+/g, '<div class="chat-paragraph-gap"></div>');
+        html = html.replace(/\n/g, '<br>');
+        html = html.replace(/<\/div><br>/g, '</div>');
+
+        // 9. Attach modern footer pills if present
+        if (footerMeta) {
+            html += `<div class="chat-meta-footer">${footerMeta}</div>`;
+        }
+
         return html;
     }
 

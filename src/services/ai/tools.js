@@ -82,6 +82,689 @@ const tools = [
         }
     },
     {
+        name: 'get_customer_360',
+        description: 'Get comprehensive, factual Customer 360 intelligence: total orders, delivered orders, cancelled orders, returned orders, exchanged orders, total spend, refund history, latest order, active open orders, and open support issues. Accepts customer phone number, order ID (#12345), email, or customer name.',
+        parameters: {
+            type: 'object',
+            properties: {
+                customerIdentifier: { type: 'string', description: 'Customer phone number, order ID (#12345), email, or customer name' }
+            },
+            required: ['customerIdentifier']
+        },
+        requiresConfirmation: false,
+        async execute({ customerIdentifier }, ctx) {
+            const { getCustomer360 } = require('../customer360Service');
+            return await getCustomer360(customerIdentifier, ctx);
+        }
+    },
+    {
+        name: 'get_conversation_history',
+        description: 'Retrieve and summarize previous customer support interactions across WhatsApp messages, support tickets, and notes. Answers what customer said, when they last contacted us, what resolution was given, explicit commitments/promises made, and whether this is a repeat issue. Accepts customer phone, order ID (#12345), ticket number (TKT-...), email, or name.',
+        parameters: {
+            type: 'object',
+            properties: {
+                customerIdentifier: { type: 'string', description: 'Customer phone number, order ID (#12345), ticket number (TKT-...), email, or customer name' },
+                query: { type: 'string', description: 'Optional question or focus area (e.g. "what was promised", "last contact date")' }
+            },
+            required: ['customerIdentifier']
+        },
+        requiresConfirmation: false,
+        async execute({ customerIdentifier, query }, ctx) {
+            const { getCustomerConversationHistory } = require('../conversationHistoryService');
+            return await getCustomerConversationHistory(customerIdentifier, { query, ...ctx });
+        }
+    },
+    {
+        name: 'get_customer_behavior_patterns',
+        description: 'Identify factual customer behavior and history patterns: number of orders, returns, exchanges, cancellations, RTOs, support contacts, and repeat issue categories. Answers "Has this customer had the same issue before?", "How many size-related complaints did they have?", and "How many returns did this customer make?". Strictly neutral, objective reporting without defamatory labels.',
+        parameters: {
+            type: 'object',
+            properties: {
+                customerIdentifier: { type: 'string', description: 'Customer phone number, order ID (#12345), ticket number (TKT-...), email, or customer name' },
+                currentIssue: { type: 'string', description: 'Optional current or queried issue (e.g. "size", "delayed delivery", "defect") to check for previous recurrence' }
+            },
+            required: ['customerIdentifier']
+        },
+        requiresConfirmation: false,
+        async execute({ customerIdentifier, currentIssue }, ctx) {
+            const { getCustomerBehaviorPatterns } = require('../customerBehaviorService');
+            return await getCustomerBehaviorPatterns(customerIdentifier, { currentIssue, ...ctx });
+        }
+    },
+    {
+        name: 'detect_repeat_contact',
+        description: 'Detect when the same customer repeatedly contacts support about the same order or problem. Correlates customer + order + issue category + time. Shows number of previous contacts, previous contact dates, previous actions taken, and current unresolved issue. Strictly follows company escalation rules without auto-escalating.',
+        parameters: {
+            type: 'object',
+            properties: {
+                customerIdentifier: { type: 'string', description: 'Customer phone number, order ID (#12345), ticket number (TKT-...), email, or customer name' },
+                orderId: { type: 'string', description: 'Optional specific order ID to check repeat contact for' },
+                currentIssue: { type: 'string', description: 'Optional current message or issue description to evaluate' },
+                issueCategory: { type: 'string', description: 'Optional issue category if already identified' }
+            },
+            required: ['customerIdentifier']
+        },
+        requiresConfirmation: false,
+        async execute({ customerIdentifier, orderId, currentIssue, issueCategory }, ctx) {
+            const { detectRepeatContact } = require('../repeatContactService');
+            return await detectRepeatContact(customerIdentifier, { orderId, currentIssue, issueCategory, ...ctx });
+        }
+    },
+    {
+        name: 'get_sales_by_sku',
+        description: 'Get real-time product- and SKU-level sales analytics: units sold, best-selling SKUs, top revenue generators, and variant breakdowns. Answers "How many units of SKU X sold today?", "What are today\'s best-selling SKUs?", "Which SKU sold the most this week?", and "Which SKU generated the highest revenue?". Timezone is strictly India Standard Time (IST, UTC+05:30) and all data is explicitly timestamped.',
+        parameters: {
+            type: 'object',
+            properties: {
+                dateRange: {
+                    type: 'string',
+                    description: 'Date range to analyze: "today", "yesterday", "this_week", "last_7_days", "this_month", or "all_time" (default "today" in IST)'
+                },
+                skuOrProduct: {
+                    type: 'string',
+                    description: 'Optional SKU or product name to filter (e.g. "HENLEY - 001", "waffle-001-w-m", "SLUB - 001")'
+                },
+                sortBy: {
+                    type: 'string',
+                    enum: ['units', 'revenue'],
+                    description: 'Sort by "units" (quantity sold) or "revenue" (gross sales amount in INR, default "units")'
+                },
+                limit: {
+                    type: ['integer', 'string'],
+                    description: 'Max results to return (default 10)'
+                }
+            },
+            required: []
+        },
+        requiresConfirmation: false,
+        async execute({ dateRange, skuOrProduct, sortBy, limit }, ctx) {
+            const { getSalesBySku } = require('../skuSalesService');
+            return await getSalesBySku({ dateRange, skuOrProduct, sortBy, limit: parseInt(limit, 10) || 10, ...ctx });
+        }
+    },
+    {
+        name: 'get_size_wise_sales',
+        description: 'Get real-time sales analytics broken down by size, variant, and colour. Answers questions like: "How many units of size M were sold today?", "Which size sells the most for SKU X?", "Give me today\'s sales breakdown by size.", "Did we sell more M or L this week?", "Compare size-wise sales this week with last week.", "How many Black M units were sold today?", "Which sizes had zero sales today?", "What\'s our best-selling size this month?", and "Which size should we stock more of?". All timezones are strictly India Standard Time (IST, UTC+05:30) and data is explicitly timestamped.',
+        parameters: {
+            type: 'object',
+            properties: {
+                size: {
+                    type: 'string',
+                    description: 'Specific size to query or filter (e.g. "M", "L", "XL", "XS", "XXL", "28", "30", "Free Size")'
+                },
+                color: {
+                    type: 'string',
+                    description: 'Specific colour to filter (e.g. "Black", "White", "Acid Wash", "Grey", "Sage")'
+                },
+                sku: {
+                    type: 'string',
+                    description: 'Specific SKU or product identifier (e.g. "henley-001-b-m", "waffle-001")'
+                },
+                product: {
+                    type: 'string',
+                    description: 'Product name or title (e.g. "HENLEY - 001", "WAFFLE - 001", "SLUB - 001")'
+                },
+                dateRange: {
+                    type: 'string',
+                    description: 'Time period to analyze: "today", "yesterday", "this_week", "last_week", "this_month", "last_month", "last_7_days", "last_30_days", or "custom"'
+                },
+                comparePeriod: {
+                    type: 'string',
+                    description: 'Period to compare against (e.g. "last_week" when querying "this_week", "last_month" when querying "this_month")'
+                },
+                compareSizes: {
+                    type: 'array',
+                    items: { type: 'string' },
+                    description: 'Array of two sizes to compare directly, e.g. ["M", "L"]'
+                },
+                startDate: {
+                    type: 'string',
+                    description: 'Custom start date (ISO string or YYYY-MM-DD)'
+                },
+                endDate: {
+                    type: 'string',
+                    description: 'Custom end date (ISO string or YYYY-MM-DD)'
+                }
+            },
+            required: []
+        },
+        requiresConfirmation: false,
+        async execute(params, ctx) {
+            const { getSizeWiseSales } = require('../sizeSalesService');
+            return await getSizeWiseSales({ ...params, ...ctx });
+        }
+    },
+    {
+        name: 'get_product_sku_info',
+        description: 'Get authoritative product, variant, and SKU information from the product catalog. Answers: "What variants exist for product X?", "What is the SKU for Size L?", "Is SKU X active?", "What sizes exist for this product?", "Show price and stock for SKU X", "Is this product available in colour Y?". Returns Product -> Variant -> SKU -> Size -> Colour -> Price -> Stock mapping, active status, and availability.',
+        parameters: {
+            type: 'object',
+            properties: {
+                query: {
+                    type: 'string',
+                    description: 'Product name, variant, or search keyword (e.g. "HENLEY - 001", "Waffle", "Acid Wash")'
+                },
+                sku: {
+                    type: 'string',
+                    description: 'Specific SKU code to look up directly (e.g. "henley-001-w-l", "waffle-001-b-m")'
+                },
+                productId: {
+                    type: 'string',
+                    description: 'Shopify or system product ID'
+                },
+                handle: {
+                    type: 'string',
+                    description: 'Product slug/handle (e.g. "henley-001-b")'
+                }
+            },
+            required: []
+        },
+        requiresConfirmation: false,
+        async execute({ query, sku, productId, handle }, ctx) {
+            const { getProductInfo, getVariantBySku } = require('../productInfoService');
+            if (sku && !query && !productId && !handle) {
+                return await getVariantBySku(sku);
+            }
+            return await getProductInfo({ query, sku, productId, handle });
+        }
+    },
+    {
+        name: 'get_inventory_intelligence',
+        description: 'Get live inventory intelligence: stock levels by SKU, size, colour, product; detect low-stock items using configured reorder_level (NOT hardcoded constants); detect out-of-stock items; calculate sales velocity and run-out days; and provide restocking recommendations. Answers: "How much stock do we have for SKU X?", "Which sizes are out of stock for product Y?", "What items are low in stock?", "Do we have size L in stock for this shirt?", "Show inventory breakdown for product X", "When will SKU X run out of stock?", "Which SKUs need restocking urgently?".',
+        parameters: {
+            type: 'object',
+            properties: {
+                sku: {
+                    type: 'string',
+                    description: 'Filter by specific SKU code'
+                },
+                productName: {
+                    type: 'string',
+                    description: 'Filter by product name (e.g. "HENLEY - 001", "WAFFLE - 001")'
+                },
+                size: {
+                    type: 'string',
+                    description: 'Filter by size (e.g. "XS", "S", "M", "L", "XL")'
+                },
+                color: {
+                    type: 'string',
+                    description: 'Filter by colour (e.g. "Black", "White", "Acid Wash")'
+                },
+                category: {
+                    type: 'string',
+                    description: 'Filter by category (e.g. "T-SHIRT")'
+                },
+                queryType: {
+                    type: 'string',
+                    enum: ['stock', 'low_stock', 'out_of_stock', 'demand_analysis', 'restock_recommendations'],
+                    description: 'Type of inventory query: "stock" (default), "low_stock" (quantity <= reorder_level), "out_of_stock" (quantity <= 0), "demand_analysis" (sales velocity and run-out days), or "restock_recommendations"'
+                },
+                days: {
+                    type: ['integer', 'string'],
+                    description: 'Number of past days to analyze sales velocity for demand calculations (default 30)'
+                },
+                limit: {
+                    type: ['integer', 'string'],
+                    description: 'Maximum items to return (default 50)'
+                }
+            },
+            required: []
+        },
+        requiresConfirmation: false,
+        async execute({ sku, productName, size, color, category, queryType = 'stock', days, limit }, ctx) {
+            const iis = require('../inventoryIntelligenceService');
+            const nLimit = parseInt(limit, 10) || 50;
+            const nDays = parseInt(days, 10) || 30;
+
+            if (queryType === 'low_stock') {
+                return await iis.getLowStockItems({ limit: nLimit, category, size });
+            }
+            if (queryType === 'out_of_stock') {
+                return await iis.getOutOfStockItems({ limit: nLimit, category });
+            }
+            if (queryType === 'demand_analysis') {
+                return await iis.analyzeStockVsDemand({ sku, productName, days: nDays });
+            }
+            if (queryType === 'restock_recommendations') {
+                return await iis.getRestockingRecommendations({ limit: nLimit });
+            }
+            return await iis.getInventoryStock({ sku, productName, size, color, category, limit: nLimit });
+        }
+    },
+    {
+        name: 'investigate_return_exchange',
+        description: 'Conduct a comprehensive case investigation for returns, exchanges, refunds, replacements, or damaged/wrong product claims. Cross-references orders, returns table, exchanges table, support tickets, and SOP policies. Checks proof requirements (unboxing video mandatory for wrong product, photos for damaged product), verifies return window, evaluates refund eligibility (store credit vs original payment), reconstructs chronological event timeline, and checks live replacement stock for size exchange requests (e.g. customer wants size L for order #1234). If no orderId or phone is provided (e.g. "tell me 5 exchange list that are most recent", "list recent exchanges"), automatically retrieves the 5 most recent return and exchange cases from the live database. Demarcates VERIFIED FACT, POLICY, INFERENCE / RECOMMENDATION, and ACTION RECOMMENDED.',
+        parameters: {
+            type: 'object',
+            properties: {
+                orderId: {
+                    type: 'string',
+                    description: 'Order number or ID (e.g. "42000", "#42000")'
+                },
+                phone: {
+                    type: 'string',
+                    description: 'Customer phone number'
+                },
+                requestId: {
+                    type: 'string',
+                    description: 'Return or exchange request ID (e.g. "REQ-12345", "RET-101")'
+                },
+                targetExchangeVariant: {
+                    type: 'string',
+                    description: 'Target size or replacement variant requested by customer (e.g. "L", "XL", "Black / L")'
+                },
+                reason: {
+                    type: 'string',
+                    description: 'Stated reason or complaint (e.g. "Size M too small, need L", "Wrong item delivered", "Damaged on arrival")'
+                }
+            },
+            required: []
+        },
+        requiresConfirmation: false,
+        async execute({ orderId, phone, requestId, targetExchangeVariant, reason }, ctx) {
+            const ris = require('../returnInvestigationService');
+            return await ris.investigateReturnExchange({ orderId, phone, requestId, targetExchangeVariant, reason });
+        }
+    },
+    {
+        name: 'check_refund_eligibility',
+        description: 'Evaluate authoritative refund eligibility for an order based on OFFCOMFRT SOP rules (Sections 3, 5, 6, 7, 8). Determines refund channel: STORE CREDIT vs ORIGINAL PAYMENT METHOD vs DIFFERENCE REFUND. Checks policy gates: 2-day return window, delivery status, damaged on arrival (photos required), wrong product delivered (uncut unboxing video MANDATORY), prepaid cancelled pre-dispatch, prepaid RTO, and reverse pickup logistics charge (Rs. 100). Emits structured breakdown with VERIFIED FACT, POLICY, INFERENCE / RECOMMENDATION, and ACTION REQUIRED.',
+        parameters: {
+            type: 'object',
+            properties: {
+                orderId: {
+                    type: 'string',
+                    description: 'Order number or ID (e.g. "42000", "#42000")'
+                },
+                phone: {
+                    type: 'string',
+                    description: 'Customer phone number'
+                },
+                reason: {
+                    type: 'string',
+                    description: 'Stated reason: "damaged", "wrong_item", "size_issue", "prepaid_cancel", "prepaid_rto", "cancellation", "buyer_remorse", etc.'
+                },
+                hasPhotos: {
+                    type: 'boolean',
+                    description: 'Whether photos of the received item/defect were provided'
+                },
+                hasUnboxingVideo: {
+                    type: 'boolean',
+                    description: 'Whether an uncut unboxing video showing shipping label was provided'
+                },
+                cancelledPreDispatch: {
+                    type: 'boolean',
+                    description: 'Whether order was cancelled prior to courier dispatch'
+                }
+            },
+            required: []
+        },
+        requiresConfirmation: false,
+        async execute({ orderId, phone, reason, hasPhotos, hasUnboxingVideo, cancelledPreDispatch }, ctx) {
+            const { checkRefundEligibility } = require('../refundEligibilityService');
+            return await checkRefundEligibility({ orderId, phone, reason, hasPhotos, hasUnboxingVideo, cancelledPreDispatch });
+        }
+    },
+    {
+        name: 'investigate_refund_status',
+        description: 'Investigate live refund status and actual progress across returns, store_shoppers, and Shopify records. Reconstructs a 7-stage chronological refund timeline (REQUEST_SUBMITTED -> PICKUP_SCHEDULED -> REVERSE_PICKUP_DONE -> QC_VERIFIED -> REFUND_INITIATED -> GATEWAY_PROCESSING -> COMPLETED). Evaluates SOP 5-7 business day banking clearance window, detects pending actions, and flags overdue refunds. Emits status with VERIFIED FACT, POLICY, INFERENCE / RECOMMENDATION, ACTION COMPLETED, and ACTION PENDING.',
+        parameters: {
+            type: 'object',
+            properties: {
+                orderId: {
+                    type: 'string',
+                    description: 'Order number or ID (e.g. "42000", "#42000")'
+                },
+                phone: {
+                    type: 'string',
+                    description: 'Customer phone number'
+                },
+                refundId: {
+                    type: 'string',
+                    description: 'Refund or return ID (e.g. "REF-12345", "RET-101")'
+                }
+            },
+            required: []
+        },
+        requiresConfirmation: false,
+        async execute({ orderId, phone, refundId }, ctx) {
+            const { investigateRefundStatus } = require('../refundStatusService');
+            return await investigateRefundStatus({ orderId, phone, refundId });
+        }
+    },
+    {
+        name: 'investigate_payment',
+        description: 'Investigate payment reconciliation, order total vs paid vs pending amounts, and detect payment discrepancies. Investigates the Shoppers Hub COD conversion case where customer clicked "Edit Details" on a prepaid discounted order, dropping the discount and converting order to COD with higher collectible amount. Calculates courier payment collected vs expected price, and identifies difference amount to refund. Emits structured report with VERIFIED FACT, POLICY, INFERENCE / RECOMMENDATION, and ACTION REQUIRED.',
+        parameters: {
+            type: 'object',
+            properties: {
+                orderId: {
+                    type: 'string',
+                    description: 'Order number or ID (e.g. "42000", "#42000")'
+                },
+                phone: {
+                    type: 'string',
+                    description: 'Customer phone number'
+                },
+                paymentMode: {
+                    type: 'string',
+                    description: 'Payment mode if known ("prepaid", "cod", "upi")'
+                }
+            },
+            required: []
+        },
+        requiresConfirmation: false,
+        async execute({ orderId, phone, paymentMode }, ctx) {
+            const { investigatePayment } = require('../paymentInvestigationService');
+            return await investigatePayment({ orderId, phone, paymentMode });
+        }
+    },
+    {
+        name: 'investigate_discount',
+        description: 'Investigate coupon codes, percentage/fixed discounts, line item discount allocations, and discount drop issues during order editing. Specifically detects when an order edit in Shopify/Shoppers Hub removed a coupon code (e.g. OFF10), leading to courier overcharging on COD delivery. Calculates exact overcharge difference to refund to customer. Emits structured report with VERIFIED FACT, POLICY, INFERENCE / RECOMMENDATION, and ACTION REQUIRED.',
+        parameters: {
+            type: 'object',
+            properties: {
+                orderId: {
+                    type: 'string',
+                    description: 'Order number or ID (e.g. "42000", "#42000")'
+                },
+                couponCode: {
+                    type: 'string',
+                    description: 'Coupon code to inspect (e.g. "OFF10", "WELCOME15")'
+                },
+                phone: {
+                    type: 'string',
+                    description: 'Customer phone number'
+                }
+            },
+            required: []
+        },
+        requiresConfirmation: false,
+        async execute({ orderId, couponCode, phone }, ctx) {
+            const { investigateDiscount } = require('../discountInvestigationService');
+            return await investigateDiscount({ orderId, couponCode, phone });
+        }
+    },
+    {
+        name: 'get_shipment_intelligence',
+        description: 'Get comprehensive carrier and shipment intelligence: full 8-stage lifecycle timeline, delay detection, stuck-in-transit analysis, RTO detection and root causes, carrier performance comparison, and SOP carrier priority sequence (1. Shiprocket -> 2. Delhivery One -> 3. Ekart for prepaid). Implements the 24-hour POD "Delivered but not received" SOP workflow (check neighbours/security -> notify carrier -> request POD -> wait 24h -> share POD). Emits structured breakdown with VERIFIED FACT, POLICY, INFERENCE / RECOMMENDATION, and ACTION REQUIRED.',
+        parameters: {
+            type: 'object',
+            properties: {
+                orderId: {
+                    type: 'string',
+                    description: 'Order number or ID (e.g. "42000", "#42000")'
+                },
+                awb: {
+                    type: 'string',
+                    description: 'Carrier tracking/AWB number'
+                },
+                phone: {
+                    type: 'string',
+                    description: 'Customer phone number'
+                },
+                deliveredNotReceived: {
+                    type: 'boolean',
+                    description: 'Set true if customer states package marked delivered but was not received'
+                }
+            },
+            required: []
+        },
+        requiresConfirmation: false,
+        async execute({ orderId, awb, phone, deliveredNotReceived }, ctx) {
+            const { getShipmentIntelligence } = require('../shipmentIntelligenceService');
+            return await getShipmentIntelligence({ orderId, awb, phone, deliveredNotReceived });
+        }
+    },
+    {
+        name: 'investigate_rto',
+        description: 'Investigate an order that is at risk of RTO, in the process of RTO, marked RTO, or completed RTO. Reconstructs full chronological milestone timeline, delivery attempts and failed delivery reasons, customer support interactions, payment method (Prepaid vs COD), and authoritative post-RTO SOP rules (100% refund for prepaid; zero refund for COD). Emits structured breakdown with VERIFIED FACT, POLICY, INFERENCE, RECOMMENDATION, ACTION COMPLETED, and ACTION REQUIRED.',
+        parameters: {
+            type: 'object',
+            properties: {
+                orderId: {
+                    type: 'string',
+                    description: 'Order number or ID (e.g. "42000", "#42000")'
+                },
+                awb: {
+                    type: 'string',
+                    description: 'Carrier tracking/AWB number'
+                },
+                phone: {
+                    type: 'string',
+                    description: 'Customer phone number'
+                },
+                rtoReason: {
+                    type: 'string',
+                    description: 'Known or suspected RTO reason if mentioned by officer'
+                }
+            },
+            required: []
+        },
+        requiresConfirmation: false,
+        async execute({ orderId, awb, phone, rtoReason }, ctx) {
+            const { investigateRto } = require('../rtoInvestigationService');
+            return await investigateRto({ orderId, awb, phone, rtoReasonOverride: rtoReason });
+        }
+    },
+    {
+        name: 'get_courier_analytics',
+        description: 'Analyze historical courier performance across Delhivery, Ekart, and Shiprocket using authoritative shipment data. Computes delivery success rates, RTO rates, delay rates, average transit times, period comparisons (this month vs last month, weekly), head-to-head courier comparisons, and pincode-specific delivery performance with minimum sample size gating (N >= 10). Emits report with VERIFIED FACT, PATTERN, INFERENCE, and RECOMMENDATION.',
+        parameters: {
+            type: 'object',
+            properties: {
+                period: {
+                    type: 'string',
+                    description: 'Time period: "today", "this_week", "last_week", "this_month", "last_month", or "all"'
+                },
+                courier: {
+                    type: 'string',
+                    description: 'Specific courier name (e.g. "Delhivery", "Ekart", "Shiprocket")'
+                },
+                compareCourier: {
+                    type: 'string',
+                    description: 'Second courier name for head-to-head comparison'
+                },
+                comparePeriod: {
+                    type: 'string',
+                    description: 'Comparison period (e.g. "last_month", "last_week")'
+                },
+                pincode: {
+                    type: 'string',
+                    description: '6-digit destination pincode to analyze'
+                },
+                metric: {
+                    type: 'string',
+                    description: 'Ranking metric: "delivery_success_rate", "lowest_rto_rate", "fastest_delivery_time", "lowest_delay_rate", "highest_rto_rate", "most_delays"'
+                }
+            },
+            required: []
+        },
+        requiresConfirmation: false,
+        async execute({ period, courier, compareCourier, comparePeriod, pincode, metric }, ctx) {
+            const { getCourierPerformanceAnalytics } = require('../courierAnalyticsService');
+            return await getCourierPerformanceAnalytics({ period, courier, compareCourier, comparePeriod, pincode, metric });
+        }
+    },
+    {
+        name: 'investigate_return_pickup',
+        description: 'Investigate the complete return pickup lifecycle for returns and exchanges. Distinguishes whether product is still with customer (Pickup Pending), in reverse transit, at warehouse (Return Received), or awaiting refund/exchange QC completion. Identifies reverse partner assignment, scheduled dates, pickup attempts, failure reasons, rescheduling, and SLA compliance (24-48h). Emits report with VERIFIED FACT, POLICY, INFERENCE, ACTION COMPLETED, and ACTION REQUIRED.',
+        parameters: {
+            type: 'object',
+            properties: {
+                orderId: {
+                    type: 'string',
+                    description: 'Order number or ID (e.g. "42000", "#42000")'
+                },
+                returnId: {
+                    type: 'string',
+                    description: 'Return request ID (e.g. "RET-101")'
+                },
+                exchangeId: {
+                    type: 'string',
+                    description: 'Exchange request ID (e.g. "EXC-101")'
+                },
+                phone: {
+                    type: 'string',
+                    description: 'Customer phone number'
+                }
+            },
+            required: []
+        },
+        requiresConfirmation: false,
+        async execute({ orderId, returnId, exchangeId, phone }, ctx) {
+            const { investigateReturnPickup } = require('../returnPickupService');
+            return await investigateReturnPickup({ orderId, returnId, exchangeId, phone });
+        }
+    },
+    {
+        name: 'detect_delivery_anomalies',
+        description: 'Detect unusual, delayed, or suspicious delivery patterns across shipments, couriers, or pincodes using defined data-driven baselines. Flags stuck-in-transit (>48h/72h without scan), excessive delivery attempts (>=3 NDR attempts), rapid deliveries (<6h from dispatch), severe transit delays, high pincode failure clusters (>=25% RTO), and weekly courier performance surges. Emits report with ANOMALY, WHAT WAS DETECTED, EVIDENCE, BASELINE, SEVERITY, and RECOMMENDED ACTION.',
+        parameters: {
+            type: 'object',
+            properties: {
+                orderId: {
+                    type: 'string',
+                    description: 'Order number or ID to inspect'
+                },
+                awb: {
+                    type: 'string',
+                    description: 'Carrier tracking/AWB number'
+                },
+                courier: {
+                    type: 'string',
+                    description: 'Courier name filter'
+                },
+                pincode: {
+                    type: 'string',
+                    description: '6-digit destination pincode'
+                },
+                windowDays: {
+                    type: 'number',
+                    description: 'Number of past days to scan (default: 7)'
+                }
+            },
+            required: []
+        },
+        requiresConfirmation: false,
+        async execute({ orderId, awb, courier, pincode, windowDays }, ctx) {
+            const { detectDeliveryAnomalies } = require('../deliveryAnomalyService');
+            return await detectDeliveryAnomalies({ orderId, awb, courier, pincode, windowDays });
+        }
+    },
+    {
+        name: 'get_complaint_patterns',
+        description: 'Analyze customer support tickets and conversations to identify recurring complaint patterns, topic distributions, period-over-period trend changes (this week vs last week), product-specific issues (e.g. size/fit or damage per SKU), and courier grievances. Strictly factual pattern analysis without negative customer profiling. Emits report with VERIFIED FACT, PATTERN, INFERENCE, and RECOMMENDATION.',
+        parameters: {
+            type: 'object',
+            properties: {
+                period: {
+                    type: 'string',
+                    description: 'Analysis period: "today", "this_week", "this_month", or "all"'
+                },
+                comparePeriod: {
+                    type: 'string',
+                    description: 'Period to compare against (e.g. "last_week", "last_month")'
+                },
+                category: {
+                    type: 'string',
+                    description: 'Specific category filter'
+                },
+                product: {
+                    type: 'string',
+                    description: 'Product or SKU name filter'
+                },
+                courier: {
+                    type: 'string',
+                    description: 'Courier name filter'
+                },
+                pincode: {
+                    type: 'string',
+                    description: '6-digit destination pincode filter'
+                }
+            },
+            required: []
+        },
+        requiresConfirmation: false,
+        async execute({ period, comparePeriod, category, product, courier, pincode }, ctx) {
+            const { getComplaintPatterns } = require('../complaintPatternService');
+            return await getComplaintPatterns({ period, comparePeriod, category, product, courier, pincode });
+        }
+    },
+    {
+        name: 'get_return_exchange_analytics',
+        description: 'Analyze product returns and exchanges by product, SKU, size, and reason. Calculates authoritative return counts, exchange counts, return rates (%), exchange rates (%), reason distributions (e.g. size small, fabric defect, color mismatch), and size swap trajectories (e.g. M -> L). Supports officer queries: "Which SKU has the highest return rate?", "Which size has the most exchanges?", and "Why are customers returning this product?". Strictly declares denominators (Units Sold from store_shoppers) and emits Phase 14 VERIFIED FACT, POLICY, PATTERN, ANOMALY, and RECOMMENDATION tags.',
+        parameters: {
+            type: 'object',
+            properties: {
+                queryType: {
+                    type: 'string',
+                    description: 'Type of query: "overview" (full breakdown), "top_returned_skus" (rank SKUs by return rate), "size_exchanges" (size exchange patterns & swap directions), "return_reasons" (why customers return a product)'
+                },
+                skuOrProduct: {
+                    type: 'string',
+                    description: 'Filter by specific SKU or product name (e.g. "HENLEY - 001 ( ACID WASH )", "WAFFLE")'
+                },
+                size: {
+                    type: 'string',
+                    description: 'Filter by garment size (e.g. "S", "M", "L", "XL", "XXL")'
+                },
+                period: {
+                    type: 'string',
+                    description: 'Analysis time window: "today", "this_week", "this_month", or "all"'
+                },
+                sortBy: {
+                    type: 'string',
+                    description: 'Sort metric: "return_rate", "exchange_rate", or "returns_count"'
+                },
+                limit: {
+                    type: ['integer', 'string'],
+                    description: 'Max records to return (default 10)'
+                },
+                minUnits: {
+                    type: ['integer', 'string'],
+                    description: 'Minimum units sold threshold to prevent sample size distortion (default 10)'
+                }
+            },
+            required: []
+        },
+        requiresConfirmation: false,
+        async execute({ queryType, skuOrProduct, size, period, sortBy, limit, minUnits }, ctx) {
+            const {
+                getReturnExchangeAnalytics,
+                getTopReturnedSkus,
+                getSizeExchangePatterns,
+                getProductReturnReasons,
+                formatReturnAnalyticsReport
+            } = require('../returnAnalyticsService');
+
+            const lim = parseInt(limit) || 10;
+            const minU = parseInt(minUnits) || 10;
+
+            if (queryType === 'top_returned_skus') {
+                return await getTopReturnedSkus({ limit: lim, minUnits: minU });
+            } else if (queryType === 'size_exchanges') {
+                return await getSizeExchangePatterns({ product: skuOrProduct });
+            } else if (queryType === 'return_reasons') {
+                return await getProductReturnReasons({ product: skuOrProduct || 'HENLEY - 001 ( ACID WASH )' });
+            }
+
+            const res = await getReturnExchangeAnalytics({
+                skuOrProduct,
+                size,
+                period: period || 'all',
+                sortBy: sortBy || 'return_rate',
+                limit: lim,
+                minUnits: minU
+            });
+            return {
+                ...res,
+                formatted_report: formatReturnAnalyticsReport(res)
+            };
+        }
+    },
+    {
         name: 'search_messages',
         description: 'Get the recent WhatsApp conversation (incoming and outgoing messages) for a customer phone number.',
         parameters: {
@@ -231,9 +914,25 @@ const tools = [
                 fulfillmentStatus: o.fulfillment_status,
                 customer: o.customer ? `${o.customer.first_name || ''} ${o.customer.last_name || ''}`.trim() : null,
                 phone: o.customer?.phone || o.shipping_address?.phone || null,
-                items: (o.line_items || []).map(li => `${li.title} x${li.quantity}`)
+                items: (o.line_items || []).map(li => `${li.title} (${li.variant_title || 'standard'}) x${li.quantity} [SKU: ${li.sku || 'N/A'}]`)
             }));
             return { count: orders.length, orders };
+        }
+    },
+    {
+        name: 'get_order_intelligence',
+        description: 'Consolidated, verified order intelligence across all systems (Shopify, Shoppers Hub, shipments, carrier tracking, return/exchange system, edits, customer requests). Use whenever an officer asks for complete details of an order, what happened to an order, whether an order was edited, what size was originally ordered or changed to, whether it shipped, which courier is handling it, or what payment method was used.',
+        parameters: {
+            type: 'object',
+            properties: {
+                orderId: { type: 'string', description: 'Order ID or number (e.g. "12345" or "#12345")' }
+            },
+            required: ['orderId']
+        },
+        requiresConfirmation: false,
+        async execute({ orderId }) {
+            const { investigateOrder } = require('../orderIntelligenceService');
+            return await investigateOrder(orderId);
         }
     },
     {
@@ -523,7 +1222,7 @@ const tools = [
     },
     {
         name: 'query_returns_system',
-        description: 'Query the exchange/return tracking system (separate server) for return/exchange requests, influencer stats or marketing data. Ask a resource: requests, request_stats, influencers, settings.',
+        description: 'Query the exchange/return tracking system for return/exchange requests, influencer stats or marketing data. Ask a resource: requests, request_stats, influencers, settings.',
         parameters: {
             type: 'object',
             properties: {
@@ -537,13 +1236,22 @@ const tools = [
         async execute({ resource, query, limit }) {
             const baseUrl = process.env.RETURNS_SERVER_URL;
             const token = process.env.WHATSAPP_INTERNAL_TOKEN;
-            if (!baseUrl) throw new Error('RETURNS_SERVER_URL is not configured on this server');
-            const response = await axios.get(`${baseUrl.replace(/\/$/, '')}/api/internal/ai-data`, {
-                params: { resource, query: query || '', limit: Math.min(parseInt(limit) || 20, 50) },
-                headers: { 'x-internal-token': token || '' },
-                timeout: 15000
-            });
-            return response.data;
+            if (!baseUrl) {
+                const ris = require('../returnInvestigationService');
+                return await ris.getRecentReturnExchangeRequests({ limit: parseInt(limit) || 5, query, type: resource === 'requests' ? 'all' : resource });
+            }
+            try {
+                const response = await axios.get(`${baseUrl.replace(/\/$/, '')}/api/internal/ai-data`, {
+                    params: { resource, query: query || '', limit: Math.min(parseInt(limit) || 20, 50) },
+                    headers: { 'x-internal-token': token || '' },
+                    timeout: 15000
+                });
+                return response.data;
+            } catch (err) {
+                console.warn('⚠️ Returns system remote URL unreachable, falling back to authoritative database:', err.message);
+                const ris = require('../returnInvestigationService');
+                return await ris.getRecentReturnExchangeRequests({ limit: parseInt(limit) || 5, query, type: resource === 'requests' ? 'all' : resource });
+            }
         }
     },
     // ---------- Batch / bulk tools ----------
@@ -1005,12 +1713,32 @@ function getToolSchemas() {
 const TOOL_TRIGGERS = {
     query_stats: /\b(stats?|statistics|overview|summary|dashboard|how many|total|count)\b/i,
     search_customers: /\b(customers?|shoppers?|buyers?|clients?|who is|email|phone|number|contact)\b/i,
+    get_customer_360: /\b(customers?|shoppers?|buyers?|client|everything\s+about|how\s+many\s+orders|how\s+many\s+returns|latest\s+order|open\s+issues|spend|profile|360)\b|\b\d{10}\b/i,
+    get_conversation_history: /\b(previous\s*(?:conversations?|interactions?|chats?|support|history)|what\s*did\s*the\s*customer\s*tell|when\s*did\s*they\s*last\s*contact|what\s*resolution|did\s*we\s*promise|repeat\s*issue|commitments?|promises?|support\s*history|last\s*contact)\b|TKT-[\w-]+/i,
+    get_customer_behavior_patterns: /\b(behavior|patterns?|same\s*issue|size[- ]related|how\s*many\s*(?:returns|exchanges|complaints|cancellations|rtos)|history\s*pattern|habit|repeat\s*complaint|repeated\s*issue)\b/i,
+    detect_repeat_contact: /\b(repeat\s*contacts?|repeated\s*contacts?|contacted\s*(?:us\s*)?before|multiple\s*times|same\s*(?:order|problem|issue)\s*again|reaching\s*out\s*again|contact\s*history|repeat\s*inquir\w*|repeat\s*query)\b/i,
+    get_sales_by_sku: /\b(sku|best-?selling|sold|units|sales|revenue|how\s*many\s*(?:units|pieces|orders)|which\s*sku|top\s*(?:selling|sku)|sales\s*analytics|highest\s*revenue)\b/i,
+    get_size_wise_sales: /\b(size|sizes|size-wise|sizewise|which\s*size|best-?selling\s*size|lowest-?selling\s*size|zero-?sales?|size\s*breakdown|demand\s*for\s*(?:xs|s|m|l|xl|xxl)|size\s*sales|size\s*comparison|more\s*[smlx]+\s*or\s*[smlx]+|stock\s*more|inventory\s*recommendation|black\s*[smlx]+|white\s*[smlx]+)\b/i,
+    get_product_sku_info: /\b(product\s*(?:info|details?|catalog)|variants?|what\s*(?:sizes?|colours?|colors?)\s*exist|sku\s*info|is\s*sku|price\s*and\s*stock|active\s*sku|what\s*is\s*the\s*sku|product\s*available)\b/i,
+    investigate_return_exchange: /\b(investigat\w*\s*(?:return|exchange|case)|return\s*investigat\w*|exchange\s*investigat\w*|can\s*(?:i|they)\s*exchange|unboxing\s*video|proof|damaged\s*item|wrong\s*(?:product|item)|exchange\s*.*for\s*size|size\s*m\s*.*size\s*l|refund\s*eligib\w*|recent\s*(?:exchanges?|returns?)|(?:tell|show|give|list|get)\s*(?:me\s*)?(?:\d+\s*)?(?:recent\s*)?(?:exchange|return)s?\s*(?:list|requests?|cases?)?|exchange\s*list)\b/i,
+    check_refund_eligibility: /\b(refund\s*eligib\w*|can\s*(?:i|they)\s*get\s*a?\s*refund|eligible\s*for\s*(?:a\s*)?refund|refund\s*policy|store\s*credit\s*or\s*(?:bank|cash|original)|is\s*this\s*order\s*eligible\s*for\s*refund)\b/i,
+    investigate_refund_status: /\b(refund\s*status|where\s*is\s*my\s*refund|refund\s*timeline|when\s*will\s*(?:i|my)\s*refund|has\s*the\s*refund\s*been|refund\s*processed|5-?7\s*(?:business\s*)?days|refund\s*delay\w*)\b/i,
+    investigate_payment: /\b(payment\s*(?:investigat\w*|issue|status|discrepanc\w*|reconcil\w*)|double\s*charge\w*|charged\s*twice|cod\s*conversion|overcharg\w*|paid\s*more|courier\s*collected|edit\s*details\s*payment)\b/i,
+    investigate_discount: /\b(discount\s*(?:investigat\w*|drop\w*|lost|remov\w*|missing)|coupon\s*(?:code|not\s*applied|disappear\w*|remov\w*|valid)|edit\s*details\s*discount|off10|promo\s*code|coupon\s*investigat\w*)\b/i,
+    get_shipment_intelligence: /\b(shipment\s*intel\w*|carrier\s*(?:priority|sequence|status)|delivered\s*but\s*not\s*received|fake\s*deliver\w*|pod\s*request|proof\s*of\s*delivery|stuck\s*in\s*transit|shipment\s*delay\w*|rto\s*reason|shiprocket|delhivery|ekart)\b/i,
+    investigate_rto: /\b(rto\s*investigat\w*|rto\s*status|rto\s*initiated|rto\s*delivered|why\s*(?:did|is)\s*(?:the\s*)?(?:order|package|shipment)\s*rto|rto\s*reason|at\s*risk\s*of\s*rto|rto\s*timeline|customer\s*refused|failed\s*delivery|delivery\s*failed|ndr|undelivered|post-?rto)\b/i,
+    get_courier_analytics: /\b(courier\s*analytics|courier\s*performance|delivery\s*success\s*rate|courier\s*ranking|which\s*courier|best\s*courier|delhivery\s*vs\s*ekart|courier\s*comparison|rto\s*rate\s*by\s*courier|courier\s*speed|average\s*transit\s*time|courier\s*delay|pincode\s*performance)\b/i,
+    investigate_return_pickup: /\b(return\s*pickup|pickup\s*investigat\w*|pickup\s*status|pickup\s*pending|pickup\s*attempt|pickup\s*failed|when\s*will\s*(?:the\s*)?pickup|reverse\s*pickup|has\s*the\s*pickup\s*been|pickup\s*sla|pickup\s*delay\w*|pickup\s*partner)\b/i,
+    detect_delivery_anomalies: /\b(delivery\s*anomal\w*|anomaly\s*detect\w*|unusual\s*delivery|stuck\s*in\s*transit|excessive\s*attempts|rapid\s*deliver\w*|delivery\s*delay\w*|suspicious\s*deliver\w*|tracking\s*anomal\w*|pincode\s*failure\s*cluster|courier\s*surge)\b/i,
+    get_complaint_patterns: /\b(complaint\s*patterns?|complaints?\s*analytics|recurring\s*(?:issues?|complaints?)|complaint\s*trend|ticket\s*trend|most\s*common\s*complaints?|grievance\s*pattern|complaint\s*categor\w*|customer\s*complaints?|complaints?\s*by\s*product|complaints?\s*by\s*courier)\b/i,
+    get_return_exchange_analytics: /\b(return\s*analytics|exchange\s*analytics|return\s*rate|exchange\s*rate|which\s*sku\s*has\s*the\s*highest\s*return|which\s*size\s*has\s*the\s*most\s*exchanges|why\s*(?:are\s*)?customers\s*returning|returns?\s*by\s*product|returns?\s*by\s*sku|returns?\s*by\s*size|size\s*exchange\s*patterns?|product\s*problems?|defect\s*rate|highest\s*return\s*rate|most\s*exchanges)\b/i,
     search_messages: /\b(messages?|chats?|conversations?|whatsapp|said|replied|history)\b/i,
     list_tickets: /\b(tickets?|support|complaints?|issues?|queries|grievance)\b/i,
     search_learned_replies: /\b(reply|replies|respond|draft|answer|suggest\w*|how (do|did|should) we)\b/i,
     update_ticket: /\b(tickets?|resolve|closed?|reopen)\b/i,
     get_abandoned_carts: /\b(carts?|abandon\w*|checkouts?|recover\w*)\b/i,
     shopify_search_orders: /\b(orders?|shopify|purchases?|bought|payments?|refunds?|fulfill?\w*|cod|prepaid)\b|#\d+/i,
+    get_order_intelligence: /\b(orders?|details?|investigat\w*|what\s+happened|status|edited?|edits?|sizes?|originally|changed\s+to|couriers?|awb|payments?|shipped|tracking)\b|#?\d{4,6}/i,
     track_awb: /\b(track\w*|awb|waybill|shipments?|couriers?|deliver\w*|transit|shipping)\b/i,
     track_order_by_id: /\b(track\w*|orders?|status|where|deliver\w*|ship\w*)\b|#?\d{4,5}/i,
     check_serviceability: /\b(pin ?codes?|serviceab\w*|deliverable|cod|prepaid)\b/i,

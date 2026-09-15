@@ -40,3 +40,4 @@ setup-turso.js
 !package.json
 !package-lock.json
 *.txt
+scratch/

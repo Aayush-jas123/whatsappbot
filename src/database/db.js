@@ -8,7 +8,7 @@ const pool = new Pool({
   max: 3, // Keep at 3 for concurrent DB operations
   min: 0, // Allow all connections to close when idle (saves ~10MB native)
   idleTimeoutMillis: 10000, // Close idle connections after 10s (was 20s)
-  connectionTimeoutMillis: 5000 // Fail fast if no connection available
+  connectionTimeoutMillis: 15000 // Allow up to 15s for TLS & pooler negotiation
 });
 
 // CRITICAL: handle background errors from idle pooled connections.
@@ -79,7 +79,18 @@ class DatabaseAdapter {
     const start = Date.now();
     const pgSql = convertPlaceholders(sql);
     const values = params.map(v => v === undefined ? null : v);
-    const result = await pool.query(pgSql, values);
+    let result;
+    try {
+      result = await pool.query(pgSql, values);
+    } catch (err) {
+      if (err.message && (err.message.includes('timeout') || err.message.includes('Connection terminated') || err.message.includes('reset by pooler'))) {
+        console.warn(`⚠️ Retrying query after connection glitch: ${sql.substring(0, 60)}`);
+        await new Promise(r => setTimeout(r, 600));
+        result = await pool.query(pgSql, values);
+      } else {
+        throw err;
+      }
+    }
     const duration = Date.now() - start;
     
     // Log slow queries (>100ms)
