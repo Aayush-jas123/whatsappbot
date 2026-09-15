@@ -147,6 +147,11 @@
             '#offcomfrt-tb .oftb-return-row .label{color:#bbb;font-size:10px;text-transform:uppercase;letter-spacing:0.8px;font-weight:600}',
             '#offcomfrt-tb .oftb-return-row .value{color:#1a1a1a;font-weight:500}',
 
+            /* WhatsApp Continue Button */
+            '#offcomfrt-tb .oftb-whatsapp-btn{display:inline-flex;align-items:center;gap:8px;margin-top:14px;padding:12px 24px;background:#25D366;color:#fff;border-radius:100px;text-decoration:none;font-size:12px;font-weight:700;font-family:inherit;letter-spacing:0.3px;transition:all 0.25s ease;border:none;cursor:pointer}',
+            '#offcomfrt-tb .oftb-whatsapp-btn:hover{background:#1ebe5d;transform:translateY(-1px);box-shadow:0 4px 16px rgba(37,211,102,0.3)}',
+            '#offcomfrt-tb .oftb-whatsapp-btn svg{width:18px;height:18px;fill:#fff;flex-shrink:0}',
+
             /* Ticket Confirmation — monochrome */
             '#offcomfrt-tb .oftb-ticket-confirm{background:#fff;border:1px solid #e0e0e0;border-radius:14px;padding:28px 24px;margin:4px 0;text-align:center;box-shadow:0 2px 8px rgba(0,0,0,0.04);animation:oftb-slideUp 0.35s cubic-bezier(0.16,1,0.3,1);width:100%}',
             '#offcomfrt-tb .oftb-ticket-confirm-icon{width:48px;height:48px;border-radius:50%;background:#1a1a1a;display:flex;align-items:center;justify-content:center;margin:0 auto 16px}',
@@ -507,9 +512,12 @@
     }
 
     // ========== FLOW 4: CONTACT SUPPORT ==========
+    var MAX_AI_ATTEMPTS = 3; // Try AI resolution this many times before showing Create Ticket
+
     function startContactSupport() {
         flowState = 'awaiting_ticket_order_id';
         flowContext = {};
+        flowContext.aiAttempts = 0;
         setInputMode('order');
         addBotMessage('Please enter your *order number* so we can pull up your details.', [
             { label: 'Back to Menu', action: 'main_menu' }
@@ -543,6 +551,7 @@
 
     function doResolveWithAI(message) {
         flowState = 'resolving_with_ai';
+        flowContext.aiAttempts = (flowContext.aiAttempts || 0) + 1;
         showTyping();
 
         fetch(API_URL + '/api/widget/chat', {
@@ -557,18 +566,26 @@
         .then(function (data) {
             hideTyping();
             var aiReply = data.reply || 'I was unable to process your request.';
-            var needsEscalation = data.suggestedAction === 'create_ticket';
+            var aiSaysCreateTicket = data.suggestedAction === 'create_ticket';
+            var attempts = flowContext.aiAttempts || 0;
+            var exhaustedAttempts = attempts >= MAX_AI_ATTEMPTS;
 
-            if (needsEscalation) {
-                addBotMessage(aiReply + '\n\nWould you like to create a support ticket so our team can assist you further?', [
+            // Only offer Create Ticket after 3 AI attempts or if AI explicitly says so
+            if (aiSaysCreateTicket || exhaustedAttempts) {
+                var escalationMsg = aiReply;
+                if (exhaustedAttempts && !aiSaysCreateTicket) {
+                    escalationMsg += '\n\nIt seems I am not able to fully resolve this. Would you like to create a support ticket so our team can assist you directly?';
+                } else {
+                    escalationMsg += '\n\nWould you like to create a support ticket so our team can assist you further?';
+                }
+                addBotMessage(escalationMsg, [
                     { label: 'Create Ticket', action: 'create_support_ticket', primary: true },
                     { label: 'Try Another Question', action: 'retry_support' },
                     { label: 'Menu', action: 'main_menu' }
                 ]);
             } else {
                 addBotMessage(aiReply, [
-                    { label: 'Create Ticket', action: 'create_support_ticket' },
-                    { label: 'Try Another Question', action: 'retry_support' },
+                    { label: 'Try Another Question', action: 'retry_support', primary: true },
                     { label: 'Menu', action: 'main_menu' }
                 ]);
             }
@@ -577,10 +594,18 @@
         })
         .catch(function () {
             hideTyping();
-            addBotMessage('I could not connect to our support assistant. Would you like to create a ticket instead?', [
-                { label: 'Create Ticket', action: 'create_support_ticket', primary: true },
-                { label: 'Menu', action: 'main_menu' }
-            ]);
+            var attempts = flowContext.aiAttempts || 0;
+            if (attempts >= MAX_AI_ATTEMPTS) {
+                addBotMessage('I could not connect to our support assistant. Would you like to create a ticket instead?', [
+                    { label: 'Create Ticket', action: 'create_support_ticket', primary: true },
+                    { label: 'Menu', action: 'main_menu' }
+                ]);
+            } else {
+                addBotMessage('I had trouble processing that. Could you rephrase or try another question?', [
+                    { label: 'Try Another Question', action: 'retry_support', primary: true },
+                    { label: 'Menu', action: 'main_menu' }
+                ]);
+            }
             setInputMode('text');
             flowState = 'idle';
         });
@@ -590,14 +615,17 @@
         flowState = 'creating_ticket';
         showTyping();
 
+        var ticketMessage = '[Website] [' + (flowContext.supportTopic || 'General') + '] ' + message;
+
         fetch(API_URL + '/api/widget/ticket', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({
                 name: CUSTOMER_NAME || 'Customer',
                 phone: CUSTOMER_PHONE || '',
-                message: '[' + (flowContext.supportTopic || 'General') + '] ' + message,
-                orderId: flowContext.orderId || null
+                message: ticketMessage,
+                orderId: flowContext.orderId || null,
+                source: 'website'
             })
         })
         .then(function (r) { return r.json(); })
@@ -725,11 +753,20 @@
         wrapper.className = 'oftb-msg-wrap oftb-align-left';
         var el = document.createElement('div');
         el.className = 'oftb-ticket-confirm';
-        el.innerHTML =
+
+        var html =
             '<div class="oftb-ticket-confirm-icon"><svg viewBox="0 0 24 24"><polyline points="20 6 9 17 4 12"/></svg></div>' +
             '<h4>Ticket Created</h4>' +
             '<p>Our team will respond within 24 hours.</p>' +
             '<div class="oftb-ticket-number">' + escapeHtml(data.ticketNumber) + '</div>';
+
+        if (data.whatsappLink) {
+            html += '<a href="' + escapeHtml(data.whatsappLink) + '" target="_blank" class="oftb-whatsapp-btn">' +
+                '<svg viewBox="0 0 24 24"><path d="M17.472 14.382c-.297-.149-1.758-.867-2.03-.967-.273-.099-.471-.148-.67.15-.197.297-.767.966-.94 1.164-.173.199-.347.223-.644.075-.297-.15-1.255-.463-2.39-1.475-.883-.788-1.48-1.761-1.653-2.059-.173-.297-.018-.458.13-.606.134-.133.298-.347.446-.52.149-.174.198-.298.298-.497.099-.198.05-.371-.025-.52-.075-.149-.669-1.612-.916-2.207-.242-.579-.487-.5-.669-.51-.173-.008-.371-.01-.57-.01-.198 0-.52.074-.792.372-.272.297-1.04 1.016-1.04 2.479 0 1.462 1.065 2.875 1.213 3.074.149.198 2.096 3.2 5.077 4.487.709.306 1.262.489 1.694.625.712.227 1.36.195 1.871.118.571-.085 1.758-.719 2.006-1.413.248-.694.248-1.289.173-1.413-.074-.124-.272-.198-.57-.347z"/><path d="M12 2C6.477 2 2 6.477 2 12c0 1.89.525 3.66 1.438 5.168L2 22l4.832-1.438A9.955 9.955 0 0 0 12 22c5.523 0 10-4.477 10-10S17.523 2 12 2z"/></svg>' +
+                'Continue on WhatsApp</a>';
+        }
+
+        el.innerHTML = html;
         wrapper.appendChild(el);
         chat.appendChild(wrapper);
         scrollToBottom();

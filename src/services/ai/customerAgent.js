@@ -400,11 +400,14 @@ function buildReturnCard(result) {
  * Create a support ticket from the widget.
  * @returns {{ ticketNumber: string, whatsappLink: string }}
  */
-async function createWidgetTicket({ name, phone, email, message, orderId }) {
+async function createWidgetTicket({ name, phone, email, message, orderId, source }) {
     const ticketNumber = 'WDG-' + Date.now().toString(36).toUpperCase();
 
     // Assign portal via round-robin so every portal gets its fair share of widget tickets
     const portalId = await getPortalIdForNewTicket();
+
+    // Source defaults to 'widget' for backward compatibility; testbot sends 'website'
+    const ticketSource = source || 'widget';
 
     await dbAdapter.insert('support_tickets', {
         ticket_number: ticketNumber,
@@ -415,7 +418,7 @@ async function createWidgetTicket({ name, phone, email, message, orderId }) {
         order_id: orderId || null,
         portal_id: portalId,
         status: 'open',
-        source: 'widget',
+        source: ticketSource,
         created_at: new Date().toISOString(),
         updated_at: new Date().toISOString()
     });

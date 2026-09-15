@@ -380,13 +380,13 @@ router.post('/track-order', async (req, res) => {
 
 router.post('/ticket', async (req, res) => {
     try {
-        const { name, phone, email, message, orderId } = req.body;
+        const { name, phone, email, message, orderId, source } = req.body;
 
         if (!message) {
             return res.status(400).json({ error: 'Message is required' });
         }
 
-        const result = await createWidgetTicket({ name, phone, email, message, orderId });
+        const result = await createWidgetTicket({ name, phone, email, message, orderId, source });
 
         res.json({
             success: true,
