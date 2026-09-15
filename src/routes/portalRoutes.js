@@ -207,6 +207,11 @@ router.post('/auth', async (req, res) => {
     }
 });
 
+// Verify portal token is still valid
+router.get('/:slug/verify', verifyPortalToken, async (req, res) => {
+    res.json({ success: true, portal: { slug: req.portal.slug, name: req.portal.name || req.portal.slug } });
+});
+
 // Get tickets for a portal
 router.get('/:slug/tickets', verifyPortalToken, async (req, res) => {
     try {
@@ -605,6 +610,93 @@ router.patch('/:slug/tickets/:id/mark-read', verifyPortalToken, async (req, res)
     } catch (error) {
         console.error('Portal mark ticket as read error:', error);
         res.status(500).json({ success: false, error: 'Failed to mark ticket as read' });
+    }
+});
+
+// ── Customer Details (aggregated: customer info + orders + returns) ──
+router.get('/:slug/customers/:phone/details', verifyPortalToken, async (req, res) => {
+    try {
+        const { slug, phone } = req.params;
+        if (slug !== req.portal.slug) {
+            return res.status(403).json({ error: 'Portal mismatch' });
+        }
+
+        const cleanPhone = phone.replace(/\D/g, '');
+        const phoneVariants = [cleanPhone];
+        if (cleanPhone.startsWith('91')) phoneVariants.push(cleanPhone.slice(2));
+        else phoneVariants.push('91' + cleanPhone);
+
+        const placeholders = phoneVariants.map(() => '?').join(',');
+
+        // Parallel fetch: customer info, orders, returns server
+        const [shoppers, orders, returnsResult] = await Promise.all([
+            // Customer info from store_shoppers (deduplicated by phone)
+            dbAdapter.query(
+                `SELECT phone, name, email, city, province, created_at
+                 FROM store_shoppers
+                 WHERE phone IN (${placeholders})
+                 ORDER BY created_at DESC
+                 LIMIT 1`,
+                phoneVariants
+            ),
+            // All orders (capped at 50)
+            dbAdapter.query(
+                `SELECT * FROM orders
+                 WHERE customer_phone IN (${placeholders})
+                 ORDER BY created_at DESC LIMIT 50`,
+                phoneVariants
+            ),
+            // Returns/exchanges from external server
+            (async () => {
+                const baseUrl = process.env.RETURNS_SERVER_URL;
+                const token = process.env.WHATSAPP_INTERNAL_TOKEN;
+                if (!baseUrl) return { connected: false, requests: [] };
+                try {
+                    const axios = require('axios');
+                    const resp = await axios.get(
+                        `${baseUrl.replace(/\/$/, '')}/api/internal/inventory-open-requests`,
+                        { params: { window: 60 }, headers: { 'x-internal-token': token || '' }, timeout: 15000 }
+                    );
+                    if (!resp.data?.success) return { connected: false, requests: [] };
+                    return { connected: true, requests: Array.isArray(resp.data.requests) ? resp.data.requests : [] };
+                } catch (err) {
+                    console.warn(`[PORTAL DETAILS] Returns server fetch failed: ${err.message}`);
+                    return { connected: false, requests: [] };
+                }
+            })()
+        ]);
+
+        // Build customer profile from store_shoppers
+        const shopper = shoppers && shoppers[0];
+        const customer = {
+            name: shopper?.name || null,
+            phone: shopper?.phone || phone,
+            email: shopper?.email || null,
+            city: shopper?.city || null,
+            province: shopper?.province || null,
+            totalOrders: (orders || []).length,
+            firstOrderAt: orders?.length ? orders[orders.length - 1]?.created_at : null,
+            lastOrderAt: orders?.length ? orders[0]?.created_at : null
+        };
+
+        // Filter returns/exchanges to only this customer's orders
+        const orderIds = new Set((orders || []).map(o => String(o.order_id)));
+        const customerReturns = (returnsResult.requests || []).filter(r =>
+            orderIds.has(String(r.order_number))
+        );
+
+        console.log(`[PORTAL DETAILS] ${customer.totalOrders} orders, ${customerReturns.length} returns for ${phone}`);
+
+        res.json({
+            success: true,
+            customer,
+            orders: orders || [],
+            returns: customerReturns,
+            returnsConnected: returnsResult.connected
+        });
+    } catch (error) {
+        console.error('[PORTAL DETAILS] Error:', error);
+        res.status(500).json({ success: false, error: 'Failed to fetch customer details', details: error.message });
     }
 });
 
