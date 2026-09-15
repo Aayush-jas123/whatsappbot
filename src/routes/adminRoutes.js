@@ -3866,11 +3866,11 @@ router.post('/support-portals', verifyToken, async (req, res) => {
         const passwordHash = await bcrypt.hash(portalPassword, 10);
 
         const result = await dbAdapter.run(
-            `INSERT INTO support_portals (name, slug, password_hash, type, config) VALUES (?, ?, ?, ?, ?)`,
-            [name, slug, passwordHash, type, config ? JSON.stringify(config) : null]
+            `INSERT INTO support_portals (name, slug, password_hash, password_plain, type, config) VALUES (?, ?, ?, ?, ?, ?)`,
+            [name, slug, passwordHash, portalPassword, type, config ? JSON.stringify(config) : null]
         );
 
-        // Store password in memory so admin can view it later
+        // Also keep in memory as a fast fallback
         const portalId = result.lastInsertRowid;
         portalPasswords.set(String(portalId), portalPassword);
 
@@ -4907,7 +4907,13 @@ router.get('/support-portals/active-shifts', verifyToken, async (req, res) => {
 router.get('/support-portals/:id/password', verifyToken, async (req, res) => {
     try {
         const { id } = req.params;
-        const password = portalPasswords.get(String(id));
+
+        // Try DB first (persists across restarts), fall back to in-memory store
+        const portals = await dbAdapter.query(
+            'SELECT password_plain FROM support_portals WHERE id = ?',
+            [id]
+        );
+        const password = portals?.[0]?.password_plain || portalPasswords.get(String(id));
 
         if (!password) {
             return res.json({
@@ -4941,11 +4947,11 @@ router.put('/support-portals/:id/password', verifyToken, async (req, res) => {
 
         const passwordHash = await bcrypt.hash(newPassword, 10);
         await dbAdapter.run(
-            'UPDATE support_portals SET password_hash = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?',
-            [passwordHash, id]
+            'UPDATE support_portals SET password_hash = ?, password_plain = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?',
+            [passwordHash, newPassword, id]
         );
 
-        // Store new password in memory so admin can view it
+        // Also update in-memory store
         portalPasswords.set(String(id), newPassword);
 
         res.json({

@@ -450,6 +450,9 @@ async function initializeSupportPortalsTable() {
     // Single-session enforcement for portals (same scheme as hub_operators)
     await addColumnIfNotExists('support_portals', 'active_session_id', 'VARCHAR(64)');
 
+    // Store plain-text password so admin can always view it (click-to-reveal)
+    await addColumnIfNotExists('support_portals', 'password_plain', 'TEXT');
+
     // Add portal_id to support_tickets if missing
     await addColumnIfNotExists('support_tickets', 'portal_id', 'INTEGER');
     await addColumnIfNotExists('support_tickets', 'ticket_number', 'VARCHAR(50)');
