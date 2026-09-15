@@ -76,6 +76,10 @@
                     <svg class="nav-icon" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></svg>
                     <span class="nav-item-text">Messages</span>
                 </a>
+                <a href="#" class="nav-item" data-page="ig-comments" data-tooltip="Instagram Comments">
+                    <svg class="nav-icon" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="2" y="2" width="20" height="20" rx="5" ry="5"/><path d="M16 11.37A4 4 0 1 1 12.63 8 4 4 0 0 1 16 11.37z"/><line x1="17.5" y1="6.5" x2="17.51" y2="6.5"/></svg>
+                    <span class="nav-item-text">IG Comments</span>
+                </a>
                 <a href="#" class="nav-item" data-page="support" data-tooltip="Support Tickets">
                     <svg class="nav-icon" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/><circle cx="12" cy="10" r="3"/></svg>
                     <span class="nav-item-text">Support Tickets</span>
@@ -740,6 +744,64 @@
                         <div class="modal-footer">
                             <button class="btn btn-secondary" data-action="closeModal" data-modal="urgentKeywordsModal">Cancel</button>
                             <button class="btn btn-primary" id="saveKeywordsBtn">Save Changes</button>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Instagram Comments Page -->
+                <div id="ig-commentsPage" class="page-section">
+                    <div class="igc-stats-bar">
+                        <div class="igc-stat"><span class="igc-stat-value" id="igcStatTotal">0</span><span class="igc-stat-label">Total</span></div>
+                        <div class="igc-stat igc-stat-new"><span class="igc-stat-value" id="igcStatNew">0</span><span class="igc-stat-label">New</span></div>
+                        <div class="igc-stat igc-stat-attention"><span class="igc-stat-value" id="igcStatAttention">0</span><span class="igc-stat-label">Needs Attention</span></div>
+                        <div class="igc-stat igc-stat-dm"><span class="igc-stat-value" id="igcStatDm">0</span><span class="igc-stat-label">DM Started</span></div>
+                        <div class="igc-stat igc-stat-ticket"><span class="igc-stat-value" id="igcStatTickets">0</span><span class="igc-stat-label">Tickets</span></div>
+                        <div class="igc-stat igc-stat-spam"><span class="igc-stat-value" id="igcStatSpam">0</span><span class="igc-stat-label">Spam</span></div>
+                    </div>
+
+                    <div class="card">
+                        <div class="card-header">
+                            <h3 class="card-title">Instagram Comments</h3>
+                            <button class="btn btn-secondary" id="igcRefreshBtn">Refresh</button>
+                        </div>
+                        <div class="igc-filters">
+                            <select id="igcStatusFilter" class="igc-filter-select">
+                                <option value="all">All Statuses</option>
+                                <option value="new">New</option>
+                                <option value="needs_review">Needs Review</option>
+                                <option value="needs_human">Needs Human</option>
+                                <option value="dm_started">DM Started</option>
+                                <option value="ticket_created">Ticket Created</option>
+                                <option value="resolved">Resolved</option>
+                                <option value="ignored">Ignored</option>
+                                <option value="spam">Spam</option>
+                            </select>
+                            <select id="igcIntentFilter" class="igc-filter-select">
+                                <option value="all">All Intents</option>
+                            </select>
+                            <input type="text" id="igcSearchInput" class="igc-filter-input" placeholder="Search username, text, comment ID, ticket..." />
+                            <input type="date" id="igcDateFrom" class="igc-filter-input" title="From date" />
+                            <input type="date" id="igcDateTo" class="igc-filter-input" title="To date" />
+                        </div>
+                        <div id="igCommentsList" class="igc-list">
+                            <div class="igc-empty">No comments yet. Comment webhook events will appear here.</div>
+                        </div>
+                        <div class="igc-pagination">
+                            <button class="btn btn-secondary" id="igcPrevBtn" disabled>Previous</button>
+                            <span id="igcPageInfo" class="igc-page-info">Page 1</span>
+                            <button class="btn btn-secondary" id="igcNextBtn" disabled>Next</button>
+                        </div>
+                    </div>
+
+                    <!-- Comment Detail Modal -->
+                    <div id="igCommentDetailModal" class="modal">
+                        <div class="modal-content igc-modal-wide">
+                            <div class="modal-header">
+                                <h3 class="modal-title">Comment Detail</h3>
+                                <button class="modal-close" data-action="closeModal" data-modal="igCommentDetailModal">&times;</button>
+                            </div>
+                            <div class="modal-body" id="igCommentDetailBody"></div>
+                            <div class="modal-footer" id="igCommentDetailFooter"></div>
                         </div>
                     </div>
                 </div>
@@ -1797,7 +1859,8 @@
 
     <!-- Scripts -->
     <script src="/dashboard/js/chart.min.js" defer></script>
-    <script src="/dashboard/js/main.js?v=17" defer></script>
+    <script src="/dashboard/js/main.js?v=18" defer></script>
+    <script src="/dashboard/js/comments.js?v=1" defer></script>
     <script src="/dashboard/js/ai-copilot.js?v=2" defer></script>
 </body>
 

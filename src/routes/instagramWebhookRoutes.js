@@ -1,16 +1,17 @@
 /**
  * instagramWebhookRoutes.js
  * ─────────────────────────────────────────────────────────────
- * Instagram webhook endpoint for receiving DMs and events.
+ * Instagram webhook endpoint for receiving DMs and comment events.
  *
  * Routes:
  *   GET  /webhook/instagram  — Meta webhook verification
- *   POST /webhook/instagram  — Incoming Instagram messages
+ *   POST /webhook/instagram  — Incoming Instagram messages + comments
  *
  * SAFETY:
  *   - Completely separate from the WhatsApp /webhook endpoint
  *   - Uses its own verify token (INSTAGRAM_VERIFY_TOKEN)
  *   - Idempotency protection prevents duplicate processing
+ *   - Comment events are routed to igCommentService (idempotent pipeline)
  *   - Does NOT modify any WhatsApp webhook logic
  * ─────────────────────────────────────────────────────────────
  */
@@ -18,6 +19,7 @@
 const express = require('express');
 const router = express.Router();
 const instagramService = require('../services/instagramService');
+const igCommentService = require('../services/igCommentService');
 const { dbAdapter } = require('../database/db');
 
 // ─── Webhook Verification (GET) ─────────────────────────────
@@ -71,6 +73,25 @@ router.post('/webhook/instagram', async (req, res) => {
                 // Process in background to avoid blocking the response
                 processInstagramEvent(event).catch(err => {
                     console.error('[IG WEBHOOK] Event processing error:', err.message);
+                });
+            }
+
+            // Handle comment events — two payload shapes exist:
+            //   - entry.comments[] (direct comment objects)
+            //   - entry.changes[] with field 'comments' (Graph webhook format)
+            const commentEvents = [
+                ...(entry.comments || []),
+                ...(entry.changes || [])
+                    .filter(c => c.field === 'comments')
+                    .map(c => c.value)
+            ].filter(Boolean);
+
+            for (const comment of commentEvents) {
+                if (!comment?.id) continue;
+                // Process in background — pipeline dedups, classifies,
+                // private-replies and records the comment
+                igCommentService.processCommentEvent(comment).catch(err => {
+                    console.error('[IG WEBHOOK] Comment processing error:', err.message);
                 });
             }
         }

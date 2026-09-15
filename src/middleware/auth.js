@@ -157,6 +157,7 @@ const ROUTE_PERMISSIONS = [
     { prefix: '/broadcast', key: null },
     { prefix: '/support-portals', key: null },
     { prefix: '/support-tickets', key: null },
+    { prefix: '/ig-comments', key: null },
     { prefix: '/upload', key: null },
     { prefix: '/shiprocket', key: null },
     // Product catalog powers the order editor (size/product picker) inside

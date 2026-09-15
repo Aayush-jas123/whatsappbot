@@ -9,6 +9,7 @@
  *   - Send image/media messages
  *   - Send quick-reply buttons
  *   - Fetch Instagram user profile (username, profile pic)
+ *   - Comment operations: public reply, private reply, fetch comment/media
  *   - 24-hour messaging window tracking
  *   - Rate-limit aware error handling
  *   - Message logging to shared messages table
@@ -258,6 +259,194 @@ class InstagramService {
 
         } catch (error) {
             return this._handleError(error, igUserId, 'sendQuickReplies');
+        }
+    }
+
+    // ─── Comment Operations ───────────────────────────────────
+
+    /**
+     * Reply publicly to a comment on our media.
+     * Instagram API: POST /{comment_id}/replies
+     *
+     * @param {string} commentId - Instagram comment ID
+     * @param {string} text      - Reply text (max 2200 chars)
+     * @returns {object|null}    - { id } of the reply comment or null on failure
+     */
+    async sendCommentReply(commentId, text) {
+        if (!this._enabled) return null;
+
+        if (!commentId || !text) {
+            console.error('[IG] sendCommentReply: commentId and text are required');
+            return null;
+        }
+
+        this._trackCall();
+
+        try {
+            const response = await axios.post(
+                `https://graph.instagram.com/${this.apiVersion}/${commentId}/replies`,
+                { message: text.substring(0, 2200) },
+                {
+                    headers: {
+                        'Authorization': `Bearer ${this.accessToken}`,
+                        'Content-Type': 'application/json'
+                    },
+                    timeout: 10000
+                }
+            );
+
+            console.log(`[IG] ✅ Public reply posted for comment ${commentId}`);
+            return response.data;
+
+        } catch (error) {
+            return this._handleError(error, commentId, 'sendCommentReply');
+        }
+    }
+
+    /**
+     * Send a private reply (DM) to the author of a comment.
+     * Instagram API: POST /me/messages with recipient.comment_id
+     * Opens a 24-hour messaging window with the commenter.
+     *
+     * @param {string} commentId - Instagram comment ID
+     * @param {string} text      - Private reply text
+     * @returns {object|null}    - { recipient_id, message_id } or null
+     */
+    async sendPrivateReply(commentId, text) {
+        if (!this._enabled) return null;
+
+        if (!commentId || !text) {
+            console.error('[IG] sendPrivateReply: commentId and text are required');
+            return null;
+        }
+
+        this._trackCall();
+
+        try {
+            const response = await axios.post(
+                this.messagesURL,
+                {
+                    recipient: { comment_id: commentId },
+                    message: { text: text }
+                },
+                {
+                    headers: {
+                        'Authorization': `Bearer ${this.accessToken}`,
+                        'Content-Type': 'application/json'
+                    },
+                    timeout: 10000
+                }
+            );
+
+            // Log the outgoing DM + ensure customer record exists.
+            // recipient_id is the IG PSID of the commenter (returned by the API).
+            const recipientId = response.data?.recipient_id;
+            if (recipientId) {
+                await this._logOutgoing(recipientId, text, 'outgoing', response.data?.message_id || null);
+            }
+
+            console.log(`[IG] ✅ Private reply sent for comment ${commentId}`);
+            return response.data;
+
+        } catch (error) {
+            return this._handleError(error, commentId, 'sendPrivateReply');
+        }
+    }
+
+    /**
+     * Fetch a single comment's details.
+     *
+     * @param {string} commentId - Instagram comment ID
+     * @returns {object|null}    - { id, text, username, timestamp, media_id, ... }
+     */
+    async fetchComment(commentId) {
+        if (!this._enabled) return null;
+
+        this._trackCall();
+
+        try {
+            const response = await axios.get(
+                `https://graph.instagram.com/${this.apiVersion}/${commentId}`,
+                {
+                    params: {
+                        fields: 'id,text,username,timestamp,media_id,permalink,like_count,from{id,username}',
+                        access_token: this.accessToken
+                    },
+                    timeout: 10000
+                }
+            );
+            return response.data;
+
+        } catch (error) {
+            console.error(`[IG] Failed to fetch comment ${commentId}:`, error.message);
+            return null;
+        }
+    }
+
+    /**
+     * Fetch media (post) details for context in the Comments Center.
+     *
+     * @param {string} mediaId - Instagram media ID
+     * @returns {object|null}  - { id, caption, media_type, media_url, thumbnail_url, permalink, timestamp }
+     */
+    async fetchMediaInfo(mediaId) {
+        if (!this._enabled) return null;
+
+        this._trackCall();
+
+        try {
+            const response = await axios.get(
+                `https://graph.instagram.com/${this.apiVersion}/${mediaId}`,
+                {
+                    params: {
+                        fields: 'id,caption,media_type,media_url,thumbnail_url,permalink,timestamp',
+                        access_token: this.accessToken
+                    },
+                    timeout: 10000
+                }
+            );
+            return response.data;
+
+        } catch (error) {
+            console.error(`[IG] Failed to fetch media ${mediaId}:`, error.message);
+            return null;
+        }
+    }
+
+    /**
+     * Get this account's own Instagram user ID (cached for 24h).
+     * Used to detect and skip the bot's own comments so outbound
+     * replies are never re-processed as inbound events.
+     */
+    async getOwnUserId() {
+        if (this._ownUserId && this._ownUserIdFetchedAt &&
+            (Date.now() - this._ownUserIdFetchedAt) < 24 * 60 * 60 * 1000) {
+            return this._ownUserId;
+        }
+
+        if (!this._enabled) return null;
+
+        this._trackCall();
+
+        try {
+            const response = await axios.get(
+                `https://graph.instagram.com/${this.apiVersion}/me`,
+                {
+                    params: {
+                        fields: 'id,username',
+                        access_token: this.accessToken
+                    },
+                    timeout: 10000
+                }
+            );
+
+            this._ownUserId = response.data?.id || null;
+            this._ownUserIdFetchedAt = Date.now();
+            return this._ownUserId;
+
+        } catch (error) {
+            console.error('[IG] Failed to fetch own user ID:', error.message);
+            return null;
         }
     }
 

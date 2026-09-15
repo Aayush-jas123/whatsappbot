@@ -11,6 +11,7 @@ const followUpService = require('../services/followUpService');
 const whatsappService = require('../services/whatsappService');
 const { dbAdapter } = require('../database/db');
 const cloudinaryService = require('../services/cloudinaryService');
+const igCommentService = require('../services/igCommentService');
 const { toIST, formatDateForExport, fromISTtoUTC } = require('../utils/timezone');
 const { invalidateCache: clearAllCaches, caches, getCacheStats, getCached, setCache } = require('../utils/cache');
 
@@ -7183,6 +7184,196 @@ router.post('/inventory/reconcile', verifyToken, async (req, res) => {
     } catch (error) {
         console.error('Reconciliation error:', error);
         res.status(500).json({ success: false, error: 'Failed to reconcile inventory' });
+    }
+});
+
+// ============================================================
+// INSTAGRAM COMMENTS CENTER
+// Comment records + automation actions (via igCommentService).
+// Admin-only section (see ROUTE_PERMISSIONS in middleware/auth).
+// ============================================================
+
+// Stats for the Comments Center header (declared before /:id)
+router.get('/ig-comments/stats', verifyToken, async (req, res) => {
+    try {
+        const stats = await igCommentService.getStats();
+        res.json({ success: true, stats });
+    } catch (error) {
+        console.error('IG comment stats error:', error);
+        res.status(500).json({ success: false, error: 'Failed to fetch comment stats' });
+    }
+});
+
+// List comments with filters / search / pagination
+router.get('/ig-comments', verifyToken, async (req, res) => {
+    try {
+        const { status, intent, media_id, search, date_from, date_to, page, limit } = req.query;
+        const result = await igCommentService.listComments({
+            status,
+            intent,
+            mediaId: media_id,
+            search,
+            dateFrom: date_from,
+            dateTo: date_to,
+            page,
+            limit
+        });
+        res.json({
+            success: true,
+            comments: result.comments,
+            meta: {
+                total: result.total,
+                page: result.page,
+                limit: result.limit,
+                has_more: result.page * result.limit < result.total
+            }
+        });
+    } catch (error) {
+        console.error('Error fetching IG comments:', error);
+        res.status(500).json({ success: false, error: 'Failed to fetch comments' });
+    }
+});
+
+// Single comment detail
+router.get('/ig-comments/:id', verifyToken, async (req, res) => {
+    try {
+        const id = parseInt(req.params.id, 10);
+        if (isNaN(id)) return res.status(400).json({ success: false, error: 'Invalid comment ID' });
+
+        const comment = await igCommentService.getCommentById(id);
+        if (!comment) return res.status(404).json({ success: false, error: 'Comment not found' });
+        res.json({ success: true, comment });
+    } catch (error) {
+        console.error('Error fetching IG comment:', error);
+        res.status(500).json({ success: false, error: 'Failed to fetch comment' });
+    }
+});
+
+// Public reply to the comment (visible on the post)
+router.post('/ig-comments/:id/reply', verifyToken, async (req, res) => {
+    try {
+        const id = parseInt(req.params.id, 10);
+        if (isNaN(id)) return res.status(400).json({ success: false, error: 'Invalid comment ID' });
+
+        const result = await igCommentService.adminPublicReply(id, req.body.text, req.admin?.username);
+        if (!result.ok) {
+            const status = result.error === 'not_found' ? 404
+                : result.error === 'empty_reply' ? 400 : 502;
+            return res.status(status).json({ success: false, error: result.error });
+        }
+        logOperatorActivity(req, 'ig_comment_public_reply', `Comment #${id}`);
+        res.json({ success: true, replyId: result.replyId });
+    } catch (error) {
+        console.error('IG comment reply error:', error);
+        res.status(500).json({ success: false, error: 'Failed to post reply' });
+    }
+});
+
+// Private reply (DM) to the commenter
+router.post('/ig-comments/:id/private-reply', verifyToken, async (req, res) => {
+    try {
+        const id = parseInt(req.params.id, 10);
+        if (isNaN(id)) return res.status(400).json({ success: false, error: 'Invalid comment ID' });
+
+        const result = await igCommentService.adminPrivateReply(id, req.body.text, req.admin?.username);
+        if (!result.ok) {
+            const status = result.error === 'not_found' ? 404
+                : result.error === 'empty_reply' ? 400 : 502;
+            return res.status(status).json({ success: false, error: result.error });
+        }
+        logOperatorActivity(req, 'ig_comment_private_reply', `Comment #${id}`);
+        res.json({ success: true, messageId: result.messageId });
+    } catch (error) {
+        console.error('IG comment private reply error:', error);
+        res.status(500).json({ success: false, error: 'Failed to send private reply' });
+    }
+});
+
+// Mark comment ignored
+router.post('/ig-comments/:id/ignore', verifyToken, async (req, res) => {
+    try {
+        const id = parseInt(req.params.id, 10);
+        if (isNaN(id)) return res.status(400).json({ success: false, error: 'Invalid comment ID' });
+
+        await igCommentService.ignoreComment(id);
+        logOperatorActivity(req, 'ig_comment_ignore', `Comment #${id}`);
+        res.json({ success: true });
+    } catch (error) {
+        console.error('IG comment ignore error:', error);
+        res.status(500).json({ success: false, error: 'Failed to ignore comment' });
+    }
+});
+
+// Mark comment as spam
+router.post('/ig-comments/:id/spam', verifyToken, async (req, res) => {
+    try {
+        const id = parseInt(req.params.id, 10);
+        if (isNaN(id)) return res.status(400).json({ success: false, error: 'Invalid comment ID' });
+
+        await igCommentService.markSpam(id);
+        logOperatorActivity(req, 'ig_comment_spam', `Comment #${id}`);
+        res.json({ success: true });
+    } catch (error) {
+        console.error('IG comment spam error:', error);
+        res.status(500).json({ success: false, error: 'Failed to mark spam' });
+    }
+});
+
+// Mark comment resolved
+router.post('/ig-comments/:id/resolve', verifyToken, async (req, res) => {
+    try {
+        const id = parseInt(req.params.id, 10);
+        if (isNaN(id)) return res.status(400).json({ success: false, error: 'Invalid comment ID' });
+
+        await igCommentService.resolveComment(id);
+        logOperatorActivity(req, 'ig_comment_resolve', `Comment #${id}`);
+        res.json({ success: true });
+    } catch (error) {
+        console.error('IG comment resolve error:', error);
+        res.status(500).json({ success: false, error: 'Failed to resolve comment' });
+    }
+});
+
+// Create a support ticket from the comment (duplicate-safe)
+router.post('/ig-comments/:id/create-ticket', verifyToken, async (req, res) => {
+    try {
+        const id = parseInt(req.params.id, 10);
+        if (isNaN(id)) return res.status(400).json({ success: false, error: 'Invalid comment ID' });
+
+        const result = await igCommentService.createTicket(id, req.admin?.username);
+        if (!result.ok) {
+            const status = result.error === 'not_found' ? 404 : 500;
+            return res.status(status).json({ success: false, error: result.error });
+        }
+        logOperatorActivity(req, 'ig_comment_ticket', `Comment #${id} → ${result.ticketNumber || ''}`);
+        res.json({
+            success: true,
+            ticketId: result.ticketId,
+            ticketNumber: result.ticketNumber,
+            existing: !!result.existing
+        });
+    } catch (error) {
+        console.error('IG comment ticket error:', error);
+        res.status(500).json({ success: false, error: 'Failed to create ticket' });
+    }
+});
+
+// Open a DM conversation with the commenter
+router.post('/ig-comments/:id/open-dm', verifyToken, async (req, res) => {
+    try {
+        const id = parseInt(req.params.id, 10);
+        if (isNaN(id)) return res.status(400).json({ success: false, error: 'Invalid comment ID' });
+
+        const result = await igCommentService.openDM(id, req.body.text, req.admin?.username);
+        if (!result.ok) {
+            const status = result.error === 'not_found' ? 404 : 502;
+            return res.status(status).json({ success: false, error: result.error });
+        }
+        logOperatorActivity(req, 'ig_comment_open_dm', `Comment #${id} via ${result.via}`);
+        res.json({ success: true, via: result.via });
+    } catch (error) {
+        console.error('IG comment open DM error:', error);
+        res.status(500).json({ success: false, error: 'Failed to open DM' });
     }
 });
 

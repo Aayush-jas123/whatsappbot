@@ -1,72 +1,39 @@
 /**
  * igBotEngine.js
  * ─────────────────────────────────────────────────────────────
- * Instagram support bot for OFFCOMFRT.
+ * Smart Instagram support bot for OFFCOMFRT.
  *
  * Responsibilities:
- *   - Detect customer intent from message text
+ *   - Classify customer intent via igSmartEngine (confidence scoring)
+ *   - Manage conversation context (entities, order ID, creator info)
+ *   - Handle stateful flows: tracking, return/exchange, support, creator
+ *   - Detect intent switches mid-flow and re-route gracefully
+ *   - Detect anger/sensitive issues and escalate smartly
  *   - Answer FAQs using the same knowledge base as WhatsApp
- *   - Handle order tracking flow
- *   - Handle return/exchange flow
  *   - Escalate to human agents (create support ticket)
- *   - Maintain conversation state per user
  *
  * SAFETY:
  *   - Does NOT call any WhatsApp service functions
  *   - Uses instagramService for all outbound messages
- *   - Reuses FAQ data from the existing system
+ *   - Reuses FAQ data from the existing system (read-only)
  *   - Creates support tickets in the shared table (channel = 'instagram')
  * ─────────────────────────────────────────────────────────────
  */
 
 const instagramService = require('../services/instagramService');
+const smartEngine = require('../services/igSmartEngine');
 const { dbAdapter } = require('../database/db');
 
-// ─── Intent Definitions ───────────────────────────────────────
-// Each intent has keywords and a handler function.
+const STATES = smartEngine.STATES;
+const CONFIDENCE = smartEngine.CONFIDENCE;
 
-const INTENTS = {
-    greeting: {
-        keywords: ['hi', 'hello', 'hey', 'good morning', 'good evening', 'good afternoon', 'sup', 'yo', 'hii', 'hiii', 'hola'],
-        description: 'User is greeting us'
-    },
-    order_tracking: {
-        keywords: ['track', 'tracking', 'where is my order', 'order status', 'order tracking', 'track order', 'track my order', 'awb', 'shipment status', 'delivery status'],
-        description: 'User wants to track an order'
-    },
-    order_id: {
-        keywords: ['ord-', 'order-', '#ord'],
-        description: 'User sent an order ID'
-    },
-    return: {
-        keywords: ['return', 'refund', 'money back', 'return policy', 'want to return', 'initiate return'],
-        description: 'User wants to return a product'
-    },
-    exchange: {
-        keywords: ['exchange', 'size change', 'wrong size', 'different size', 'swap', 'size exchange'],
-        description: 'User wants to exchange a product'
-    },
-    shipping: {
-        keywords: ['shipping', 'delivery', 'how long', 'when will i get', 'delivery time', 'shipping time', 'dispatch'],
-        description: 'User asking about shipping'
-    },
-    payment: {
-        keywords: ['payment', 'pay', 'cod', 'cash on delivery', 'payment methods', 'upi', 'how to pay'],
-        description: 'User asking about payment'
-    },
-    cancellation: {
-        keywords: ['cancel', 'cancellation', 'cancel order', 'dont want', 'don\'t want'],
-        description: 'User wants to cancel'
-    },
-    product_info: {
-        keywords: ['size chart', 'size guide', 'material', 'fabric', 'quality', 'color', 'colour', 'available size'],
-        description: 'User asking about product details'
-    },
-    human_support: {
-        keywords: ['support', 'agent', 'human', 'talk to someone', 'contact', 'customer care', 'help me', 'complaint', 'issue'],
-        description: 'User wants human support'
-    }
-};
+// Intents that open the creator/collaboration flow
+const CREATOR_INTENTS = [
+    'creator_collaboration', 'ugc', 'gifting', 'affiliate', 'wholesale', 'business_enquiry'
+];
+
+// Intents that are product problems (need order ID + human review)
+const PRODUCT_ISSUE_INTENTS = ['delivery_issue', 'damaged_product', 'wrong_product'];
 
 // ─── FAQ Answers (Instagram-formatted) ────────────────────────
 // Same content as WhatsApp FAQ but without WhatsApp-specific
@@ -102,6 +69,12 @@ Process:
   - New size shipped after quality check
 
 Subject to stock availability.`,
+
+    refund: `OFFCOMFRT — REFUNDS
+
+Refunds are issued as store credit within 5-7 business days after pickup.
+
+Share your Order ID and I'll check the refund status for you.`,
 
     shipping: `OFFCOMFRT — SHIPPING & DELIVERY
 
@@ -154,74 +127,44 @@ class IGBotEngine {
      */
     async processMessage(igUserId, message, options = {}) {
         try {
-            const cleanMessage = (message || '').trim().toLowerCase();
-
+            const cleanMessage = (message || '').trim();
             if (!cleanMessage && !options.isAttachment) return;
 
-            // Get current bot state
+            // Get current bot state + conversation context
             const botState = await instagramService.getBotState(igUserId);
-            const currentState = botState?.state || 'idle';
+            const currentState = botState?.state || STATES.IDLE;
+            let context = botState?.context || {};
 
             console.log(`[IG BOT] User ${igUserId} | State: ${currentState} | Msg: "${cleanMessage.substring(0, 50)}"`);
 
-            // ── State machine: handle stateful flows ────────
-
-            // Awaiting order ID for tracking
-            if (currentState === 'awaiting_order_id') {
-                return await this._handleOrderTracking(igUserId, cleanMessage);
+            // Referral entry (ad/link) — greet the user
+            if (options.referral) {
+                return await this._handleGreeting(igUserId);
             }
 
-            // Awaiting return/exchange order ID
-            if (currentState === 'awaiting_return_order_id') {
-                return await this._handleReturnExchange(igUserId, cleanMessage, botState?.context);
+            // ── 1. Classify via smart engine (context-aware) ──────
+            const result = smartEngine.classify(cleanMessage, context);
+
+            // ── 2. Update conversation memory ─────────────────────
+            context = smartEngine.updateContext(context, {
+                intent: result.intent,
+                entities: result.entities,
+                summaryEntry: cleanMessage.substring(0, 120)
+            });
+
+            // ── 3. WAITING_FOR_CUSTOMER: team owes this customer a reply ──
+            if (currentState === STATES.WAITING_FOR_CUSTOMER) {
+                const handled = await this._handleWaitingForCustomer(igUserId, cleanMessage, context, result);
+                if (handled) return;
+                // Clear new request — resume normal flow below
             }
 
-            // Awaiting support description
-            if (currentState === 'awaiting_support_description') {
-                return await this._createSupportTicket(igUserId, cleanMessage);
-            }
+            // ── 4. Stateful flows (collecting order ID, creator info, etc.) ──
+            const stateHandled = await this._handleStateful(igUserId, cleanMessage, currentState, context, result);
+            if (stateHandled) return;
 
-            // ── Intent detection ────────────────────────────
-
-            const intent = this._detectIntent(cleanMessage);
-
-            // ── Route to handler ────────────────────────────
-
-            switch (intent) {
-                case 'greeting':
-                    return await this._handleGreeting(igUserId);
-
-                case 'order_tracking':
-                    return await this._askForOrderId(igUserId, 'tracking');
-
-                case 'return':
-                    return await this._handleReturn(igUserId);
-
-                case 'exchange':
-                    return await this._handleExchange(igUserId);
-
-                case 'shipping':
-                    return await this._sendFAQ(igUserId, 'shipping');
-
-                case 'payment':
-                    return await this._sendFAQ(igUserId, 'payment');
-
-                case 'cancellation':
-                    return await this._sendFAQ(igUserId, 'cancellation');
-
-                case 'product_info':
-                    return await this._sendFAQ(igUserId, 'product_info');
-
-                case 'human_support':
-                    return await this._handleHumanSupport(igUserId);
-
-                case 'order_id':
-                    // User sent an order ID directly
-                    return await this._handleOrderTracking(igUserId, cleanMessage);
-
-                default:
-                    return await this._handleUnknown(igUserId, cleanMessage);
-            }
+            // ── 5. Intent routing ─────────────────────────────────
+            await this._routeIntent(igUserId, cleanMessage, result, context);
 
         } catch (error) {
             console.error('[IG BOT] processMessage error:', error);
@@ -235,38 +178,205 @@ class IGBotEngine {
         }
     }
 
-    // ─── Intent Detection ───────────────────────────────────────
+    // ─── Waiting For Customer ───────────────────────────────────
 
     /**
-     * Detect the user's intent from their message text.
-     * Returns the intent key or 'unknown'.
+     * Customer replied while a flow was handed off to the team
+     * (e.g., creator enquiry under review).
+     *
+     *   - Low-signal follow-ups: append to ticket + quiet ack, stay waiting
+     *   - Clear new requests (high confidence / intent switch): resume flow
+     *
+     * @returns {boolean} true if handled (stay waiting), false to resume flow
      */
-    _detectIntent(message) {
-        if (!message) return 'unknown';
+    async _handleWaitingForCustomer(igUserId, message, context, result) {
+        const isClearNewRequest =
+            result.isIntentSwitch ||
+            (result.confidence >= CONFIDENCE.HIGH &&
+             result.intent !== 'greeting' &&
+             result.intent !== 'positive_message');
 
-        // Check for order ID pattern first (e.g., ORD-XXXX, #ORD-XXXX)
-        if (/^(ord[-#]|order[-#]|#ord)/i.test(message)) {
-            return 'order_id';
+        if (isClearNewRequest) {
+            await instagramService.setBotState(igUserId, STATES.IDLE, context);
+            return false; // resume normal routing
         }
 
-        // Score each intent by number of keyword matches
-        let bestIntent = 'unknown';
-        let bestScore = 0;
+        // Follow-up while waiting — log to the linked ticket if any
+        if (context.ticketId) {
+            try {
+                await dbAdapter.query(
+                    `UPDATE support_tickets
+                     SET message = message || '\n\n---\n' || ?,
+                         is_read = false,
+                         updated_at = CURRENT_TIMESTAMP
+                     WHERE id = ?`,
+                    [message, context.ticketId]
+                );
+            } catch (e) { /* best-effort */ }
+        }
 
-        for (const [intentName, intentDef] of Object.entries(INTENTS)) {
-            let score = 0;
-            for (const keyword of intentDef.keywords) {
-                if (message.includes(keyword.toLowerCase())) {
-                    score += keyword.length; // Longer keyword matches = higher confidence
+        await instagramService.sendMessage(
+            igUserId,
+            'Got it — our team has this conversation and will update you right here shortly.'
+        );
+        return true; // handled — stay waiting
+    }
+
+    // ─── Stateful Flow Handling ─────────────────────────────────
+
+    /**
+     * Handle stateful conversation flows. Returns true if handled.
+     */
+    async _handleStateful(igUserId, message, state, context, result) {
+        switch (state) {
+
+            // ── Awaiting order ID for tracking ──
+            case STATES.COLLECTING_ORDER_ID:
+                if (result.intent === 'provide_order_id') {
+                    await instagramService.setBotState(igUserId, STATES.IDLE, context);
+                    const id = result.entities.orderId || result.entities.awb || result.entities.bareNumber;
+                    await this._handleOrderTracking(igUserId, id || message);
+                    return true;
                 }
-            }
-            if (score > bestScore) {
-                bestScore = score;
-                bestIntent = intentName;
-            }
-        }
+                if (result.isIntentSwitch) {
+                    await this._acknowledgeSwitch(igUserId);
+                    await this._routeIntent(igUserId, message, result, context);
+                    return true;
+                }
+                await this._askForOrderId(igUserId, 'tracking');
+                return true;
 
-        return bestIntent;
+            // ── Awaiting order ID for return/exchange ──
+            case STATES.AWAITING_RETURN_ORDER_ID:
+                if (result.intent === 'provide_order_id') {
+                    await instagramService.setBotState(igUserId, STATES.IDLE, context);
+                    const id = result.entities.orderId || result.entities.bareNumber;
+                    await this._handleReturnExchange(igUserId, id || message, context);
+                    return true;
+                }
+                if (result.isIntentSwitch) {
+                    await this._acknowledgeSwitch(igUserId);
+                    await this._routeIntent(igUserId, message, result, context);
+                    return true;
+                }
+                await instagramService.sendMessage(
+                    igUserId,
+                    'Please share the Order ID for your return/exchange (e.g., ORD-2024-001).'
+                );
+                return true;
+
+            // ── Awaiting issue description for support ticket ──
+            case STATES.AWAITING_SUPPORT_DESCRIPTION:
+                if (result.isIntentSwitch) {
+                    await this._acknowledgeSwitch(igUserId);
+                    await this._routeIntent(igUserId, message, result, context);
+                    return true;
+                }
+                if (message.length >= 3) {
+                    await instagramService.setBotState(igUserId, STATES.IDLE, context);
+                    await this._createSupportTicket(igUserId, message, context);
+                    return true;
+                }
+                await instagramService.sendMessage(
+                    igUserId,
+                    'Please describe your issue in a few words so our team can help you.'
+                );
+                return true;
+
+            // ── Collecting creator collaboration details ──
+            case STATES.COLLECTING_CREATOR_PROFILE:
+                // classify() special-cases this state → provide_creator_info.
+                // Anything the user sends is treated as their details.
+                await this._completeCreatorFlow(igUserId, context, message, result);
+                return true;
+
+            default:
+                return false;
+        }
+    }
+
+    /**
+     * Brief acknowledgment when the user switches topics mid-flow.
+     */
+    async _acknowledgeSwitch(igUserId) {
+        await instagramService.sendMessage(igUserId, "No problem — let's take care of that instead.");
+    }
+
+    // ─── Intent Routing ─────────────────────────────────────────
+
+    async _routeIntent(igUserId, message, result, context) {
+        const { intent } = result;
+
+        switch (intent) {
+            case 'greeting':
+                return await this._handleGreeting(igUserId);
+
+            case 'order_tracking':
+                // If they already included an order ID, track right away
+                if (result.entities.orderId || result.entities.awb) {
+                    return await this._handleOrderTracking(
+                        igUserId,
+                        result.entities.orderId || result.entities.awb
+                    );
+                }
+                return await this._askForOrderId(igUserId, 'tracking');
+
+            case 'provide_order_id':
+                return await this._handleOrderTracking(
+                    igUserId,
+                    result.entities.orderId || result.entities.awb || result.entities.bareNumber || message
+                );
+
+            case 'return':
+                return await this._handleReturn(igUserId);
+
+            case 'exchange':
+                return await this._handleExchange(igUserId);
+
+            case 'refund':
+                return await this._sendFAQ(igUserId, 'refund');
+
+            case 'shipping':
+                return await this._sendFAQ(igUserId, 'shipping');
+
+            case 'payment':
+                return await this._sendFAQ(igUserId, 'payment');
+
+            case 'cancellation':
+                return await this._sendFAQ(igUserId, 'cancellation');
+
+            case 'product_question':
+            case 'size_question':
+                return await this._sendFAQ(igUserId, 'product_info');
+
+            case 'delivery_issue':
+            case 'damaged_product':
+            case 'wrong_product':
+                return await this._handleProductIssue(igUserId, intent, context);
+
+            case 'human_support':
+                return await this._handleHumanSupport(igUserId);
+
+            case 'complaint':
+            case 'sensitive_issue':
+                return await this._handleSmartEscalation(igUserId, result, context, message);
+
+            case 'faq':
+                return await this._handleUnknown(igUserId, message, context);
+
+            default:
+                if (CREATOR_INTENTS.includes(intent)) {
+                    return await this._startCreatorFlow(igUserId, intent, context);
+                }
+                if (intent === 'spam') return; // silently ignore spam
+                if (intent === 'positive_message') {
+                    return await instagramService.sendMessage(
+                        igUserId,
+                        "Thank you so much! It means a lot. If you ever need anything, we're right here."
+                    );
+                }
+                return await this._handleUnknown(igUserId, message, context);
+        }
     }
 
     // ─── Greeting Handler ───────────────────────────────────────
@@ -300,7 +410,7 @@ What would you like help with?`,
             ]
         );
 
-        await instagramService.setBotState(igUserId, 'idle');
+        await instagramService.setBotState(igUserId, STATES.IDLE);
     }
 
     // ─── Order Tracking ─────────────────────────────────────────
@@ -314,16 +424,16 @@ Please send your Order ID (e.g., ORD-2024-001) or AWB number.
 
 You can also find it in your order confirmation email.`
         );
-        await instagramService.setBotState(igUserId, 'awaiting_order_id');
+        await instagramService.setBotState(igUserId, STATES.COLLECTING_ORDER_ID);
     }
 
     async _handleOrderTracking(igUserId, orderId) {
         // Reset state
-        await instagramService.setBotState(igUserId, 'idle');
+        await instagramService.setBotState(igUserId, STATES.IDLE);
 
         // Look up the order in the database
         const orders = await dbAdapter.query(
-            `SELECT * FROM orders 
+            `SELECT * FROM orders
              WHERE order_id ILIKE ? OR awb ILIKE ?
              ORDER BY created_at DESC LIMIT 1`,
             [`%${orderId}%`, `%${orderId}%`]
@@ -365,7 +475,7 @@ Need help? Type "support" to contact us.`;
             igUserId,
             IG_FAQ.return + '\n\nTo start a return, please send your Order ID.'
         );
-        await instagramService.setBotState(igUserId, 'awaiting_return_order_id', { flow: 'return' });
+        await instagramService.setBotState(igUserId, STATES.AWAITING_RETURN_ORDER_ID, { flow: 'return' });
     }
 
     async _handleExchange(igUserId) {
@@ -373,12 +483,12 @@ Need help? Type "support" to contact us.`;
             igUserId,
             IG_FAQ.exchange + '\n\nTo start an exchange, please send your Order ID.'
         );
-        await instagramService.setBotState(igUserId, 'awaiting_return_order_id', { flow: 'exchange' });
+        await instagramService.setBotState(igUserId, STATES.AWAITING_RETURN_ORDER_ID, { flow: 'exchange' });
     }
 
     async _handleReturnExchange(igUserId, orderId, context) {
         const flow = context?.flow || 'return';
-        await instagramService.setBotState(igUserId, 'idle');
+        await instagramService.setBotState(igUserId, STATES.IDLE);
 
         // Look up the order
         const orders = await dbAdapter.query(
@@ -452,6 +562,32 @@ You can continue chatting here for updates.`
         );
     }
 
+    // ─── Product Issues (delivery / damaged / wrong item) ───────
+
+    /**
+     * Product issue reported: apologize, collect order ID + description,
+     * then the next message creates a priority support ticket.
+     */
+    async _handleProductIssue(igUserId, intent, context) {
+        const issueLabel = {
+            delivery_issue: 'delivery issue',
+            damaged_product: 'damaged product',
+            wrong_product: 'wrong item'
+        }[intent] || 'issue';
+
+        await instagramService.sendMessage(
+            igUserId,
+            `We're really sorry about the ${issueLabel}.
+
+Please share your Order ID and a short description (a photo helps too) — I'll create a priority ticket for our team right away.`
+        );
+
+        // Remember the issue type so the ticket is labeled correctly
+        context = smartEngine.updateContext(context, { lastQuestion: `${issueLabel} description` });
+        context = { ...context, issueType: intent };
+        await instagramService.setBotState(igUserId, STATES.AWAITING_SUPPORT_DESCRIPTION, context);
+    }
+
     // ─── FAQ ────────────────────────────────────────────────────
 
     async _sendFAQ(igUserId, topic) {
@@ -471,8 +607,8 @@ You can continue chatting here for updates.`
     async _handleHumanSupport(igUserId) {
         // Check if there's already an open ticket
         const existingTicket = await dbAdapter.query(
-            `SELECT * FROM support_tickets 
-             WHERE ig_user_id = ? AND status = 'open' 
+            `SELECT * FROM support_tickets
+             WHERE ig_user_id = ? AND status = 'open'
              ORDER BY created_at DESC LIMIT 1`,
             [igUserId]
         );
@@ -487,7 +623,7 @@ Please describe your issue and our team will respond.
 You can message us right here.`
             );
             await instagramService.escalateToHuman(igUserId, existingTicket[0].id);
-            await instagramService.setBotState(igUserId, 'idle');
+            await instagramService.setBotState(igUserId, STATES.IDLE);
             return;
         }
 
@@ -500,11 +636,11 @@ Please describe your issue below and we'll create a support ticket.
 
 Our team will respond within 24 hours.`
         );
-        await instagramService.setBotState(igUserId, 'awaiting_support_description');
+        await instagramService.setBotState(igUserId, STATES.AWAITING_SUPPORT_DESCRIPTION);
     }
 
-    async _createSupportTicket(igUserId, description) {
-        await instagramService.setBotState(igUserId, 'idle');
+    async _createSupportTicket(igUserId, description, context = {}) {
+        await instagramService.setBotState(igUserId, STATES.IDLE);
 
         if (!description || description.length < 3) {
             await instagramService.sendMessage(
@@ -521,6 +657,17 @@ Our team will respond within 24 hours.`
         );
         const customerName = customer?.[0]?.name || customer?.[0]?.ig_username || 'Instagram Customer';
 
+        // Label the ticket with the issue type (product issues route here)
+        const issuePrefix = context.issueType
+            ? `[${String(context.issueType).replace(/_/g, ' ')}] `
+            : '';
+
+        // Smart escalation summary gives agents instant context
+        const smartSummary = smartEngine.buildEscalationSummary(context);
+        const fullMessage = smartSummary
+            ? `${issuePrefix}${description}\n\n--- Conversation context ---\n${smartSummary}`
+            : `${issuePrefix}${description}`;
+
         await dbAdapter.query(
             `INSERT INTO support_tickets (ticket_number, customer_phone, customer_name, message, status, channel, ig_user_id, ig_username, is_read)
              VALUES (?, ?, ?, ?, 'open', 'instagram', ?, ?, false)`,
@@ -528,7 +675,7 @@ Our team will respond within 24 hours.`
                 ticketNumber,
                 igUserId,
                 customerName,
-                description,
+                fullMessage,
                 igUserId,
                 customer?.[0]?.ig_username || null
             ]
@@ -561,17 +708,194 @@ You can continue messaging us here for updates.`
         console.log(`[IG BOT] Created support ticket ${ticketNumber} for IG user ${igUserId}`);
     }
 
+    // ─── Smart Escalation (anger / sensitive) ───────────────────
+
+    /**
+     * Complaint, anger or sensitive (legal) issue detected —
+     * escalate immediately with the full conversation summary.
+     */
+    async _handleSmartEscalation(igUserId, result, context, message) {
+        // Duplicate prevention: reuse an open ticket if one exists
+        const existingTicket = await dbAdapter.query(
+            `SELECT * FROM support_tickets
+             WHERE ig_user_id = ? AND status = 'open'
+             ORDER BY created_at DESC LIMIT 1`,
+            [igUserId]
+        );
+
+        if (existingTicket && existingTicket.length > 0) {
+            await instagramService.escalateToHuman(igUserId, existingTicket[0].id);
+            await instagramService.sendMessage(
+                igUserId,
+                `We hear you, and we're truly sorry.
+
+Your open ticket ${existingTicket[0].ticket_number} has been marked as priority — a senior team member will respond here shortly.`
+            );
+            return;
+        }
+
+        const ticketNumber = await this._generateTicketNumber();
+        const customer = await dbAdapter.query(
+            'SELECT name, ig_username FROM customers WHERE ig_psid = ? LIMIT 1',
+            [igUserId]
+        );
+        const customerName = customer?.[0]?.name || customer?.[0]?.ig_username || 'Instagram Customer';
+
+        const smartSummary = smartEngine.buildEscalationSummary(context);
+        const ticketMessage = [
+            `[PRIORITY — ${result.intent}${result.sentiment !== 'neutral' ? ` | sentiment: ${result.sentiment}` : ''}]`,
+            `Customer: "${(message || '').substring(0, 500)}"`,
+            '',
+            smartSummary ? `--- Conversation context ---\n${smartSummary}` : null
+        ].filter(Boolean).join('\n');
+
+        await dbAdapter.query(
+            `INSERT INTO support_tickets (ticket_number, customer_phone, customer_name, message, status, channel, ig_user_id, ig_username, is_read)
+             VALUES (?, ?, ?, ?, 'open', 'instagram', ?, ?, false)`,
+            [ticketNumber, igUserId, customerName, ticketMessage, igUserId, customer?.[0]?.ig_username || null]
+        );
+
+        const ticketRows = await dbAdapter.query(
+            'SELECT id FROM support_tickets WHERE ticket_number = ? LIMIT 1',
+            [ticketNumber]
+        );
+        if (ticketRows?.[0]?.id) {
+            await instagramService.escalateToHuman(igUserId, ticketRows[0].id);
+        }
+
+        await instagramService.sendMessage(
+            igUserId,
+            `We hear you, and we're truly sorry about this experience.
+
+I've flagged this as a priority — ticket ${ticketNumber}.
+
+A senior team member will respond right here shortly.`
+        );
+
+        console.log(`[IG BOT] Smart escalation ${ticketNumber} for ${igUserId} (${result.intent}, sentiment: ${result.sentiment})`);
+    }
+
+    // ─── Creator / Business Flow ────────────────────────────────
+
+    /**
+     * Start the creator/collaboration flow — a separate mini
+     * state machine that collects profile + collab details.
+     */
+    async _startCreatorFlow(igUserId, intent, context) {
+        context = smartEngine.updateContext(context, {
+            creatorInfo: { type: this._creatorTypeFor(intent) }
+        });
+
+        await instagramService.sendQuickReplies(
+            igUserId,
+            `Awesome — we'd love to work with you!
+
+To get you to the right person, tell us a bit about yourself:
+• Your Instagram handle
+• Follower count
+• The kind of collab you have in mind (paid collab / barter / UGC / affiliate)`,
+            [
+                { title: 'Paid Collab', payload: 'creator_paid' },
+                { title: 'Barter / Gifting', payload: 'creator_barter' },
+                { title: 'UGC', payload: 'creator_ugc' },
+                { title: 'Affiliate', payload: 'creator_affiliate' }
+            ]
+        );
+
+        await instagramService.setBotState(igUserId, STATES.COLLECTING_CREATOR_PROFILE, context);
+    }
+
+    /**
+     * Complete the creator flow: capture details + create a
+     * business-enquiry ticket, then hand off to the team.
+     */
+    async _completeCreatorFlow(igUserId, context, rawMessage, result = {}) {
+        // Capture structured creator info from their message
+        context = smartEngine.updateContext(context, {
+            creatorInfo: result.entities?.creatorInfo || {}
+        });
+        if (rawMessage) {
+            context.creatorInfo = {
+                ...(context.creatorInfo || {}),
+                rawNote: String(rawMessage).substring(0, 500)
+            };
+        }
+
+        // Create a business-enquiry ticket with the collected details
+        const ticketNumber = await this._generateTicketNumber();
+        const customer = await dbAdapter.query(
+            'SELECT name, ig_username FROM customers WHERE ig_psid = ? LIMIT 1',
+            [igUserId]
+        );
+        const customerName = customer?.[0]?.name || customer?.[0]?.ig_username || 'Instagram Customer';
+        const ci = context.creatorInfo || {};
+
+        const ticketMessage = [
+            `[Creator/Business enquiry — ${ci.type || 'general'}]`,
+            `Customer: ${customerName}`,
+            ci.profile ? `Profile: ${ci.profile}` : null,
+            ci.followerMention ? `Followers: ${ci.followerMention}` : null,
+            ci.rawNote ? `Message: "${ci.rawNote}"` : null
+        ].filter(Boolean).join('\n');
+
+        await dbAdapter.query(
+            `INSERT INTO support_tickets (ticket_number, customer_phone, customer_name, message, status, channel, ig_user_id, ig_username, is_read)
+             VALUES (?, ?, ?, ?, 'open', 'instagram', ?, ?, false)`,
+            [ticketNumber, igUserId, customerName, ticketMessage, igUserId, customer?.[0]?.ig_username || null]
+        );
+
+        const ticketRows = await dbAdapter.query(
+            'SELECT id FROM support_tickets WHERE ticket_number = ? LIMIT 1',
+            [ticketNumber]
+        );
+        const ticketId = ticketRows?.[0]?.id || null;
+
+        // Hand off to the team — wait for the customer across sessions
+        context = smartEngine.updateContext(context, {
+            state: STATES.WAITING_FOR_CUSTOMER,
+            summaryEntry: `Creator enquiry ticket ${ticketNumber}`
+        });
+        context.ticketId = ticketId;
+        context.waitingSince = new Date().toISOString();
+        await instagramService.setBotState(igUserId, STATES.WAITING_FOR_CUSTOMER, context);
+
+        await instagramService.sendMessage(
+            igUserId,
+            `Thank you! Your details are with our partnerships team.
+
+Ticket: ${ticketNumber}
+
+They'll review and reply right here within 24-48 hours.`
+        );
+
+        console.log(`[IG BOT] Creator enquiry ${ticketNumber} for ${igUserId} (${ci.type || 'general'})`);
+    }
+
+    _creatorTypeFor(intent) {
+        return {
+            creator_collaboration: 'paid_collab',
+            ugc: 'ugc',
+            gifting: 'barter',
+            affiliate: 'affiliate',
+            wholesale: 'wholesale',
+            business_enquiry: 'business'
+        }[intent] || 'general';
+    }
+
     // ─── Unknown / Fallback ─────────────────────────────────────
 
-    async _handleUnknown(igUserId, message) {
+    async _handleUnknown(igUserId, message, context = {}) {
         // Try to match against the existing FAQ database first
         const faqMatch = await this._tryFAQMatch(message, igUserId);
         if (faqMatch) return;
 
-        // No match — offer help menu
+        // Targeted clarification from the smart engine
+        // (never a bare "I don't understand")
+        const clarification = smartEngine.getClarificationQuestion(context);
+
         await instagramService.sendQuickReplies(
             igUserId,
-            'I\'m not sure I understood that. Here\'s what I can help with:',
+            clarification,
             [
                 { title: 'Track Order', payload: 'track_order' },
                 { title: 'Return', payload: 'return' },
@@ -585,7 +909,7 @@ You can continue messaging us here for updates.`
 
     /**
      * Try to match the message against the existing FAQ handler.
-     * Reuses the same FAQ knowledge base as WhatsApp.
+     * Reuses the same FAQ knowledge base as WhatsApp (read-only).
      */
     async _tryFAQMatch(message, igUserId) {
         try {
@@ -599,10 +923,10 @@ You can continue messaging us here for updates.`
                 await instagramService.sendMessage(igUserId, igAnswer);
                 return true;
             }
+            return false;
         } catch (e) {
-            // FAQ handler not available
+            return false;
         }
-        return false;
     }
 
     // ─── Helpers ────────────────────────────────────────────────

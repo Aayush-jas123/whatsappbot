@@ -478,6 +478,7 @@ function navigateTo(page) {
         orders: 'Order Management',
         returns: 'Returns & Exchanges',
         messages: 'Message History',
+        'ig-comments': 'Instagram Comments',
         broadcast: 'Broadcast Messages',
         templates: 'Meta API Templates',
         analytics: 'Detailed Analytics',
@@ -491,6 +492,7 @@ function navigateTo(page) {
         orders: 'Track and manage all orders',
         returns: 'Manage returns and exchange requests',
         messages: 'View conversation history',
+        'ig-comments': 'Comment automation, replies and support hand-offs',
         broadcast: 'Send messages to customers',
         templates: 'Manage and sync Meta API templates',
         analytics: 'In-depth performance metrics',
@@ -551,6 +553,9 @@ async function loadPageData(page) {
         case 'support':
             await loadSupportTickets();
             await loadPortals();
+            break;
+        case 'ig-comments':
+            await window.CommentsCenter?.load();
             break;
         case 'broadcast':
             await loadBroadcastHistory();
