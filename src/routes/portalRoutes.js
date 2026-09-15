@@ -614,6 +614,16 @@ router.patch('/:slug/tickets/:id/mark-read', verifyPortalToken, async (req, res)
 });
 
 // ── Customer Details (aggregated: customer info + orders + returns) ──
+// Phone numbers are stored in wildly different formats across tables:
+//   tickets: 917499609179  (digits, country code)
+//   store_shoppers: +91 8756560652, +916386146008 (+ prefix, spaces)
+//   orders: 916000525998  (digits, country code)
+// Solution: normalize by stripping all non-digits in SQL via REGEXP_REPLACE,
+// then compare against the cleaned input phone.
+//
+// store_shoppers is the primary order source (every Shopify order creates a row).
+// The orders table adds tracking data (AWB, courier, tracking_url).
+// We merge both: store_shoppers for order details + orders for tracking info.
 router.get('/:slug/customers/:phone/details', verifyPortalToken, async (req, res) => {
     try {
         const { slug, phone } = req.params;
@@ -621,30 +631,34 @@ router.get('/:slug/customers/:phone/details', verifyPortalToken, async (req, res
             return res.status(403).json({ error: 'Portal mismatch' });
         }
 
-        const cleanPhone = phone.replace(/\D/g, '');
-        const phoneVariants = [cleanPhone];
-        if (cleanPhone.startsWith('91')) phoneVariants.push(cleanPhone.slice(2));
-        else phoneVariants.push('91' + cleanPhone);
+        // Strip to digits only — this is the canonical comparison key
+        const digits = phone.replace(/\D/g, '');
+        const localDigits = digits.startsWith('91') && digits.length > 10 ? digits.slice(2) : digits;
+        const intlDigits = !digits.startsWith('91') ? '91' + digits : digits;
+        const digitVariants = [...new Set([digits, localDigits, intlDigits])];
+        const placeholders = digitVariants.map(() => '?').join(',');
 
-        const placeholders = phoneVariants.map(() => '?').join(',');
+        console.log(`[PORTAL DETAILS] Looking up customer for phone=${phone}, digitVariants=${digitVariants.join(',')}`);
 
-        // Parallel fetch: customer info, orders, returns server
-        const [shoppers, orders, returnsResult] = await Promise.all([
-            // Customer info from store_shoppers (deduplicated by phone)
+        // Parallel fetch: store_shoppers (orders+customer info), orders (tracking), returns server
+        const [shoppers, trackingOrders, returnsResult] = await Promise.all([
+            // ALL store_shoppers rows for this phone — these are the customer's orders
             dbAdapter.query(
-                `SELECT phone, name, email, city, province, created_at
+                `SELECT phone, name, email, order_id, items_json, order_total, payment_method,
+                        status, address, city, province, zip, country, delivery_type, source,
+                        customer_message, created_at
                  FROM store_shoppers
-                 WHERE phone IN (${placeholders})
-                 ORDER BY created_at DESC
-                 LIMIT 1`,
-                phoneVariants
+                 WHERE REGEXP_REPLACE(COALESCE(phone, ''), '[^0-9]', '', 'g') IN (${placeholders})
+                 ORDER BY created_at DESC LIMIT 50`,
+                digitVariants
             ),
-            // All orders (capped at 50)
+            // Tracking data from orders table — match by phone OR by order_id from shoppers
             dbAdapter.query(
                 `SELECT * FROM orders
                  WHERE customer_phone IN (${placeholders})
+                    OR REGEXP_REPLACE(COALESCE(customer_phone, ''), '[^0-9]', '', 'g') IN (${placeholders})
                  ORDER BY created_at DESC LIMIT 50`,
-                phoneVariants
+                [...digitVariants, ...digitVariants]
             ),
             // Returns/exchanges from external server
             (async () => {
@@ -666,31 +680,102 @@ router.get('/:slug/customers/:phone/details', verifyPortalToken, async (req, res
             })()
         ]);
 
-        // Build customer profile from store_shoppers
-        const shopper = shoppers && shoppers[0];
+        // Build tracking lookup by order_id from the orders table
+        const trackingByOrderId = new Map();
+        for (const o of (trackingOrders || [])) {
+            if (o.order_id) trackingByOrderId.set(String(o.order_id), o);
+        }
+
+        // Build unified order list from store_shoppers, enriched with tracking data
+        const orders = (shoppers || []).map(s => {
+            const tracking = trackingByOrderId.get(String(s.order_id));
+            // Parse items_json if present
+            let items = [];
+            try {
+                if (s.items_json) {
+                    const parsed = JSON.parse(s.items_json);
+                    items = Array.isArray(parsed) ? parsed : [parsed];
+                }
+            } catch (_) {}
+
+            return {
+                order_id: s.order_id,
+                status: s.status || 'pending',
+                created_at: s.created_at,
+                total: s.order_total,
+                payment_method: s.payment_method,
+                product_name: items.length ? items.map(i => i.name || i.title || '').filter(Boolean).join(', ') : null,
+                items,
+                address: s.address ? [s.address, s.city, s.province, s.zip, s.country].filter(Boolean).join(', ') : null,
+                city: s.city,
+                province: s.province,
+                delivery_type: s.delivery_type,
+                // Tracking data from orders table
+                awb: tracking?.awb || null,
+                courier_name: tracking?.courier_name || null,
+                tracking_url: tracking?.tracking_url || null,
+                shiprocket_order_id: tracking?.shiprocket_order_id || null,
+                expected_delivery: tracking?.expected_delivery || null
+            };
+        });
+
+        // If store_shoppers had no rows but orders table did, include those too
+        const shopperOrderIds = new Set(orders.map(o => String(o.order_id)));
+        for (const to of (trackingOrders || [])) {
+            if (!shopperOrderIds.has(String(to.order_id))) {
+                orders.push({
+                    order_id: to.order_id,
+                    status: to.status || 'pending',
+                    created_at: to.created_at,
+                    total: to.total,
+                    payment_method: to.payment_method,
+                    product_name: to.product_name || null,
+                    items: [],
+                    address: null,
+                    awb: to.awb || null,
+                    courier_name: to.courier_name || null,
+                    tracking_url: to.tracking_url || null,
+                    shiprocket_order_id: to.shiprocket_order_id || null,
+                    expected_delivery: to.expected_delivery || null
+                });
+            }
+        }
+
+        // Sort by date descending
+        orders.sort((a, b) => new Date(b.created_at || 0) - new Date(a.created_at || 0));
+
+        // Build customer profile from first store_shoppers row
+        const firstShopper = shoppers?.[0];
         const customer = {
-            name: shopper?.name || null,
-            phone: shopper?.phone || phone,
-            email: shopper?.email || null,
-            city: shopper?.city || null,
-            province: shopper?.province || null,
-            totalOrders: (orders || []).length,
-            firstOrderAt: orders?.length ? orders[orders.length - 1]?.created_at : null,
-            lastOrderAt: orders?.length ? orders[0]?.created_at : null
+            name: firstShopper?.name || null,
+            phone: firstShopper?.phone || phone,
+            email: firstShopper?.email || null,
+            city: firstShopper?.city || null,
+            province: firstShopper?.province || null,
+            totalOrders: orders.length,
+            firstOrderAt: orders.length ? orders[orders.length - 1].created_at : null,
+            lastOrderAt: orders.length ? orders[0].created_at : null
         };
 
-        // Filter returns/exchanges to only this customer's orders
-        const orderIds = new Set((orders || []).map(o => String(o.order_id)));
-        const customerReturns = (returnsResult.requests || []).filter(r =>
-            orderIds.has(String(r.order_number))
-        );
+        // Filter returns/exchanges to this customer's orders (fuzzy match on order_number)
+        const allOrderIds = orders.map(o => String(o.order_id));
+        const orderNums = new Set(allOrderIds);
+        allOrderIds.forEach(id => {
+            const numeric = id.replace(/\D/g, '');
+            if (numeric) orderNums.add(numeric);
+        });
+        const customerReturns = (returnsResult.requests || []).filter(r => {
+            const rn = String(r.order_number);
+            const rnNumeric = rn.replace(/\D/g, '');
+            return orderNums.has(rn) || orderNums.has(rnNumeric);
+        });
 
-        console.log(`[PORTAL DETAILS] ${customer.totalOrders} orders, ${customerReturns.length} returns for ${phone}`);
+        console.log(`[PORTAL DETAILS] ${orders.length} orders (${shoppers?.length || 0} from shoppers, ${trackingOrders?.length || 0} tracking), ${customerReturns.length} returns for ${phone}`);
 
         res.json({
             success: true,
             customer,
-            orders: orders || [],
+            orders: orders.slice(0, 50),
             returns: customerReturns,
             returnsConnected: returnsResult.connected
         });

@@ -729,18 +729,32 @@ function renderDetailsPanel(data) {
     if (!orders || orders.length === 0) {
         html += '<div style="font-size:13px;color:var(--text-tertiary);padding:8px 0;">No orders found</div>';
     } else {
-        orders.forEach(order => {
+        orders.forEach((order, idx) => {
             const statusClass = (order.status || 'pending').toLowerCase().replace(/\s+/g, '_');
+            const collapsed = idx > 0 ? ' collapsed' : '';
+            // Build items list HTML
+            let itemsHtml = '';
+            if (order.items && order.items.length) {
+                itemsHtml = order.items.map(item => {
+                    const name = escapeHtml(item.name || item.title || 'Item');
+                    const qty = item.quantity || item.qty || 1;
+                    const price = item.price ? `₹${parseFloat(item.price).toFixed(2)}` : '';
+                    return `<div class="doc-row"><span class="doc-row-label">${name} ×${qty}</span><span class="doc-row-value">${price}</span></div>`;
+                }).join('');
+            }
             html += `<div class="detail-order-card">
                 <div class="doc-header" data-order-toggle>
                     <span class="doc-order-id">${escapeHtml(order.order_id || 'N/A')}</span>
                     <span class="doc-status ${statusClass}">${escapeHtml(order.status || 'unknown')}</span>
                 </div>
-                <div class="doc-body">
+                <div class="doc-body${collapsed}">
                     <div class="doc-row"><span class="doc-row-label">Date</span><span class="doc-row-value">${formatDate(order.created_at)}</span></div>
                     ${order.total ? `<div class="doc-row"><span class="doc-row-label">Amount</span><span class="doc-row-value">₹${parseFloat(order.total).toFixed(2)}</span></div>` : ''}
                     ${order.payment_method ? `<div class="doc-row"><span class="doc-row-label">Payment</span><span class="doc-row-value">${escapeHtml(order.payment_method)}</span></div>` : ''}
-                    ${order.product_name ? `<div class="doc-row"><span class="doc-row-label">Product</span><span class="doc-row-value">${escapeHtml(order.product_name)}</span></div>` : ''}
+                    ${order.delivery_type ? `<div class="doc-row"><span class="doc-row-label">Delivery</span><span class="doc-row-value">${escapeHtml(order.delivery_type)}</span></div>` : ''}
+                    ${order.product_name && !itemsHtml ? `<div class="doc-row"><span class="doc-row-label">Product</span><span class="doc-row-value">${escapeHtml(order.product_name)}</span></div>` : ''}
+                    ${itemsHtml}
+                    ${order.address ? `<div class="doc-row"><span class="doc-row-label">Address</span><span class="doc-row-value" style="font-size:11px;max-width:200px;text-align:right;">${escapeHtml(order.address)}</span></div>` : ''}
                     ${order.awb ? `<div class="doc-row"><span class="doc-row-label">AWB</span><span class="doc-row-value">${escapeHtml(order.awb)}</span></div>` : ''}
                     ${order.courier_name ? `<div class="doc-row"><span class="doc-row-label">Courier</span><span class="doc-row-value">${escapeHtml(order.courier_name)}</span></div>` : ''}
                     ${order.tracking_url ? `<div class="doc-row"><span class="doc-row-label">Tracking</span><span class="doc-row-value"><a href="${escapeHtml(order.tracking_url)}" target="_blank" class="doc-tracking-link">Track →</a></span></div>` : ''}
