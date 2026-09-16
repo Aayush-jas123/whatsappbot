@@ -3959,6 +3959,64 @@ router.get('/support-portals', verifyToken, async (req, res) => {
     }
 });
 
+// Update a support portal
+router.put('/support-portals/:id', verifyToken, async (req, res) => {
+    try {
+        const { id } = req.params;
+        const { name, slug, type, config, password } = req.body;
+
+        const existing = await dbAdapter.query('SELECT id FROM support_portals WHERE id = ?', [id]);
+        if (!existing || existing.length === 0) {
+            return res.status(404).json({ success: false, error: 'Portal not found' });
+        }
+
+        if (type && !['manual', 'time_based', 'auto'].includes(type)) {
+            return res.status(400).json({ success: false, error: 'Invalid portal type' });
+        }
+
+        const updates = [];
+        const params = [];
+
+        if (name) { updates.push('name = ?'); params.push(name); }
+        if (slug) { updates.push('slug = ?'); params.push(slug); }
+        if (type) { updates.push('type = ?'); params.push(type); }
+        if (config) { updates.push('config = ?'); params.push(JSON.stringify(config)); }
+        updates.push('updated_at = CURRENT_TIMESTAMP');
+
+        if (password) {
+            const passwordHash = await bcrypt.hash(password, 10);
+            updates.push('password_hash = ?');
+            params.push(passwordHash);
+            updates.push('password_plain = ?');
+            params.push(password);
+            portalPasswords.set(String(id), password);
+        }
+
+        if (updates.length <= 1) {
+            return res.status(400).json({ success: false, error: 'No fields to update' });
+        }
+
+        params.push(id);
+        await dbAdapter.run(
+            `UPDATE support_portals SET ${updates.join(', ')} WHERE id = ?`,
+            params
+        );
+
+        const portal = await dbAdapter.query(
+            'SELECT id, name, slug, type, config, created_at FROM support_portals WHERE id = ?',
+            [id]
+        );
+
+        res.json({
+            success: true,
+            portal: portal[0]
+        });
+    } catch (error) {
+        console.error('Update support portal error:', error);
+        res.status(500).json({ success: false, error: 'Failed to update support portal' });
+    }
+});
+
 // Delete a support portal
 router.delete('/support-portals/:id', verifyToken, async (req, res) => {
     try {
