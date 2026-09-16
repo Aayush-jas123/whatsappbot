@@ -687,8 +687,8 @@ router.get('/:slug/customers/:phone/details', verifyPortalToken, async (req, res
         }
 
         // Also query shipments table (authoritative source for tracking data)
-        const shopperOrderIds = new Set((shoppers || []).map(s => String(s.order_id)));
-        if (shopperOrderIds.size > 0) {
+        const shopperOrderIds = [...new Set((shoppers || []).map(s => String(s.order_id)))];
+        if (shopperOrderIds.length > 0) {
             const oidPlaceholders = shopperOrderIds.map(() => '?').join(',');
             try {
                 const shipments = await dbAdapter.query(
