@@ -541,9 +541,14 @@ function renderPortalsList() {
     if (!portalsCache.length) { container.innerHTML = '<p class="text-muted text-small">No portals configured</p>'; return; }
     container.innerHTML = portalsCache.map(p => `
         <div class="portal-item">
-            <div>
+            <div style="min-width:0">
                 <div class="portal-item-name">${esc(p.name)}</div>
                 <div class="portal-item-type">${p.type}${p.config?.time_start ? ` · ${p.config.time_start}–${p.config.time_end}` : ''}</div>
+                ${p.url ? `
+                <div class="portal-item-link" id="plink-${p.id}">
+                    <a class="portal-link-url" href="${esc(p.url)}" target="_blank" rel="noopener" title="${esc(p.url)}">${esc(p.url)}</a>
+                    <button class="btn btn-secondary btn-sm portal-pw-btn portal-link-copy" onclick="copyPortalLink(${p.id})" title="Copy portal link">📋</button>
+                </div>` : ''}
                 <div class="portal-item-password" id="pw-${p.id}">
                     <span class="portal-pw-masked">••••••••</span>
                     <button class="btn btn-secondary btn-sm portal-pw-btn" onclick="revealPortalPassword(${p.id})" title="Show password">👁</button>
@@ -655,6 +660,17 @@ async function copyPortalPassword(id) {
         btn.textContent = '✓';
         setTimeout(() => btn.textContent = orig, 1500);
     }
+}
+
+async function copyPortalLink(id) {
+    const p = portalsCache.find(x => x.id === id);
+    if (!p?.url) return;
+    await navigator.clipboard.writeText(p.url);
+    const btn = document.querySelector(`#plink-${id} .portal-link-copy`);
+    if (!btn) return;
+    const orig = btn.textContent;
+    btn.textContent = '✓';
+    setTimeout(() => btn.textContent = orig, 1500);
 }
 
 async function deletePortal(id) {

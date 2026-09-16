@@ -1618,6 +1618,24 @@ td { color: var(--text-secondary); }
     font-size: 12px !important;
     line-height: 1 !important;
 }
+.portal-item-link {
+    display: flex;
+    align-items: center;
+    gap: 4px;
+    margin-top: 4px;
+    max-width: 100%;
+    overflow: hidden;
+}
+.portal-link-url {
+    font-family: monospace;
+    font-size: 11px;
+    color: var(--text-secondary);
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+.portal-link-url:hover { color: var(--text-primary); }
 .keywords-preview, .auto-dist-info { font-size: 13px; }
 
 /* ===================================
