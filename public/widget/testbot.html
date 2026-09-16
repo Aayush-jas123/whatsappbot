@@ -206,7 +206,7 @@
             <h2>Embed Code</h2>
             <div class="embed-code" id="embed-code-block">
                 <button class="copy-btn" id="copy-embed-btn">Copy</button>
-                <span class="tag">&lt;script</span> <span class="attr">src</span>=<span class="val">"YOUR_SERVER_URL/widget/js/testbot-loader.js"</span> <span class="attr">defer</span><span class="tag">&gt;&lt;/script&gt;</span>
+                <span class="tag">&lt;script</span> <span class="attr">src</span>=<span class="val">"https://whatsappbot-4l4b.onrender.com/widget/js/testbot-loader.js"</span> <span class="attr">defer</span><span class="tag">&gt;&lt;/script&gt;</span>
             </div>
         </div>
     </div>
@@ -224,7 +224,7 @@
         });
 
         document.getElementById('copy-embed-btn').addEventListener('click', function () {
-            var code = '<script src="' + window.location.origin + '/widget/js/testbot-loader.js" defer><\/script>';
+            var code = '<script src="https://whatsappbot-4l4b.onrender.com/widget/js/testbot-loader.js" defer><\/script>';
             navigator.clipboard.writeText(code).then(function () {
                 document.getElementById('copy-embed-btn').textContent = 'Copied';
                 setTimeout(function () { document.getElementById('copy-embed-btn').textContent = 'Copy'; }, 2000);

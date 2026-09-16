@@ -477,7 +477,7 @@ app.get('/shoppers', (req, res) => {
     res.sendFile(path.join(__dirname, 'public', 'shoppers', 'index.html'));
 });
 
-// Test Bot — CSP override for inline event handlers and external resources
+// Widget (testbot) page — CSP override for inline event handlers and external resources
 app.use('/widget/testbot.html', helmet({
     contentSecurityPolicy: {
         directives: {
@@ -492,7 +492,7 @@ app.use('/widget/testbot.html', helmet({
     }
 }));
 
-// Serve Test Bot page
+// Serve Widget page (testbot)
 app.get('/testbot', (req, res) => {
     res.sendFile(path.join(__dirname, 'public', 'widget', 'testbot.html'));
 });
