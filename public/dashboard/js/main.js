@@ -101,6 +101,25 @@ function setupEventListeners() {
     // AI Analytics
     document.getElementById('refreshAiInsights')?.addEventListener('click', loadAiAnalytics);
 
+    // Widget Chats
+    document.querySelectorAll('.wc-sub-tab').forEach(tab => {
+        tab.addEventListener('click', () => {
+            document.querySelectorAll('.wc-sub-tab').forEach(t => t.classList.remove('active'));
+            tab.classList.add('active');
+            const target = tab.dataset.wctab;
+            document.querySelectorAll('.wc-tab-panel').forEach(p => p.classList.remove('active'));
+            if (target === 'conversations') { document.getElementById('wcTabConversations')?.classList.add('active'); }
+            else if (target === 'wc-analytics') { document.getElementById('wcTabAnalytics')?.classList.add('active'); loadWidgetChatAnalytics(); }
+            else if (target === 'wc-settings') { document.getElementById('wcTabSettings')?.classList.add('active'); loadWidgetChatSettings(); }
+        });
+    });
+    document.getElementById('wcSearchInput')?.addEventListener('input', debounce(() => { wcPage = 1; loadWidgetChats(); }, 350));
+    document.getElementById('wcTicketFilter')?.addEventListener('change', () => { wcPage = 1; loadWidgetChats(); });
+    document.getElementById('wcSortBy')?.addEventListener('change', () => { wcPage = 1; loadWidgetChats(); });
+    document.getElementById('wcRefreshBtn')?.addEventListener('click', () => loadWidgetChats());
+    document.getElementById('wcShowMoreBtn')?.addEventListener('click', () => { wcPage++; loadWidgetChats(true); });
+    document.getElementById('wcPurgeBtn')?.addEventListener('click', purgeWidgetChats);
+
     // Modal close buttons
     document.querySelectorAll('[data-action="closeModal"]').forEach(btn => {
         btn.addEventListener('click', () => {
@@ -184,6 +203,7 @@ function navigateTo(page) {
 
     const titles = {
         'support': ['Support Tickets', 'Manage customer conversations across all channels'],
+        'widget-chats': ['Widget Chats', 'Website bot conversations, token usage and analytics'],
         'ai-analytics': ['AI Analytics', 'Intelligent insights from all support conversations'],
         'templates': ['Templates', 'Meta API message templates'],
         'ig-comments': ['Instagram Comments', 'Monitor and manage Instagram comment interactions'],
@@ -199,6 +219,7 @@ function navigateTo(page) {
 function loadPageData(page) {
     switch (page) {
         case 'support': loadTickets(); loadPortals(); break;
+        case 'widget-chats': loadWidgetChats(); break;
         case 'ai-analytics': initAnalyticsDateFilter(); loadAiAnalytics(); break;
         case 'templates': loadTemplates(); break;
         case 'ig-comments': if (typeof loadIgComments === 'function') loadIgComments(); break;
@@ -1225,6 +1246,255 @@ async function loadUnreadCount() {
 // ===================================
 function toggleSelectAll(e) {
     document.querySelectorAll('.ticket-check').forEach(cb => { cb.checked = e.target.checked; });
+}
+
+// ===================================
+// Widget Chats
+// ===================================
+let wcPage = 1;
+const wcLimit = 50;
+let wcMeta = {};
+
+async function loadWidgetChats(append = false) {
+    const list = document.getElementById('wcSessionsList');
+    if (!append) list.innerHTML = '<div class="tickets-loading"><div class="spinner"></div><span>Loading sessions...</span></div>';
+
+    const params = new URLSearchParams({ page: wcPage, limit: wcLimit });
+    const search = document.getElementById('wcSearchInput')?.value.trim();
+    const ticketFilter = document.getElementById('wcTicketFilter')?.value;
+    if (search) params.set('search', search);
+    if (ticketFilter) params.set('has_ticket', ticketFilter);
+
+    try {
+        const [sessionsData, analyticsData] = await Promise.all([
+            apiFetch(`/widget-chats/sessions?${params}`),
+            wcPage === 1 ? apiFetch('/widget-chats/analytics') : Promise.resolve(null)
+        ]);
+
+        if (!sessionsData?.success) { list.innerHTML = '<div class="tickets-loading"><span>Failed to load</span></div>'; return; }
+        wcMeta = sessionsData.meta || {};
+        renderWidgetSessions(sessionsData.sessions || [], append);
+        updateWcPagination();
+
+        if (analyticsData?.success) updateWcStatsRow(analyticsData.analytics);
+    } catch (err) {
+        list.innerHTML = '<div class="tickets-loading"><span>Error loading sessions</span></div>';
+    }
+}
+
+function renderWidgetSessions(sessions, append) {
+    const list = document.getElementById('wcSessionsList');
+    if (!append) list.innerHTML = '';
+    if (!sessions.length && !append) {
+        list.innerHTML = '<div class="tickets-loading"><span>No widget chat sessions found</span></div>';
+        return;
+    }
+    sessions.forEach(s => {
+        const row = document.createElement('div');
+        row.className = 'wc-session-row';
+        const sid = esc(s.session_id || '');
+        const shortSid = sid.length > 20 ? sid.substring(0, 20) + '...' : sid;
+        const ticketBadge = s.has_ticket
+            ? `<span class="wc-ticket-badge" title="${esc(s.ticket_number || '')}">${esc(s.ticket_number || 'Ticket')}</span>`
+            : '<span class="wc-no-ticket">No ticket</span>';
+        const tokens = (s.total_prompt_tokens || 0) + (s.total_completion_tokens || 0);
+        const cost = parseFloat(s.total_cost_usd || 0);
+
+        row.innerHTML = `
+            <div class="wc-session-main">
+                <div class="wc-session-id" title="${sid}">${shortSid}</div>
+                <div class="wc-session-meta">
+                    <span class="wc-msg-count">${s.message_count || 0} msgs</span>
+                    ${ticketBadge}
+                    <span class="wc-token-badge" title="${tokens} tokens">${formatTokens(tokens)} tok</span>
+                    <span class="wc-cost-badge">$${cost.toFixed(4)}</span>
+                </div>
+            </div>
+            <div class="wc-session-time">
+                <div>${formatTimeAgo(s.last_message_at || s.created_at)}</div>
+                <button class="ticket-action-btn" onclick="openWidgetChat('${sid}')" title="View conversation">
+                    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></svg>
+                </button>
+            </div>
+        `;
+        list.appendChild(row);
+    });
+}
+
+function updateWcPagination() {
+    const pag = document.getElementById('wcPagination');
+    if (!wcMeta.total) { pag.style.display = 'none'; return; }
+    pag.style.display = 'flex';
+    const end = wcPage * wcLimit;
+    document.getElementById('wcShowStart').textContent = ((wcPage - 1) * wcLimit) + 1;
+    document.getElementById('wcShowEnd').textContent = Math.min(end, wcMeta.total);
+    document.getElementById('wcShowTotal').textContent = wcMeta.total;
+    document.getElementById('wcShowMoreBtn').style.display = wcMeta.has_more ? '' : 'none';
+}
+
+function updateWcStatsRow(a) {
+    if (!a) return;
+    setText('wcStatSessions', a.totalSessions || 0);
+    setText('wcStatTickets', a.sessionsWithTickets || 0);
+    setText('wcStatEscRate', `${a.escalationRate || 0}%`);
+    setText('wcStatCost', `$${(a.totalCostUsd || 0).toFixed(4)}`);
+    setText('wcStatTokens', formatTokens(a.totalTokens || 0));
+}
+
+async function openWidgetChat(sessionId) {
+    const modal = document.getElementById('wcConversationModal');
+    document.getElementById('wcConvoTitle').textContent = 'Widget Chat';
+    document.getElementById('wcConvoSubtitle').textContent = sessionId;
+    document.getElementById('wcConvoStats').textContent = '';
+    document.getElementById('wcConvoMessages').innerHTML = '<div class="chat-loading"><div class="spinner"></div><span>Loading...</span></div>';
+    modal.classList.add('active');
+
+    try {
+        const data = await apiFetch(`/widget-chats/session/${encodeURIComponent(sessionId)}`);
+        if (!data?.success) {
+            document.getElementById('wcConvoMessages').innerHTML = '<div class="chat-loading"><span>Not found</span></div>';
+            return;
+        }
+        const sess = data.session;
+        const tokens = (sess.total_prompt_tokens || 0) + (sess.total_completion_tokens || 0);
+        document.getElementById('wcConvoStats').textContent =
+            `${sess.message_count || 0} msgs · ${formatTokens(tokens)} tok · $${parseFloat(sess.total_cost_usd || 0).toFixed(4)}` +
+            (sess.has_ticket ? ` · ${esc(sess.ticket_number || 'ticket')}` : '');
+
+        renderWidgetConversation(data.messages || []);
+    } catch {
+        document.getElementById('wcConvoMessages').innerHTML = '<div class="chat-loading"><span>Error loading</span></div>';
+    }
+}
+
+function renderWidgetConversation(messages) {
+    const container = document.getElementById('wcConvoMessages');
+    container.innerHTML = '';
+    messages.forEach(m => {
+        const div = document.createElement('div');
+        const isBot = m.sender === 'bot';
+        div.className = `chat-msg ${isBot ? 'outgoing' : 'incoming'}`;
+        let metaHtml = '';
+        if (isBot && (m.prompt_tokens || m.completion_tokens)) {
+            const tok = (m.prompt_tokens || 0) + (m.completion_tokens || 0);
+            metaHtml = `<div class="wc-msg-meta">${formatTokens(tok)} tok · $${parseFloat(m.cost_usd || 0).toFixed(4)}${m.model ? ' · ' + esc(m.model) : ''}${m.suggested_action ? ' · ' + esc(m.suggested_action) : ''}</div>`;
+        }
+        div.innerHTML = `<div>${esc(m.content || '')}${metaHtml}</div><div class="chat-msg-time">${formatTime(m.created_at)}</div>`;
+        container.appendChild(div);
+    });
+    container.scrollTop = container.scrollHeight;
+}
+
+async function loadWidgetChatAnalytics() {
+    try {
+        const data = await apiFetch('/widget-chats/analytics');
+        if (!data?.success) return;
+        const a = data.analytics;
+
+        setText('wcAnaSessions', a.totalSessions || 0);
+        setText('wcAnaMessages', a.totalMessages || 0);
+        setText('wcAnaTokens', formatTokens(a.totalTokens || 0));
+        setText('wcAnaTokensBreakdown', `prompt: ${formatTokens(a.totalPromptTokens || 0)} / completion: ${formatTokens(a.totalCompletionTokens || 0)}`);
+        setText('wcAnaCost', `$${(a.totalCostUsd || 0).toFixed(4)}`);
+        setText('wcAnaAvgCost', `avg $${(a.avgCostPerSession || 0).toFixed(4)}/session`);
+        setText('wcAnaEscRate', `${a.escalationRate || 0}%`);
+        setText('wcAnaEscCount', `${a.sessionsWithTickets || 0} of ${a.totalSessions || 0} sessions`);
+        setText('wcAnaAvgTokens', formatTokens(a.avgTokensPerSession || 0));
+
+        renderWcDailyChart(a.dailyUsage || []);
+        renderWcHourlyHeatmap(a.hourlyDistribution || []);
+        renderWcModelUsage(a.modelUsage || []);
+    } catch (err) {
+        console.error('Widget chat analytics error:', err);
+    }
+}
+
+function renderWcDailyChart(daily) {
+    const el = document.getElementById('wcDailyChart');
+    if (!el) return;
+    if (!daily.length) { el.innerHTML = '<p class="text-muted text-small" style="text-align:center;padding:24px">No data yet</p>'; return; }
+    const maxMsg = Math.max(...daily.map(d => d.messages || 0), 1);
+    const maxCost = Math.max(...daily.map(d => parseFloat(d.cost) || 0), 0.001);
+    el.innerHTML = `<div class="wc-daily-bars">${daily.map(d => {
+        const msgH = Math.max(((d.messages || 0) / maxMsg) * 100, 2);
+        const label = new Date(d.day + 'T00:00:00').toLocaleDateString('en', { month: 'short', day: 'numeric' });
+        return `<div class="wc-daily-bar-group">
+            <div class="wc-daily-bar" style="height:${msgH}%" title="${d.messages || 0} msgs · ${formatTokens(d.tokens || 0)} tok · $${parseFloat(d.cost || 0).toFixed(4)}"></div>
+            <span class="wc-daily-label">${label}</span>
+        </div>`;
+    }).join('')}</div>`;
+}
+
+function renderWcHourlyHeatmap(hourly) {
+    const el = document.getElementById('wcHourlyHeatmap');
+    if (!el) return;
+    if (!hourly.length) { el.innerHTML = '<p class="text-muted text-small" style="text-align:center;padding:24px;width:100%">No data</p>'; return; }
+    const max = Math.max(...hourly.map(h => h.count), 1);
+    let html = '';
+    for (let h = 0; h < 24; h++) {
+        const data = hourly.find(x => x.hour === h);
+        const count = data ? data.count : 0;
+        const ratio = count / max;
+        let heat = 'heat-1';
+        if (ratio > 0.8) heat = 'heat-5';
+        else if (ratio > 0.6) heat = 'heat-4';
+        else if (ratio > 0.4) heat = 'heat-3';
+        else if (ratio > 0.2) heat = 'heat-2';
+        html += `<div class="heatmap-cell ${heat}" title="${h}:00 — ${count} messages">${count || ''}</div>`;
+    }
+    el.innerHTML = html + '<div class="heatmap-labels" style="width:100%"><span>00:00</span><span>06:00</span><span>12:00</span><span>18:00</span><span>23:00</span></div>';
+}
+
+function renderWcModelUsage(models) {
+    const el = document.getElementById('wcModelUsage');
+    if (!el) return;
+    if (!models.length) { el.innerHTML = '<p class="text-muted text-small">No model data yet</p>'; return; }
+    el.innerHTML = models.map(m => {
+        const tok = (m.prompt_tokens || 0) + (m.completion_tokens || 0);
+        return `<div class="wc-model-row">
+            <span class="wc-model-name">${esc(m.model)}</span>
+            <span class="wc-model-stats">${m.calls || 0} calls · ${formatTokens(tok)} tok · $${parseFloat(m.cost || 0).toFixed(4)}</span>
+        </div>`;
+    }).join('');
+}
+
+async function loadWidgetChatSettings() {
+    try {
+        const data = await apiFetch('/widget-chats/settings');
+        if (!data?.success) return;
+        const s = data.settings;
+        setText('wcSetProvider', s.provider || '—');
+        setText('wcSetModel', s.model || '—');
+        setText('wcSetInputCost', `$${s.inputCostPer1M || 0} per 1M`);
+        setText('wcSetOutputCost', `$${s.outputCostPer1M || 0} per 1M`);
+        setText('wcSetTTL', `${s.sessionTtlMinutes || 15} min`);
+        setText('wcSetMaxSess', s.maxSessions || 200);
+        setText('wcSetHistory', s.maxHistoryTurns || 10);
+        setText('wcSetRetention', `${s.retentionDays || 90} days`);
+    } catch { /* silent */ }
+}
+
+async function purgeWidgetChats() {
+    const days = document.getElementById('wcPurgeDays')?.value || 90;
+    if (!confirm(`Purge all widget chats older than ${days} days?`)) return;
+    const result = document.getElementById('wcPurgeResult');
+    try {
+        const data = await apiFetch(`/widget-chats/purge?days=${days}`, { method: 'DELETE' });
+        if (data?.success) {
+            result.textContent = `Purged ${data.purged.chats} messages and ${data.purged.sessions} sessions.`;
+            loadWidgetChats();
+        } else {
+            result.textContent = data?.error || 'Failed to purge';
+        }
+    } catch {
+        result.textContent = 'Error purging data';
+    }
+}
+
+function formatTokens(n) {
+    if (n >= 1000000) return (n / 1000000).toFixed(1) + 'M';
+    if (n >= 1000) return (n / 1000).toFixed(1) + 'k';
+    return String(n);
 }
 
 // ===================================

@@ -625,7 +625,8 @@
                 phone: CUSTOMER_PHONE || '',
                 message: ticketMessage,
                 orderId: flowContext.orderId || null,
-                source: 'website'
+                source: 'website',
+                sessionId: sessionId
             })
         })
         .then(function (r) { return r.json(); })

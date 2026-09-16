@@ -14,7 +14,7 @@
  * - Multi-language awareness (detects and responds in customer's language)
  */
 
-const { chatCompletion, isConfigured, estimateTokens } = require('./aiClient');
+const { chatCompletion, isConfigured, estimateTokens, computeCostUsd } = require('./aiClient');
 const { getTool } = require('./tools');
 const { dbAdapter } = require('../../database/db');
 const { detectLanguage } = require('./autoSupportAgent');
@@ -248,16 +248,27 @@ async function runCustomerAgent({ sessionId, message }) {
     let reply = null;
     let returnCard = null;
     const MAX_ROUNDS = 3;
+    let totalPromptTokens = 0;
+    let totalCompletionTokens = 0;
+    let totalToolCalls = 0;
+    let usedModel = null;
 
     for (let round = 0; round <= MAX_ROUNDS; round++) {
-        const { message: aiMessage } = await chatCompletion({
+        const { message: aiMessage, usage, model } = await chatCompletion({
             messages,
             tools: toolSchemas.length ? toolSchemas : undefined,
             maxTokens: 512,
             temperature: 0.4
         });
 
+        if (usage) {
+            totalPromptTokens += usage.prompt_tokens || 0;
+            totalCompletionTokens += usage.completion_tokens || 0;
+        }
+        if (model) usedModel = model;
+
         const toolCalls = aiMessage.tool_calls || [];
+        totalToolCalls += toolCalls.length;
         if (!toolCalls.length) {
             reply = aiMessage.content || 'Let me know if there is anything else I can help with!';
             break;
@@ -322,11 +333,24 @@ async function runCustomerAgent({ sessionId, message }) {
     session.history.push({ role: 'assistant', content: reply });
     saveSession(sessionId, session.history, context);
 
+    // ── Persist to database (fire-and-forget — never block the response) ──
+    const totalCost = computeCostUsd(totalPromptTokens, totalCompletionTokens);
+    persistWidgetChat(sessionId, message, reply, {
+        model: usedModel,
+        promptTokens: totalPromptTokens,
+        completionTokens: totalCompletionTokens,
+        costUsd: totalCost,
+        toolCalls: totalToolCalls,
+        suggestedAction,
+        entities: Object.keys(context).length ? context : null
+    }).catch(err => console.warn('[widget] persist error:', err.message));
+
     return {
         reply,
         suggestedAction,
         cardType: returnCard ? 'return' : null,
-        cardData: returnCard
+        cardData: returnCard,
+        usage: { prompt_tokens: totalPromptTokens, completion_tokens: totalCompletionTokens, cost_usd: totalCost }
     };
 }
 
@@ -394,13 +418,51 @@ function buildReturnCard(result) {
     return card;
 }
 
+// ---------- Persistence (optimised: single upsert per turn) ----------
+
+/**
+ * Persist a customer+bot message pair and update the session summary.
+ * Fire-and-forget — caller catches rejections.
+ */
+async function persistWidgetChat(sessionId, customerMsg, botReply, opts) {
+    const now = new Date().toISOString();
+    const entitiesJson = opts.entities ? JSON.stringify(opts.entities) : null;
+
+    // 1. Insert both messages in one batch via two INSERTs
+    await dbAdapter.run(
+        `INSERT INTO widget_chats (session_id, sender, content, created_at) VALUES ($1, $2, $3, $4)`,
+        [sessionId, 'customer', customerMsg, now]
+    );
+    await dbAdapter.run(
+        `INSERT INTO widget_chats (session_id, sender, content, model, prompt_tokens, completion_tokens, cost_usd, tool_calls, suggested_action, entities, created_at)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)`,
+        [sessionId, 'bot', botReply, opts.model || null,
+         opts.promptTokens || 0, opts.completionTokens || 0,
+         opts.costUsd || 0, opts.toolCalls || 0,
+         opts.suggestedAction || null, entitiesJson, now]
+    );
+
+    // 2. Upsert session summary (single atomic statement)
+    await dbAdapter.run(
+        `INSERT INTO widget_chat_sessions (session_id, message_count, total_prompt_tokens, total_completion_tokens, total_cost_usd, last_message_at, created_at)
+         VALUES ($1, 2, $2, $3, $4, $5, $5)
+         ON CONFLICT (session_id) DO UPDATE SET
+           message_count = widget_chat_sessions.message_count + 2,
+           total_prompt_tokens = widget_chat_sessions.total_prompt_tokens + $2,
+           total_completion_tokens = widget_chat_sessions.total_completion_tokens + $3,
+           total_cost_usd = widget_chat_sessions.total_cost_usd + $4,
+           last_message_at = $5`,
+        [sessionId, opts.promptTokens || 0, opts.completionTokens || 0, opts.costUsd || 0, now]
+    );
+}
+
 // ---------- Ticket creation ----------
 
 /**
  * Create a support ticket from the widget.
- * @returns {{ ticketNumber: string, whatsappLink: string }}
+ * @returns {{ ticketNumber: string, whatsappLink: string, ticketId: number }}
  */
-async function createWidgetTicket({ name, phone, email, message, orderId, source }) {
+async function createWidgetTicket({ name, phone, email, message, orderId, source, sessionId }) {
     const ticketNumber = 'WDG-' + Date.now().toString(36).toUpperCase();
 
     // Assign portal via round-robin so every portal gets its fair share of widget tickets
@@ -409,7 +471,7 @@ async function createWidgetTicket({ name, phone, email, message, orderId, source
     // Source defaults to 'widget' for backward compatibility; testbot sends 'website'
     const ticketSource = source || 'widget';
 
-    await dbAdapter.insert('support_tickets', {
+    const inserted = await dbAdapter.insert('support_tickets', {
         ticket_number: ticketNumber,
         customer_name: name || 'Widget Customer',
         customer_phone: phone || '',
@@ -423,12 +485,28 @@ async function createWidgetTicket({ name, phone, email, message, orderId, source
         updated_at: new Date().toISOString()
     });
 
+    const ticketId = inserted?.id || null;
+
+    // Link the chat session to this ticket (fire-and-forget)
+    if (sessionId && ticketId) {
+        dbAdapter.run(
+            `UPDATE widget_chat_sessions SET has_ticket = TRUE, ticket_id = $1, ticket_number = $2 WHERE session_id = $3`,
+            [ticketId, ticketNumber, sessionId]
+        ).catch(err => console.warn('[widget] ticket link error:', err.message));
+
+        // Also stamp the ticket_id on all chat messages for this session
+        dbAdapter.run(
+            `UPDATE widget_chats SET ticket_id = $1 WHERE session_id = $2 AND ticket_id IS NULL`,
+            [ticketId, sessionId]
+        ).catch(err => console.warn('[widget] chat stamp error:', err.message));
+    }
+
     // Build WhatsApp deep link
     const businessNumber = (process.env.WHATSAPP_BUSINESS_NUMBER || '').replace(/\D/g, '');
     const prefilledText = `Hi, I need help with my order.\nTicket: ${ticketNumber}\n${orderId ? 'Order: ' + orderId + '\n' : ''}${message ? 'Issue: ' + message.substring(0, 200) : ''}`;
     const whatsappLink = `https://wa.me/${businessNumber}?text=${encodeURIComponent(prefilledText)}`;
 
-    return { ticketNumber, whatsappLink };
+    return { ticketNumber, whatsappLink, ticketId };
 }
 
 module.exports = { runCustomerAgent, createWidgetTicket, noteSessionContext, appendSessionExchange };

@@ -7686,4 +7686,221 @@ router.post('/ig-comments/:id/open-dm', verifyToken, async (req, res) => {
     }
 });
 
+// ════════════════════════════════════════════════════════════════
+// Widget Chats — sessions, conversations, analytics, settings
+// ════════════════════════════════════════════════════════════════
+
+// GET /api/admin/widget-chats/sessions — paginated session list
+router.get('/widget-chats/sessions', verifyToken, async (req, res) => {
+    try {
+        const page = Math.max(1, parseInt(req.query.page) || 1);
+        const limit = Math.min(100, Math.max(1, parseInt(req.query.limit) || 50));
+        const offset = (page - 1) * limit;
+        const { has_ticket, date_from, date_to, search } = req.query;
+
+        let where = 'WHERE 1=1';
+        const params = [];
+        let pi = 1;
+
+        if (has_ticket === '1' || has_ticket === 'true') { where += ` AND has_ticket = TRUE`; }
+        else if (has_ticket === '0' || has_ticket === 'false') { where += ` AND has_ticket = FALSE`; }
+
+        if (date_from) { where += ` AND created_at >= $${pi}`; params.push(date_from); pi++; }
+        if (date_to) { where += ` AND created_at <= $${pi}`; params.push(date_to + ' 23:59:59'); pi++; }
+
+        if (search) {
+            where += ` AND (session_id ILIKE $${pi} OR ticket_number ILIKE $${pi})`;
+            params.push(`%${search}%`);
+            pi++;
+        }
+
+        const cacheKey = `wcsess:${page}:${limit}:${has_ticket || ''}:${date_from || ''}:${date_to || ''}:${search || ''}`;
+        const cached = getCached(cacheKey);
+        if (cached) return res.json(cached);
+
+        const [countRows, sessions] = await Promise.all([
+            dbAdapter.query(`SELECT COUNT(*) AS total FROM widget_chat_sessions ${where}`, params),
+            dbAdapter.query(
+                `SELECT session_id, message_count, has_ticket, ticket_id, ticket_number,
+                        total_prompt_tokens, total_completion_tokens, total_cost_usd,
+                        last_message_at, created_at
+                 FROM widget_chat_sessions ${where}
+                 ORDER BY created_at DESC
+                 LIMIT $${pi} OFFSET $${pi + 1}`,
+                [...params, limit, offset]
+            )
+        ]);
+
+        const total = parseInt(countRows[0]?.total) || 0;
+        const response = {
+            success: true,
+            sessions,
+            meta: { total, page, limit, has_more: offset + limit < total }
+        };
+        setCache(cacheKey, response, 'queries', 2 * 60 * 1000);
+        res.json(response);
+    } catch (error) {
+        console.error('widget-chats/sessions error:', error.message);
+        res.status(500).json({ success: false, error: 'Failed to load widget chat sessions' });
+    }
+});
+
+// GET /api/admin/widget-chats/session/:sessionId — full conversation
+router.get('/widget-chats/session/:sessionId', verifyToken, async (req, res) => {
+    try {
+        const { sessionId } = req.params;
+        const [session, messages] = await Promise.all([
+            dbAdapter.query('SELECT * FROM widget_chat_sessions WHERE session_id = $1', [sessionId]),
+            dbAdapter.query(
+                'SELECT id, sender, content, model, prompt_tokens, completion_tokens, cost_usd, tool_calls, suggested_action, entities, created_at FROM widget_chats WHERE session_id = $1 ORDER BY created_at ASC',
+                [sessionId]
+            )
+        ]);
+        if (!session.length) return res.status(404).json({ success: false, error: 'Session not found' });
+        res.json({ success: true, session: session[0], messages });
+    } catch (error) {
+        console.error('widget-chats/session error:', error.message);
+        res.status(500).json({ success: false, error: 'Failed to load conversation' });
+    }
+});
+
+// GET /api/admin/widget-chats/analytics — aggregated token/cost analytics
+router.get('/widget-chats/analytics', verifyToken, async (req, res) => {
+    try {
+        const { date_from, date_to } = req.query;
+        const cacheKey = `wcanalytics:${date_from || ''}:${date_to || ''}`;
+        const cached = getCached(cacheKey);
+        if (cached) return res.json(cached);
+
+        let where = 'WHERE 1=1';
+        const p = [];
+        let pi = 1;
+        if (date_from) { where += ` AND created_at >= $${pi}`; p.push(date_from); pi++; }
+        if (date_to) { where += ` AND created_at <= $${pi}`; p.push(date_to + ' 23:59:59'); pi++; }
+
+        let sessWhere = 'WHERE 1=1';
+        const sp = [];
+        let spi = 1;
+        if (date_from) { sessWhere += ` AND created_at >= $${spi}`; sp.push(date_from); spi++; }
+        if (date_to) { sessWhere += ` AND created_at <= $${spi}`; sp.push(date_to + ' 23:59:59'); spi++; }
+
+        const [sessStats, msgStats, dailyUsage, hourly, modelUsage] = await Promise.all([
+            // Session-level stats
+            dbAdapter.query(
+                `SELECT COUNT(*) AS total_sessions,
+                        SUM(message_count) AS total_messages,
+                        SUM(CASE WHEN has_ticket THEN 1 ELSE 0 END) AS sessions_with_tickets,
+                        SUM(total_prompt_tokens) AS total_prompt_tokens,
+                        SUM(total_completion_tokens) AS total_completion_tokens,
+                        SUM(total_cost_usd) AS total_cost_usd,
+                        AVG(total_cost_usd) AS avg_cost_per_session,
+                        AVG(total_prompt_tokens + total_completion_tokens) AS avg_tokens_per_session
+                 FROM widget_chat_sessions ${sessWhere}`, sp
+            ),
+            // Message-level stats
+            dbAdapter.query(
+                `SELECT COUNT(*) AS total_msgs, SUM(cost_usd) AS total_cost FROM widget_chats ${where} AND sender = 'bot'`, p
+            ),
+            // Daily usage (last 14 days)
+            dbAdapter.query(
+                `SELECT created_at::date AS day,
+                        COUNT(*) AS sessions,
+                        SUM(message_count) AS messages,
+                        SUM(total_prompt_tokens + total_completion_tokens) AS tokens,
+                        SUM(total_cost_usd) AS cost
+                 FROM widget_chat_sessions ${sessWhere}
+                 GROUP BY created_at::date ORDER BY day DESC LIMIT 14`, sp
+            ),
+            // Hourly distribution (IST = UTC+5:30)
+            dbAdapter.query(
+                `SELECT EXTRACT(HOUR FROM (created_at + INTERVAL '5 hours 30 minutes'))::int AS hour,
+                        COUNT(*) AS count
+                 FROM widget_chats ${where} AND sender = 'customer'
+                 GROUP BY hour ORDER BY hour`, p
+            ),
+            // Model breakdown
+            dbAdapter.query(
+                `SELECT model,
+                        COUNT(*) AS calls,
+                        SUM(prompt_tokens) AS prompt_tokens,
+                        SUM(completion_tokens) AS completion_tokens,
+                        SUM(cost_usd) AS cost
+                 FROM widget_chats ${where} AND sender = 'bot' AND model IS NOT NULL
+                 GROUP BY model ORDER BY cost DESC`, p
+            )
+        ]);
+
+        const s = sessStats[0] || {};
+        const totalSessions = parseInt(s.total_sessions) || 0;
+        const sessionsWithTickets = parseInt(s.sessions_with_tickets) || 0;
+
+        const response = {
+            success: true,
+            analytics: {
+                totalSessions,
+                totalMessages: parseInt(s.total_messages) || 0,
+                sessionsWithTickets,
+                escalationRate: totalSessions > 0 ? Math.round(sessionsWithTickets / totalSessions * 100) : 0,
+                totalPromptTokens: parseInt(s.total_prompt_tokens) || 0,
+                totalCompletionTokens: parseInt(s.total_completion_tokens) || 0,
+                totalTokens: (parseInt(s.total_prompt_tokens) || 0) + (parseInt(s.total_completion_tokens) || 0),
+                totalCostUsd: parseFloat(s.total_cost_usd) || 0,
+                avgCostPerSession: parseFloat(s.avg_cost_per_session) || 0,
+                avgTokensPerSession: Math.round(parseFloat(s.avg_tokens_per_session) || 0),
+                dailyUsage: (dailyUsage || []).reverse(),
+                hourlyDistribution: hourly || [],
+                modelUsage: modelUsage || []
+            }
+        };
+        setCache(cacheKey, response, 'queries', 5 * 60 * 1000);
+        res.json(response);
+    } catch (error) {
+        console.error('widget-chats/analytics error:', error.message);
+        res.status(500).json({ success: false, error: 'Failed to load analytics' });
+    }
+});
+
+// GET /api/admin/widget-chats/settings — current config
+router.get('/widget-chats/settings', verifyToken, async (req, res) => {
+    try {
+        const { getConfig } = require('../services/ai/aiClient');
+        const cfg = getConfig();
+        res.json({
+            success: true,
+            settings: {
+                provider: cfg.provider,
+                model: cfg.model,
+                inputCostPer1M: cfg.inputCostPer1M,
+                outputCostPer1M: cfg.outputCostPer1M,
+                sessionTtlMinutes: 15,
+                maxSessions: 200,
+                maxHistoryTurns: 10,
+                retentionDays: 90
+            }
+        });
+    } catch (error) {
+        console.error('widget-chats/settings error:', error.message);
+        res.status(500).json({ success: false, error: 'Failed to load settings' });
+    }
+});
+
+// DELETE /api/admin/widget-chats/purge — purge chats older than N days
+router.delete('/widget-chats/purge', verifyToken, async (req, res) => {
+    try {
+        const days = Math.max(1, parseInt(req.query.days) || 90);
+        const cutoff = new Date(Date.now() - days * 86400000).toISOString();
+        const [chatResult, sessResult] = await Promise.all([
+            dbAdapter.run('DELETE FROM widget_chats WHERE created_at < $1', [cutoff]),
+            dbAdapter.run('DELETE FROM widget_chat_sessions WHERE created_at < $1', [cutoff])
+        ]);
+        res.json({
+            success: true,
+            purged: { chats: chatResult.changes || 0, sessions: sessResult.changes || 0, olderThanDays: days }
+        });
+    } catch (error) {
+        console.error('widget-chats/purge error:', error.message);
+        res.status(500).json({ success: false, error: 'Failed to purge' });
+    }
+});
+
 module.exports = router;

@@ -245,6 +245,9 @@ async function initializeDatabase() {
     
     // Initialize AI Copilot Tables (pending actions, chat history, usage log)
     await initializeAiTables();
+
+    // Initialize Widget Chat Tables (persisted website bot conversations)
+    await initializeWidgetChatTables();
     
     // Initialize Manual Inventory Tables (bulk inventory-in tracking)
     await initializeManualInventoryTables();
@@ -761,6 +764,56 @@ async function initializeAiTables() {
     console.log('✅ AI copilot tables initialized');
   } catch (error) {
     console.error('❌ Failed to initialize AI copilot tables:', error.message);
+  }
+}
+
+// ── Widget Chat Tables ──
+// Persists all website bot (testbot) conversations so admins can view,
+// analyze token usage/cost, and track which sessions escalated to tickets.
+async function initializeWidgetChatTables() {
+  try {
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS widget_chats (
+        id SERIAL PRIMARY KEY,
+        session_id VARCHAR(100) NOT NULL,
+        sender VARCHAR(10) NOT NULL,
+        content TEXT NOT NULL,
+        model VARCHAR(100),
+        prompt_tokens INTEGER DEFAULT 0,
+        completion_tokens INTEGER DEFAULT 0,
+        cost_usd DECIMAL(10,6) DEFAULT 0,
+        tool_calls INTEGER DEFAULT 0,
+        suggested_action VARCHAR(30),
+        ticket_id INTEGER,
+        entities JSONB,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+      )
+    `);
+    await pool.query('CREATE INDEX IF NOT EXISTS idx_widget_chats_session ON widget_chats(session_id, created_at)');
+    await pool.query('CREATE INDEX IF NOT EXISTS idx_widget_chats_created ON widget_chats(created_at DESC)');
+    await pool.query('CREATE INDEX IF NOT EXISTS idx_widget_chats_ticket ON widget_chats(ticket_id) WHERE ticket_id IS NOT NULL');
+
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS widget_chat_sessions (
+        id SERIAL PRIMARY KEY,
+        session_id VARCHAR(100) UNIQUE NOT NULL,
+        message_count INTEGER DEFAULT 0,
+        ticket_id INTEGER,
+        ticket_number VARCHAR(50),
+        has_ticket BOOLEAN DEFAULT FALSE,
+        total_prompt_tokens INTEGER DEFAULT 0,
+        total_completion_tokens INTEGER DEFAULT 0,
+        total_cost_usd DECIMAL(10,6) DEFAULT 0,
+        last_message_at TIMESTAMP,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+      )
+    `);
+    await pool.query('CREATE INDEX IF NOT EXISTS idx_wcs_created ON widget_chat_sessions(created_at DESC)');
+    await pool.query('CREATE INDEX IF NOT EXISTS idx_wcs_has_ticket ON widget_chat_sessions(has_ticket)');
+
+    console.log('✅ Widget chat tables initialized');
+  } catch (error) {
+    console.error('❌ Failed to initialize widget chat tables:', error.message);
   }
 }
 
