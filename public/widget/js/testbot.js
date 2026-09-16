@@ -17,6 +17,10 @@
     var CUSTOMER_NAME = config.customerName || '';
     var CUSTOMER_PHONE = config.customerPhone || '';
 
+    // Clickable text trigger config
+    var TRIGGER_TEXT = config.triggerText || '';  // e.g. 'Need Help?'
+    var TRIGGER_POSITION = config.triggerPosition || 'bottom-right'; // bottom-right | bottom-left | top-right | top-left
+
     // ---------- Session ----------
     // Persistent visitor ID (survives tab close — links all sessions from same browser)
     var visitorId = localStorage.getItem('offcomfrt_tb_visitor');
@@ -218,16 +222,74 @@
             '#offcomfrt-tb .oftb-msg-bot strong{font-weight:700}',
             '#offcomfrt-tb .oftb-msg-bot em{font-style:italic}',
 
+            /* Clickable Text Trigger — inline class (place anywhere in theme) */
+            '.offcomfrt-open-chat{cursor:pointer;display:inline-flex;align-items:center;gap:6px;font-family:"Archive Narrow",-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;font-size:13px;font-weight:700;letter-spacing:1.5px;text-transform:uppercase;color:#1a1a1a;background:#fff;padding:10px 22px;border-radius:100px;border:1px solid #000;box-shadow:0 4px 20px rgba(0,0,0,0.12),0 1px 4px rgba(0,0,0,0.08);transition:all 0.3s cubic-bezier(0.34,1.56,0.64,1);white-space:nowrap;user-select:none;-webkit-user-select:none;text-decoration:none;line-height:1}',
+            '.offcomfrt-open-chat:hover{background:#000;color:#fff;transform:translateY(-2px);box-shadow:0 8px 28px rgba(0,0,0,0.18)}',
+            '.offcomfrt-open-chat:active{transform:translateY(0) scale(0.96)}',
+
+            /* Clickable Text Trigger — fixed position (auto-created via config) */
+            '#offcomfrt-tb-trigger{position:fixed;z-index:99998;cursor:pointer;font-family:"Archive Narrow",-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;font-size:13px;font-weight:700;letter-spacing:1.5px;text-transform:uppercase;color:#1a1a1a;background:#fff;padding:10px 22px;border-radius:100px;border:1px solid #000;box-shadow:0 4px 20px rgba(0,0,0,0.12),0 1px 4px rgba(0,0,0,0.08);transition:all 0.3s cubic-bezier(0.34,1.56,0.64,1);white-space:nowrap;user-select:none;-webkit-user-select:none}',
+            '#offcomfrt-tb-trigger:hover{background:#000;color:#fff;transform:translateY(-2px);box-shadow:0 8px 28px rgba(0,0,0,0.18)}',
+            '#offcomfrt-tb-trigger:active{transform:translateY(0) scale(0.96)}',
+            '#offcomfrt-tb-trigger.pos-bottom-right{bottom:100px;right:28px}',
+            '#offcomfrt-tb-trigger.pos-bottom-left{bottom:100px;left:28px}',
+            '#offcomfrt-tb-trigger.pos-top-right{top:28px;right:28px}',
+            '#offcomfrt-tb-trigger.pos-top-left{top:28px;left:28px}',
+
             /* Mobile */
             '@media(max-width:480px){',
             '#offcomfrt-tb{bottom:0;right:0;left:0;width:100%;height:90vh;max-height:750px;border-radius:20px 20px 0 0;border:none;border-top:1px solid #000;box-shadow:0 -12px 48px rgba(0,0,0,0.15)}',
             '#offcomfrt-tb-btn{bottom:20px;right:20px;width:56px;height:56px}',
+            '#offcomfrt-tb-trigger.pos-bottom-right{bottom:86px;right:20px}',
+            '#offcomfrt-tb-trigger.pos-bottom-left{bottom:86px;left:20px}',
+            '#offcomfrt-tb-trigger.pos-top-right{top:20px;right:20px}',
+            '#offcomfrt-tb-trigger.pos-top-left{top:20px;left:20px}',
             '#offcomfrt-tb .oftb-header{padding:18px 14px}',
             '#offcomfrt-tb .oftb-chat{padding:18px 12px 14px;gap:12px}',
             '#offcomfrt-tb .oftb-input-area{padding:12px 12px 14px}',
             '}'
         ].join('\n');
         document.head.appendChild(style);
+    }
+
+    // ---------- Inline Trigger Binding (Shopify theme placement) ----------
+    function bindInlineTrigger(el) {
+        if (el.getAttribute('data-offcomfrt-bound')) return;
+        el.setAttribute('data-offcomfrt-bound', '1');
+        el.setAttribute('role', 'button');
+        if (!el.getAttribute('tabindex')) el.setAttribute('tabindex', '0');
+        el.addEventListener('click', function (e) {
+            e.preventDefault();
+            e.stopPropagation();
+            toggleWidget();
+        });
+        el.addEventListener('keydown', function (e) {
+            if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); toggleWidget(); }
+        });
+    }
+
+    function bindInlineTriggers() {
+        var els = document.querySelectorAll('.offcomfrt-open-chat');
+        for (var i = 0; i < els.length; i++) bindInlineTrigger(els[i]);
+    }
+
+    function watchInlineTriggers() {
+        if (typeof MutationObserver === 'undefined') return;
+        var observer = new MutationObserver(function (mutations) {
+            for (var i = 0; i < mutations.length; i++) {
+                var nodes = mutations[i].addedNodes;
+                if (!nodes || !nodes.length) continue;
+                for (var j = 0; j < nodes.length; j++) {
+                    var node = nodes[j];
+                    if (node.nodeType !== 1) continue; // element only
+                    if (node.classList && node.classList.contains('offcomfrt-open-chat')) bindInlineTrigger(node);
+                    // also check children
+                    var children = node.querySelectorAll ? node.querySelectorAll('.offcomfrt-open-chat') : [];
+                    for (var k = 0; k < children.length; k++) bindInlineTrigger(children[k]);
+                }
+            }
+        });
+        observer.observe(document.body || document.documentElement, { childList: true, subtree: true });
     }
 
     // ---------- DOM Creation ----------
@@ -240,6 +302,28 @@
         btn.innerHTML = '<svg viewBox="0 0 24 24"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></svg>';
         btn.addEventListener('click', toggleWidget);
         document.body.appendChild(btn);
+
+        // Clickable text trigger (optional — only if triggerText is configured)
+        var trigger = null;
+        if (TRIGGER_TEXT) {
+            trigger = document.createElement('div');
+            trigger.id = 'offcomfrt-tb-trigger';
+            trigger.textContent = TRIGGER_TEXT;
+            trigger.className = 'pos-' + TRIGGER_POSITION;
+            trigger.setAttribute('role', 'button');
+            trigger.setAttribute('tabindex', '0');
+            trigger.setAttribute('aria-label', TRIGGER_TEXT);
+            trigger.addEventListener('click', toggleWidget);
+            trigger.addEventListener('keydown', function (e) {
+                if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); toggleWidget(); }
+            });
+            document.body.appendChild(trigger);
+        }
+
+        // Auto-bind any .offcomfrt-open-chat elements already in the DOM (Shopify theme placement)
+        bindInlineTriggers();
+        // Watch for dynamically added .offcomfrt-open-chat elements (SPA / lazy sections)
+        watchInlineTriggers();
 
         var widget = document.createElement('div');
         widget.id = 'offcomfrt-tb';
@@ -283,6 +367,8 @@
     function openWidget() {
         document.getElementById('offcomfrt-tb').classList.add('open');
         document.getElementById('offcomfrt-tb-btn').style.display = 'none';
+        var trig = document.getElementById('offcomfrt-tb-trigger');
+        if (trig) trig.style.display = 'none';
         isOpen = true;
         startPolling();
         setTimeout(function () { document.getElementById('oftb-input').focus(); }, 300);
@@ -290,6 +376,8 @@
     function closeWidget() {
         document.getElementById('offcomfrt-tb').classList.remove('open');
         document.getElementById('offcomfrt-tb-btn').style.display = 'flex';
+        var trig = document.getElementById('offcomfrt-tb-trigger');
+        if (trig) trig.style.display = '';
         isOpen = false;
         stopPolling();
     }

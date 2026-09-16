@@ -10,7 +10,9 @@
  *       apiUrl: 'https://your-bot-server.onrender.com',
  *       brandName: 'OFFCOMFRT',
  *       customerName: 'John Doe',
- *       customerPhone: '+919876543210'
+ *       customerPhone: '+919876543210',
+ *       triggerText: 'Need Help?',           // clickable text trigger (omit to disable)
+ *       triggerPosition: 'bottom-right'       // bottom-right | bottom-left | top-right | top-left
  *     };
  *   </script>
  */
