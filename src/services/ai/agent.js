@@ -345,50 +345,116 @@ function compactValue(value) {
 }
 
 function clampToolResult(result) {
+    let val = compactValue(result);
+    // If it's an object with array property, limit array size safely
+    if (val && typeof val === 'object' && !Array.isArray(val)) {
+        for (const [k, v] of Object.entries(val)) {
+            if (Array.isArray(v) && v.length > 15) {
+                val[k] = v.slice(0, 15);
+                val[k + '_notice'] = `${v.length - 15} additional records omitted for context efficiency`;
+            }
+        }
+    } else if (Array.isArray(val) && val.length > 20) {
+        val = val.slice(0, 20);
+    }
     let json;
     try {
-        json = JSON.stringify(compactValue(result));
+        json = JSON.stringify(val);
     } catch {
         json = String(result);
     }
     if (json.length > TOOL_RESULT_MAX_CHARS) {
-        json = json.substring(0, TOOL_RESULT_MAX_CHARS) + '… (truncated)';
+        return JSON.stringify({
+            status: 'truncated_for_context',
+            summary: 'Result was compressed for context token efficiency.',
+            snippet: json.substring(0, TOOL_RESULT_MAX_CHARS - 100)
+        });
     }
     return json;
 }
 
 /**
- * Run one copilot turn for an admin.
- * @returns {{ reply: string, pendingAction: {id, summary, toolName}|null, usage: object }}
+ * Run one copilot turn for an admin with Smart Conversational Memory & Entity Context.
+ * @returns {{ reply: string, pendingAction: {id, summary, toolName}|null, usage: object, activeMemory: object }}
  */
 async function runAgent({ actor, userMessage }) {
     if (!isConfigured()) {
-        return { reply: 'AI is not configured. Set AI_API_KEY in the server environment.', pendingAction: null, usage: null };
+        return { reply: 'AI is not configured. Set AI_API_KEY in the server environment.', pendingAction: null, usage: null, activeMemory: null };
+    }
+
+    const {
+        getWorkingMemory,
+        updateWorkingMemory,
+        clearWorkingMemory,
+        extractEntities,
+        extractEntitiesFromToolResult,
+        autoFillToolArgs,
+        buildMemoryPrompt,
+        compressConversationHistory
+    } = require('./aiMemoryService');
+
+    // Handle explicit memory reset commands
+    if (/^\s*(?:clear\s*memory|forget\s*context|reset\s*memory|new\s*inquiry|start\s*fresh)\s*$/i.test(userMessage.trim())) {
+        clearWorkingMemory(actor);
+        await aiStore.clearChatHistory(actor);
+        return {
+            reply: '🧠 Conversational working memory and chat history have been cleared. Ready for your next inquiry!',
+            pendingAction: null,
+            usage: { prompt_tokens: 0, completion_tokens: 0 },
+            activeMemory: null
+        };
     }
 
     // Kill switch + daily cap
     const enabled = await Settings.get('ai_admin_copilot_enabled', 'true');
     if (String(enabled) === 'false') {
-        return { reply: 'The AI copilot is currently disabled in settings.', pendingAction: null, usage: null };
+        return { reply: 'The AI copilot is currently disabled in settings.', pendingAction: null, usage: null, activeMemory: null };
     }
     const dailyLimit = parseInt(await Settings.get('ai_daily_admin_limit', process.env.AI_DAILY_ADMIN_LIMIT || '200')) || 200;
     const usedToday = await aiStore.getTodayUsageCount(actor, 'chat');
     if (usedToday >= dailyLimit) {
-        return { reply: `AI daily limit reached (${dailyLimit} requests). Try again tomorrow or raise the limit in settings.`, pendingAction: null, usage: null };
+        return { reply: `AI daily limit reached (${dailyLimit} requests). Try again tomorrow or raise the limit in settings.`, pendingAction: null, usage: null, activeMemory: null };
     }
 
+    // 1. Extract newly mentioned entities from user message and update working memory
+    const userEntities = extractEntities(userMessage);
+    if (Object.keys(userEntities).length > 0) {
+        updateWorkingMemory(actor, userEntities);
+    }
+    let currentMemory = getWorkingMemory(actor);
+
+    // 2. Fetch history and apply hierarchical rolling context compression
     const history = await aiStore.getChatHistory(actor);
-    const budget = MAX_INPUT_TOKENS - estimateTokens(SYSTEM_PROMPT) - estimateTokens(userMessage) - 1000; // reserve for tool schemas
-    const recentHistory = truncateHistory(history, Math.max(budget, 1000));
+    const { summary: historySummary, recentTurns } = compressConversationHistory(history, 6);
+    if (historySummary) {
+        currentMemory = updateWorkingMemory(actor, { summary: historySummary });
+    }
+
+    // 3. Construct active system prompt injected with live conversational working memory
+    const memoryPrompt = buildMemoryPrompt(actor);
+    const activeSystemPrompt = memoryPrompt
+        ? `${SYSTEM_PROMPT}\n\n${memoryPrompt}`
+        : SYSTEM_PROMPT;
+
+    const budget = MAX_INPUT_TOKENS - estimateTokens(activeSystemPrompt) - estimateTokens(userMessage) - 1000; // reserve for tool schemas
+    const recentHistory = truncateHistory(recentTurns, Math.max(budget, 1000));
     const messages = [
-        { role: 'system', content: SYSTEM_PROMPT },
+        { role: 'system', content: activeSystemPrompt },
         ...recentHistory,
         { role: 'user', content: userMessage }
     ];
 
-    // Route: only send tool schemas relevant to the question (+ recent context),
-    // instead of all 14 schemas on every round — the single biggest token saver.
-    const routingContext = `${recentHistory.slice(-4).map(h => h.content).join('\n')}\n${userMessage}`;
+    // 4. Memory-smart tool schema selection: Include active entity keywords so follow-ups route accurately
+    const memoryKeywords = [
+        currentMemory.orderId ? `order #${currentMemory.orderId}` : '',
+        currentMemory.phone || '',
+        currentMemory.customerName || '',
+        currentMemory.ticketNumber || '',
+        currentMemory.sku || '',
+        currentMemory.subject || ''
+    ].filter(Boolean).join(' ');
+
+    const routingContext = `${recentHistory.slice(-4).map(h => h.content).join('\n')}\n${memoryKeywords}\n${userMessage}`;
     const toolSchemas = selectToolSchemas(routingContext);
     const usageTotal = { prompt_tokens: 0, completion_tokens: 0 };
     const toolCallLog = [];
@@ -426,6 +492,9 @@ async function runAgent({ actor, userMessage }) {
                 args = JSON.parse(call.function?.arguments || '{}');
             } catch { /* keep {} */ }
 
+            // Autofill missing arguments from active working memory (resolves "it", "they", "this order")
+            args = autoFillToolArgs(name, args, currentMemory);
+
             const tool = getTool(name);
             let resultJson;
 
@@ -446,6 +515,11 @@ async function runAgent({ actor, userMessage }) {
             } else {
                 try {
                     const result = await tool.execute(args, { actor });
+                    // Learn new entities from tool results to enrich working memory
+                    const learnedEntities = extractEntitiesFromToolResult(name, result);
+                    if (Object.keys(learnedEntities).length > 0) {
+                        currentMemory = updateWorkingMemory(actor, learnedEntities);
+                    }
                     resultJson = clampToolResult(result);
                     toolCallLog.push({ tool: name });
                 } catch (e) {
@@ -481,7 +555,7 @@ async function runAgent({ actor, userMessage }) {
         toolCalls: toolCallLog
     });
 
-    return { reply, pendingAction, usage: usageTotal };
+    return { reply, pendingAction, usage: usageTotal, activeMemory: getWorkingMemory(actor) };
 }
 
 /**

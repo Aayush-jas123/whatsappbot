@@ -5302,7 +5302,7 @@ router.post('/ai/chat', verifyToken, async (req, res) => {
             actor: req.admin?.username || 'admin',
             userMessage: String(message).trim().substring(0, 4000)
         });
-        res.json({ success: true, reply: result.reply, pendingAction: result.pendingAction, usage: result.usage });
+        res.json({ success: true, reply: result.reply, pendingAction: result.pendingAction, usage: result.usage, activeMemory: result.activeMemory });
     } catch (error) {
         console.error('AI chat error:', error.message);
         const friendly = ['AI_RATE_LIMIT', 'AI_UNAVAILABLE'].includes(error.code)
@@ -5405,15 +5405,31 @@ router.post('/ai/clear-history', verifyToken, async (req, res) => {
     }
 });
 
-// Load copilot chat history (for panel restore on reload)
+// Load copilot chat history and active working memory (for panel restore on reload)
 router.get('/ai/history', verifyToken, async (req, res) => {
     try {
         const aiStore = require('../services/ai/aiStore');
+        const { getWorkingMemory } = require('../services/ai/aiMemoryService');
         const history = await aiStore.getChatHistory(req.admin?.username || 'admin');
-        res.json({ success: true, history: history || [] });
+        const activeMemory = getWorkingMemory(req.admin?.username || 'admin');
+        res.json({ success: true, history: history || [], activeMemory });
     } catch (error) {
         console.warn('AI history load error:', error.message);
-        res.json({ success: true, history: [] });
+        res.json({ success: true, history: [], activeMemory: null });
+    }
+});
+
+// Clear working memory & chat history
+router.post('/ai/memory/clear', verifyToken, async (req, res) => {
+    try {
+        const { clearWorkingMemory } = require('../services/ai/aiMemoryService');
+        const aiStore = require('../services/ai/aiStore');
+        clearWorkingMemory(req.admin?.username || 'admin');
+        await aiStore.clearChatHistory(req.admin?.username || 'admin');
+        res.json({ success: true, message: 'Memory cleared successfully' });
+    } catch (error) {
+        console.error('AI clear memory error:', error.message);
+        res.status(500).json({ success: false, error: error.message });
     }
 });
 

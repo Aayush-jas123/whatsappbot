@@ -47,6 +47,13 @@
     .quick-chip { white-space: nowrap; padding: 6px 14px; border-radius: 20px; border: 1px solid var(--border); background: var(--bg-input); color: var(--text-secondary); font-size: 12px; cursor: pointer; flex-shrink: 0; }
     .quick-chip:hover { background: var(--accent-bg); color: var(--accent-hover); border-color: var(--accent); }
 
+    /* Smart Working Memory Bar */
+    .chat-memory-bar { padding: 6px 20px; display: flex; align-items: center; justify-content: space-between; background: rgba(99, 102, 241, 0.08); border-top: 1px solid rgba(99, 102, 241, 0.25); font-size: 11.5px; color: #a5b4fc; }
+    .chat-memory-content { display: flex; align-items: center; gap: 6px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .chat-memory-content b { color: #818cf8; font-weight: 600; }
+    .chat-memory-clear { background: none; border: 1px solid rgba(99, 102, 241, 0.3); color: #c7d2fe; font-size: 11px; padding: 2px 8px; border-radius: 12px; cursor: pointer; flex-shrink: 0; transition: all .15s; }
+    .chat-memory-clear:hover { background: rgba(239, 68, 68, 0.2); color: #fca5a5; border-color: rgba(239, 68, 68, 0.4); }
+
     /* Input area */
     .chat-input-area { display: flex; gap: 10px; padding: 16px 20px; border-top: 1px solid var(--border); background: var(--bg-secondary); align-items: flex-end; }
     .chat-input-area textarea { flex: 1; resize: none; border: 1px solid var(--border); border-radius: var(--radius); padding: 10px 14px; font-size: 13.5px; background: var(--bg-input); color: var(--text-primary); outline: none; max-height: 120px; min-height: 44px; line-height: 1.4; }
@@ -60,63 +67,28 @@
     .chat-save-btn { align-self: flex-end; background: none; border: 1px solid var(--border); color: var(--text-muted); font-size: 11px; padding: 4px 10px; border-radius: 12px; cursor: pointer; margin-top: -4px; }
     .chat-save-btn:hover { color: var(--accent-hover); border-color: var(--accent); }
 
-    /* Markdown elements & Typography */
-    .chat-msg strong { color: #ffffff; font-weight: 600; }
-    .chat-msg em { color: var(--text-secondary); font-style: italic; }
-    .chat-code { font-size: 11.5px; background: rgba(255,255,255,0.08); padding: 2px 6px; border-radius: 4px; font-family: monospace; color: #38bdf8; }
-    .chat-list-item { padding-left: 4px; margin: 3px 0; line-height: 1.5; }
-    .chat-list-item .list-num { font-weight: 600; color: var(--accent-hover); margin-right: 4px; }
-    .chat-paragraph-gap { height: 6px; }
+    /* Enhanced Markdown / Live Data Styling */
+    .chat-msg.assistant strong { font-weight: 700; color: #f8fafc; }
+    .chat-msg.assistant em { font-style: italic; color: #cbd5e1; }
+    .chat-msg.assistant ul { margin: 6px 0 6px 18px; padding: 0; list-style-type: disc; }
+    .chat-msg.assistant li { margin-bottom: 4px; }
+    .chat-msg.assistant p { margin: 6px 0; }
+    .chat-msg.assistant code { background: rgba(0,0,0,0.25); padding: 2px 6px; border-radius: 4px; font-family: monospace; font-size: 12px; color: #38bdf8; }
 
-    /* Modern Timestamp & Denominator Footer Pills */
-    .chat-meta-footer { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 10px; padding-top: 8px; border-top: 1px dashed rgba(255,255,255,0.1); }
-    .chat-meta-pill {
-        display: inline-flex;
-        align-items: center;
-        gap: 6px;
-        background: rgba(99, 102, 241, 0.12);
-        border: 1px solid rgba(99, 102, 241, 0.28);
-        color: #c7d2fe;
-        font-size: 11px;
-        font-weight: 500;
-        padding: 4px 10px;
-        border-radius: 20px;
-    }
-    .chat-meta-pill svg { color: #818cf8; flex-shrink: 0; }
-    .chat-meta-pill .meta-dot { width: 5px; height: 5px; border-radius: 50%; background: #22c55e; }
-    .chat-meta-pill .meta-tag { color: #22c55e; font-weight: 600; font-size: 10px; text-transform: uppercase; }
+    /* Modern live metadata pills */
+    .chat-meta-footer { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 10px; padding-top: 8px; border-top: 1px solid rgba(255,255,255,0.08); font-size: 11px; }
+    .chat-meta-pill { display: inline-flex; align-items: center; gap: 5px; padding: 3px 9px; border-radius: 12px; background: rgba(99, 102, 241, 0.12); color: #818cf8; border: 1px solid rgba(99, 102, 241, 0.25); font-weight: 500; }
+    .chat-meta-pill.live-db { background: rgba(34, 197, 94, 0.12); color: #4ade80; border-color: rgba(34, 197, 94, 0.25); }
+    .chat-meta-pill.denominator { background: rgba(245, 158, 11, 0.12); color: #fbbf24; border-color: rgba(245, 158, 11, 0.25); }
 
-    .chat-denom-pill {
-        display: inline-flex;
-        align-items: center;
-        gap: 6px;
-        background: rgba(255, 255, 255, 0.05);
-        border: 1px solid var(--border);
-        color: var(--text-secondary);
-        font-size: 11px;
-        padding: 4px 10px;
-        border-radius: 20px;
-    }
-    .chat-denom-pill svg { color: var(--text-muted); flex-shrink: 0; }
-
-    /* Phase 14 8-tier Classification Badges */
-    .tier-badge {
-        display: inline-flex;
-        align-items: center;
-        font-size: 10px;
-        font-weight: 700;
-        letter-spacing: 0.02em;
-        padding: 2px 7px;
-        border-radius: 4px;
-        margin: 0 4px 2px 0;
-        vertical-align: middle;
-    }
-    .tier-verified { background: rgba(34, 197, 94, 0.15); color: #4ade80; border: 1px solid rgba(34, 197, 94, 0.3); }
-    .tier-policy { background: rgba(56, 189, 248, 0.15); color: #38bdf8; border: 1px solid rgba(56, 189, 248, 0.3); }
-    .tier-pattern { background: rgba(251, 191, 36, 0.15); color: #fbbf24; border: 1px solid rgba(251, 191, 36, 0.3); }
-    .tier-anomaly { background: rgba(239, 68, 68, 0.15); color: #f87171; border: 1px solid rgba(239, 68, 68, 0.3); }
-    .tier-inference { background: rgba(168, 85, 247, 0.15); color: #c084fc; border: 1px solid rgba(168, 85, 247, 0.3); }
-    .tier-recommendation { background: rgba(20, 184, 166, 0.15); color: #2dd4bf; border: 1px solid rgba(20, 184, 166, 0.3); }
+    /* Phase 14 Categorization Badges */
+    .badge-tier { display: inline-block; font-size: 10px; font-weight: 700; padding: 2px 6px; border-radius: 4px; text-transform: uppercase; margin-right: 4px; vertical-align: middle; letter-spacing: 0.5px; }
+    .badge-verified-fact { background: #059669; color: #ffffff; }
+    .badge-policy { background: #0284c7; color: #ffffff; }
+    .badge-pattern { background: #7c3aed; color: #ffffff; }
+    .badge-anomaly { background: #dc2626; color: #ffffff; }
+    .badge-recommendation { background: #d97706; color: #ffffff; }
+    .badge-inference { background: #475569; color: #ffffff; }
     `;
     document.head.appendChild(style);
 
@@ -127,6 +99,10 @@
         <div class="chat-layout">
             <div class="chat-messages" id="chatMessages">
                 <div class="chat-msg system">Welcome to AI Copilot Pro. I can look up customers, orders, tickets, shipments, run analytics, and perform actions — all with your confirmation.</div>
+            </div>
+            <div class="chat-memory-bar" id="chatMemoryBar" style="display:none;">
+                <div class="chat-memory-content" id="chatMemoryContent"></div>
+                <button class="chat-memory-clear" id="chatMemoryClear" title="Clear conversational memory and start a fresh inquiry">× Forget Context</button>
             </div>
             <div class="chat-quick-bar" id="chatQuickBar">
                 <button class="quick-chip" data-prompt="Show me open support tickets today">Open tickets today</button>
@@ -155,6 +131,13 @@
                 sendMessage();
             });
         });
+        const memClear = document.getElementById('chatMemoryClear');
+        if (memClear) {
+            memClear.addEventListener('click', () => {
+                document.getElementById('chatInput').value = 'clear memory';
+                sendMessage();
+            });
+        }
     }
 
     // ── Message rendering ──
@@ -303,6 +286,11 @@
             if (typing) typing.remove();
             addMsg('assistant', data.reply || 'Done.');
             if (data.pendingAction && data.pendingAction.id) addConfirmCard(data.pendingAction);
+            if (data.activeMemory) {
+                updateMemoryBar(data.activeMemory);
+            } else if (/clear\s*memory|forget/i.test(text)) {
+                updateMemoryBar(null);
+            }
             // Add save-to-training button on last assistant message
             addSaveBtn(data.reply);
         } catch (e) {
@@ -313,6 +301,28 @@
             document.getElementById('chatSendBtn').disabled = false;
             input.focus();
         }
+    }
+
+    function updateMemoryBar(mem) {
+        const bar = document.getElementById('chatMemoryBar');
+        const content = document.getElementById('chatMemoryContent');
+        if (!bar || !content) return;
+
+        if (!mem || (!mem.orderId && !mem.phone && !mem.customerName && !mem.ticketNumber && !mem.sku)) {
+            bar.style.display = 'none';
+            return;
+        }
+
+        const pills = [];
+        if (mem.orderId) pills.push(`Order <b>#${escapeHtml(mem.orderId)}</b>`);
+        if (mem.customerName) pills.push(`<b>${escapeHtml(mem.customerName)}</b>`);
+        if (mem.phone) pills.push(`+91 ${escapeHtml(mem.phone)}`);
+        if (mem.ticketNumber) pills.push(`Ticket <b>#${escapeHtml(mem.ticketNumber)}</b>`);
+        if (mem.sku) pills.push(`SKU: <b>${escapeHtml(mem.sku)}</b>`);
+        if (mem.subject) pills.push(`Focus: ${escapeHtml(mem.subject)}`);
+
+        content.innerHTML = `🧠 <b>Active Context:</b> ${pills.join(' <span style="opacity:0.35;margin:0 2px;">•</span> ')}`;
+        bar.style.display = 'flex';
     }
 
     function addSaveBtn(replyText) {
@@ -346,6 +356,7 @@
             (data.history || []).forEach(turn => {
                 if (turn.role === 'user' || turn.role === 'assistant') addMsg(turn.role, turn.content);
             });
+            if (data.activeMemory) updateMemoryBar(data.activeMemory);
         } catch (e) { /* optional */ }
     }
 

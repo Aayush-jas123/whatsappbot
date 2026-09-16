@@ -31,10 +31,47 @@
 | 19 | Delivery Anomaly Detection | ✅ Complete (Localhost) | 2026-09-09 | 9 / 9 tests passed (Live Verified) |
 | 20 | Customer Complaint Pattern Detection | ✅ Complete (Localhost) | 2026-09-09 | 10 / 10 tests passed (Live Verified) |
 | 21 | Return and Exchange Analytics | ✅ Complete (Localhost) | 2026-09-09 | 20 / 20 tests passed (Live Verified) |
+| 22 | Smart Conversational Memory & Entity Context | ✅ Complete (Localhost) | 2026-09-16 | 11 / 11 tests passed (Live Verified) |
 
 ---
 
 ## Detailed Entries
+
+### Requirement 22: Smart Conversational Memory, Entity Context & In-Memory Acceleration
+
+- **Goal**: Upgrade the AI Copilot to maintain active working memory across conversational turns, automatically resolve anaphoric entity references (such as orders, phones, tickets, and SKUs), auto-fill tool arguments, compress historical turns to prevent context blowup, and accelerate conversation loading by caching chat history in-memory.
+- **Why**:
+  1. Officers frequently ask natural follow-up questions (e.g. "Can they exchange it for size L?" or "Check their payment status") after investigating an order or customer without re-typing order numbers or phone numbers.
+  2. Sequential PostgreSQL queries (`SELECT role, content FROM ai_chat_history`) on every turn incurred 500ms–800ms of latency per message.
+  3. Long multi-turn conversations overflow LLM context windows or degrade attention, requiring intelligent sliding-window context compression.
+  4. Officers need full visibility into what the Copilot currently "remembers" with the ability to clear or reset context instantly.
+- **Key Capabilities Implemented**:
+  1. **Working Memory Cache**: In-memory LRU cache (`LRUCache(100, 30min)`) maintaining active entities per officer:
+     - `orderId`: Last referenced order ID (e.g. `50992`, `#51209`).
+     - `phone`: Customer phone number (10-digit Indian mobile `[6-9]\d{9}`).
+     - `customerName` & `customerEmail`: Customer identifiers.
+     - `ticketNumber`: Support ticket number (e.g. `TKT-260909-1770`).
+     - `sku`: Product SKU (e.g. `OC-TS-BLK-L`).
+     - `subject`: Active conversational topic (e.g. `Exchange Request`, `Refund Delay`).
+  2. **Multi-Source Entity Extraction**: Extracts entities both from user messages (`extractEntities`) and dynamically from tool execution results (`extractEntitiesFromToolResult`), ensuring entities discovered by tools automatically update the working memory.
+  3. **Automatic Tool Argument Auto-Filling**: `autoFillToolArgs(toolName, args, memory)` automatically binds missing `orderId`, `phone`, or `customerIdentifier` parameters when executing tools in follow-up queries.
+  4. **System Prompt Injection**: Injects `[CONVERSATION WORKING MEMORY]` and `[HISTORICAL CONVERSATION RECAP]` into system prompts so the LLM has exact awareness of the active entity context.
+  5. **Hierarchical Context Compression**: `compressConversationHistory(history, maxRawTurns=6)` retains the last 6 turns verbatim and compiles older turns into concise bullet points, preventing token window exhaustion.
+  6. **Chat History LRU Cache**: In-memory write-through cache in `aiStore.js` (`LRUCache(50, 10min)`) reducing history retrieval latency from ~640ms to <1ms.
+  7. **Safe JSON Compaction**: Enhanced `clampToolResult` to compress JSON arrays and preserve valid JSON envelopes, eliminating syntax errors from raw string truncation.
+  8. **Dashboard UI Integration**: Added active memory status chip (`🧠 Active Context: Order #50992 • Grishma`) in `ai-copilot.html` with a 1-click `× Forget Context` action and conversational reset triggers (`/clear memory`, `/reset context`).
+- **Changes Made**:
+  1. **New Service**: [`src/services/ai/aiMemoryService.js`](file:///d:/offcom/src/services/ai/aiMemoryService.js)
+  2. **Store Acceleration**: [`src/services/ai/aiStore.js`](file:///d:/offcom/src/services/ai/aiStore.js)
+  3. **Brain & Agent Integration**: [`src/services/ai/agent.js`](file:///d:/offcom/src/services/ai/agent.js)
+  4. **Admin Endpoints**: [`src/routes/adminRoutes.js`](file:///d:/offcom/src/routes/adminRoutes.js) (`/api/admin/ai/memory/clear`, `activeMemory` in `/chat` and `/history`)
+  5. **Frontend UI**: [`public/dashboard/ai-copilot.html`](file:///d:/offcom/public/dashboard/ai-copilot.html) & [`public/dashboard/js/ai-copilot-pro/chat.js`](file:///d:/offcom/public/dashboard/js/ai-copilot-pro/chat.js)
+  6. **Automated Test Suite**: [`test/test_ai_memory_smart.js`](file:///d:/offcom/test/test_ai_memory_smart.js) (11 tests passed)
+- **Verification Results**:
+  - `node test/test_ai_memory_smart.js`: **11 passed, 0 failed**
+  - Live AI Copilot multi-turn anaphora test with `runAgent`: **Verified successfully**
+
+---
 
 ### Requirement 21: Return and Exchange Analytics
 
@@ -501,7 +538,7 @@
 
 ---
 
-## Files Modified / Created Across Requirements 1 to 21
+## Files Modified / Created Across Requirements 1 to 22
 
 ### Backend Services
 - `src/services/orderIntelligenceService.js` *(NEW - Req 1)*
@@ -525,21 +562,23 @@
 - `src/services/deliveryAnomalyService.js` *(NEW - Req 19)*
 - `src/services/complaintPatternService.js` *(NEW - Req 20)*
 - `src/services/returnAnalyticsService.js` *(NEW - Req 21)*
+- `src/services/ai/aiMemoryService.js` *(NEW - Req 22: Working Memory, Entity Extraction & Compression)*
 
 ### AI Integration & Routes
 - `src/services/ai/tools.js` *(MODIFIED - 48 specialized tools + PostgreSQL fallback)*
-- `src/services/ai/agent.js` *(MODIFIED - System prompt with Phase 14 demarcation)*
+- `src/services/ai/agent.js` *(MODIFIED - System prompt, active memory injection, tool argument auto-filling, safe JSON truncation)*
+- `src/services/ai/aiStore.js` *(MODIFIED - High-speed in-memory LRU chat history cache)*
 - `src/database/db.js` *(MODIFIED - Optimized query pool & cache integration)*
-- `src/routes/adminRoutes.js` *(MODIFIED - AI chat & usage metrics)*
+- `src/routes/adminRoutes.js` *(MODIFIED - AI chat with active memory, clear memory endpoint)*
 
 ### Frontend & UI
-- `public/dashboard/ai-copilot.html` *(MODIFIED - Cache-busting & UI enhancements)*
+- `public/dashboard/ai-copilot.html` *(MODIFIED - Active memory chip & forget context button, cache-busting v=3)*
 - `public/dashboard/index.html` *(MODIFIED - Script version bump)*
-- `public/dashboard/js/ai-copilot-pro/chat.js` *(MODIFIED - Markdown bold/italic parser, IST metadata pills, denominator chips, tier badges)*
+- `public/dashboard/js/ai-copilot-pro/chat.js` *(MODIFIED - Active memory pill rendering, forget context action, Markdown bold/italic parser, IST metadata pills, denominator chips, tier badges)*
 - `public/dashboard/js/ai-copilot.js` *(MODIFIED - Rich markdown parser & badge pills)*
 
-### Regression Test Suites (All 11 Suites / 340 Tests Passing)
-- `test/run_all_tests.js` *(NEW - Master test runner across Reqs 1-21)*
+### Regression Test Suites (All 12 Suites / 351 Tests Passing)
+- `test/run_all_tests.js` *(NEW - Master test runner across Reqs 1-22)*
 - `test/test_order_intelligence.js` *(NEW - 47 tests)*
 - `test/test_customer_360.js` *(NEW - 36 tests)*
 - `test/test_conversation_history.js` *(NEW - 24 tests)*
@@ -551,6 +590,7 @@
 - `test/test_refunds_payments_shipments.js` *(NEW - 50 tests)*
 - `test/test_rto_courier_pickup_anomaly_complaints.js` *(NEW - 50 tests)*
 - `test/test_return_exchange_analytics.js` *(NEW - 20 tests)*
+- `test/test_ai_memory_smart.js` *(NEW - 11 tests)*
 - `COPILOT_CHANGELOG.md` *(UPDATED)*
 
 ---

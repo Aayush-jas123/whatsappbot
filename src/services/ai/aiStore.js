@@ -60,17 +60,33 @@ async function cancelPendingAction(id, actor) {
     return { ok: true };
 }
 
-// ---------- Chat history ----------
+// ---------- Chat history with LRU In-Memory Acceleration ----------
+const { chatHistoryCache } = require('./aiMemoryService');
 
 async function getChatHistory(actor) {
+    const cached = chatHistoryCache.get(actor);
+    if (cached) return [...cached];
+
     const rows = await dbAdapter.query(
         'SELECT role, content FROM ai_chat_history WHERE actor = ? ORDER BY id DESC LIMIT ?',
         [actor, HISTORY_MAX_TURNS]
     );
-    return rows.reverse().map(r => ({ role: r.role, content: r.content }));
+    const history = rows.reverse().map(r => ({ role: r.role, content: r.content }));
+    chatHistoryCache.set(actor, history);
+    return history;
 }
 
 async function appendChatHistory(actor, role, content) {
+    // Update in-memory cache immediately for sub-millisecond turn latency
+    let history = chatHistoryCache.get(actor);
+    if (history) {
+        history.push({ role, content });
+        if (history.length > HISTORY_MAX_TURNS) {
+            history.shift();
+        }
+        chatHistoryCache.set(actor, history);
+    }
+
     await dbAdapter.insert('ai_chat_history', {
         actor,
         role,
@@ -90,6 +106,7 @@ async function pruneChatHistory(actor) {
 }
 
 async function clearChatHistory(actor) {
+    chatHistoryCache.delete(actor);
     await dbAdapter.run('DELETE FROM ai_chat_history WHERE actor = ?', [actor]);
 }
 
