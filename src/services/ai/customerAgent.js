@@ -188,7 +188,7 @@ RULES:
 - Never invent order numbers, tracking data, or policies. If unsure, say so.
 - Amounts are in INR. Times are in IST (UTC+5:30).
 - When creating a ticket, ask for the customer's name, phone number, and a brief description of their issue.
-- Keep responses SHORT and conversational — this is a chat widget, not an email. Aim for 1-2 sentences per reply. One short paragraph max. Never use more than 3 sentences. Get straight to the point, skip filler phrases like "I've checked" or "It appears that". If the answer is simple, say it in one line.`;
+- Keep responses SHORT and conversational — this is a chat widget, not an email. Aim for 2-3 sentences, up to 5 if the answer genuinely needs it. One short paragraph max. Get straight to the point, skip filler phrases like "I've checked" or "It appears that". If the answer is simple, say it in one line.`;
 }
 
 // ---------- Customer tool set ----------
@@ -303,7 +303,7 @@ async function runCustomerAgent({ sessionId, message, visitorId }) {
         const { message: aiMessage, usage, model } = await chatCompletion({
             messages,
             tools: toolSchemas.length ? toolSchemas : undefined,
-            maxTokens: 256,
+            maxTokens: 400,
             temperature: 0.4
         });
 
