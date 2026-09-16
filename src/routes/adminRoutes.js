@@ -1618,9 +1618,15 @@ router.get('/support-tickets', verifyToken, async (req, res) => {
         // they feed the "urgent" stat card, and filter the list only when urgent_filter=1
         const urgentActive = urgent_filter === '1' || urgent_filter === 'true';
         let urgentClause = null;
+        let urgentClauseLiteral = null; // for FILTER() in stats SQL — uses escaped literals, not ?
         const urgentParams = urgentKeywords.map(k => `%${k}%`);
         if (urgentKeywords.length) {
             urgentClause = '(' + urgentKeywords.map(() => 'message ILIKE ?').join(' OR ') + ')';
+            // Build a literal version for the FILTER clause (no ? placeholders)
+            urgentClauseLiteral = '(' + urgentKeywords.map(k => {
+                const escaped = String(k).replace(/'/g, "''").replace(/\\/g, '\\\\');
+                return `message ILIKE '%${escaped}%'`;
+            }).join(' OR ') + ')';
             if (urgentActive) {
                 conditions.push(urgentClause);
                 params.push(...urgentParams);
@@ -1640,16 +1646,17 @@ router.get('/support-tickets', verifyToken, async (req, res) => {
             LIMIT ? OFFSET ?`;
 
         // Stat cards in one aggregation scan over the same filtered set
+        // Uses urgentClauseLiteral (escaped literals, no ? placeholders) in FILTER
         const statsSql = `SELECT COUNT(*)::int AS total,
                 COUNT(*) FILTER (WHERE is_read = false)::int AS unread,
                 COUNT(*) FILTER (WHERE status = 'open')::int AS open,
                 COUNT(*) FILTER (WHERE status = 'resolved')::int AS resolved,
-                COUNT(*) FILTER (WHERE ${urgentClause || 'false'})::int AS urgent
+                COUNT(*) FILTER (WHERE ${urgentClauseLiteral || 'false'})::int AS urgent
             FROM support_tickets${whereSql}`;
 
         let tickets;
         let statsRow;
-        const statsParams = urgentClause ? [...params, ...urgentParams] : params;
+        const statsParams = [...params]; // no extra urgent params needed — literal clause used in FILTER
         try {
             const [dataRows, statsRows] = await Promise.all([
                 dbAdapter.query(buildDataSql(true), [...params, limit, offset]),
@@ -4980,7 +4987,18 @@ router.get('/support-analytics/ai-overview', verifyToken, async (req, res) => {
             channelStats,
             sentimentStats,
             dailyVolume,
-            scenarioStats
+            scenarioStats,
+            // ── NEW: deep-dive queries ──
+            hourlyPattern,
+            channelSentiment,
+            portalPerformance,
+            confidenceDist,
+            resolutionTrend,
+            todayStats,
+            avgResponseTime,
+            peakDayStats,
+            channelResolution,
+            escalationByChannel
         ] = await Promise.all([
             // Overall ticket stats
             dbAdapter.query(`SELECT
@@ -4990,7 +5008,9 @@ router.get('/support-analytics/ai-overview', verifyToken, async (req, res) => {
                 COUNT(*) FILTER (WHERE is_read = false)::int AS unread,
                 COUNT(*) FILTER (WHERE sentiment = 'negative')::int AS negative,
                 COUNT(*) FILTER (WHERE sentiment = 'positive')::int AS positive,
-                COUNT(*) FILTER (WHERE sentiment = 'neutral')::int AS neutral
+                COUNT(*) FILTER (WHERE sentiment = 'neutral')::int AS neutral,
+                COUNT(*) FILTER (WHERE ai_scenario IS NOT NULL)::int AS ai_classified,
+                COUNT(*) FILTER (WHERE portal_id IS NOT NULL)::int AS portal_assigned
             FROM support_tickets`),
 
             // Channel breakdown
@@ -5011,12 +5031,127 @@ router.get('/support-analytics/ai-overview', verifyToken, async (req, res) => {
             ORDER BY day ASC`),
 
             // AI scenario breakdown
-            dbAdapter.query(`SELECT ai_scenario, COUNT(*)::int AS count
-                FROM support_tickets WHERE ai_scenario IS NOT NULL GROUP BY ai_scenario ORDER BY count DESC LIMIT 10`)
+            dbAdapter.query(`SELECT ai_scenario, COUNT(*)::int AS count,
+                ROUND(AVG(ai_confidence)::numeric, 2)::float AS avg_confidence
+                FROM support_tickets WHERE ai_scenario IS NOT NULL GROUP BY ai_scenario ORDER BY count DESC LIMIT 15`),
+
+            // ── NEW: Hourly distribution (0-23h IST) ──
+            dbAdapter.query(`SELECT
+                EXTRACT(HOUR FROM created_at AT TIME ZONE 'UTC' AT TIME ZONE 'Asia/Kolkata')::int AS hour,
+                COUNT(*)::int AS count
+            FROM support_tickets
+            GROUP BY EXTRACT(HOUR FROM created_at AT TIME ZONE 'UTC' AT TIME ZONE 'Asia/Kolkata')
+            ORDER BY hour ASC`),
+
+            // ── NEW: Channel × Sentiment cross-tab ──
+            dbAdapter.query(`SELECT
+                channel,
+                sentiment,
+                COUNT(*)::int AS count
+            FROM support_tickets
+            WHERE channel IS NOT NULL AND sentiment IS NOT NULL
+            GROUP BY channel, sentiment
+            ORDER BY channel, count DESC`),
+
+            // ── NEW: Portal performance (assigned count, resolved count) ──
+            dbAdapter.query(`SELECT
+                p.name AS portal_name,
+                COUNT(t.id)::int AS assigned,
+                COUNT(t.id) FILTER (WHERE t.status = 'resolved')::int AS resolved,
+                COUNT(t.id) FILTER (WHERE t.status = 'open')::int AS open_count,
+                COUNT(t.id) FILTER (WHERE t.is_read = false)::int AS unread
+            FROM support_portals p
+            LEFT JOIN support_tickets t ON t.portal_id = p.id
+            GROUP BY p.id, p.name
+            ORDER BY assigned DESC`),
+
+            // ── NEW: AI confidence distribution ──
+            dbAdapter.query(`SELECT
+                CASE
+                    WHEN ai_confidence >= 0.8 THEN 'high'
+                    WHEN ai_confidence >= 0.5 THEN 'medium'
+                    WHEN ai_confidence > 0 THEN 'low'
+                    ELSE 'none'
+                END AS tier,
+                COUNT(*)::int AS count
+            FROM support_tickets
+            GROUP BY tier
+            ORDER BY tier ASC`),
+
+            // ── NEW: Resolution trend (last 7 days) ──
+            dbAdapter.query(`SELECT
+                TO_CHAR(DATE(updated_at AT TIME ZONE 'UTC' AT TIME ZONE 'Asia/Kolkata'), 'YYYY-MM-DD') AS day,
+                COUNT(*) FILTER (WHERE status = 'resolved')::int AS resolved,
+                COUNT(*)::int AS total
+            FROM support_tickets
+            WHERE updated_at >= NOW() - INTERVAL '7 days'
+            GROUP BY DATE(updated_at AT TIME ZONE 'UTC' AT TIME ZONE 'Asia/Kolkata')
+            ORDER BY day ASC`),
+
+            // ── NEW: Today's stats ──
+            dbAdapter.query(`SELECT
+                COUNT(*)::int AS today_total,
+                COUNT(*) FILTER (WHERE status = 'open')::int AS today_open,
+                COUNT(*) FILTER (WHERE status = 'resolved')::int AS today_resolved,
+                COUNT(*) FILTER (WHERE sentiment = 'negative')::int AS today_negative
+            FROM support_tickets
+            WHERE created_at >= (NOW() AT TIME ZONE 'Asia/Kolkata')::date AT TIME ZONE 'Asia/Kolkata'`),
+
+            // ── NEW: Average response time (time from creation to first agent reply) ──
+            dbAdapter.query(`SELECT
+                ROUND(AVG(EXTRACT(EPOCH FROM (updated_at - created_at)))::numeric, 0)::int AS avg_seconds
+            FROM support_tickets
+            WHERE status = 'resolved' AND updated_at > created_at`),
+
+            // ── NEW: Peak day (highest volume day in last 14 days) ──
+            dbAdapter.query(`SELECT
+                TO_CHAR(DATE(created_at AT TIME ZONE 'UTC' AT TIME ZONE 'Asia/Kolkata'), 'YYYY-MM-DD') AS day,
+                COUNT(*)::int AS count
+            FROM support_tickets
+            WHERE created_at >= NOW() - INTERVAL '14 days'
+            GROUP BY DATE(created_at AT TIME ZONE 'UTC' AT TIME ZONE 'Asia/Kolkata')
+            ORDER BY count DESC LIMIT 1`),
+
+            // ── NEW: Channel resolution rate ──
+            dbAdapter.query(`SELECT
+                channel,
+                COUNT(*)::int AS total,
+                COUNT(*) FILTER (WHERE status = 'resolved')::int AS resolved,
+                COUNT(*) FILTER (WHERE status = 'open')::int AS open_count
+            FROM support_tickets
+            WHERE channel IS NOT NULL
+            GROUP BY channel
+            ORDER BY total DESC`),
+
+            // ── NEW: Escalation rate by channel (% that went to human) ──
+            dbAdapter.query(`SELECT
+                channel,
+                COUNT(*)::int AS total,
+                COUNT(*) FILTER (WHERE portal_id IS NOT NULL)::int AS escalated,
+                COUNT(*) FILTER (WHERE portal_id IS NULL)::int AS self_served
+            FROM support_tickets
+            WHERE channel IS NOT NULL
+            GROUP BY channel
+            ORDER BY total DESC`)
         ]);
 
         const stats = totalStats[0] || {};
         const resolutionRate = stats.total > 0 ? Math.round((stats.resolved / stats.total) * 100) : 0;
+        const today = todayStats[0] || {};
+        const peak = peakDayStats[0] || {};
+        const avgResp = avgResponseTime[0] || {};
+
+        // Format avg response time
+        let avgResponseFormatted = null;
+        if (avgResp.avg_seconds) {
+            const hrs = Math.floor(avgResp.avg_seconds / 3600);
+            const mins = Math.round((avgResp.avg_seconds % 3600) / 60);
+            avgResponseFormatted = hrs > 0 ? `${hrs}h ${mins}m` : `${mins}m`;
+        }
+
+        // Find peak hour
+        const hourlyArr = hourlyPattern || [];
+        const peakHour = hourlyArr.reduce((max, h) => h.count > (max?.count || 0) ? h : max, null);
 
         const response = {
             success: true,
@@ -5028,12 +5163,31 @@ router.get('/support-analytics/ai-overview', verifyToken, async (req, res) => {
                 resolutionRate,
                 negativeCount: stats.negative || 0,
                 positiveCount: stats.positive || 0,
-                neutralCount: stats.neutral || 0
+                neutralCount: stats.neutral || 0,
+                aiClassified: stats.ai_classified || 0,
+                portalAssigned: stats.portal_assigned || 0,
+                todayTotal: today.today_total || 0,
+                todayOpen: today.today_open || 0,
+                todayResolved: today.today_resolved || 0,
+                todayNegative: today.today_negative || 0,
+                avgResponseSeconds: avgResp.avg_seconds || null,
+                avgResponseFormatted: avgResponseFormatted,
+                peakHour: peakHour ? peakHour.hour : null,
+                peakHourCount: peakHour ? peakHour.count : 0,
+                peakDay: peak.day || null,
+                peakDayCount: peak.count || 0
             },
             channels: channelStats,
             sentiments: sentimentStats,
             dailyVolume,
-            topScenarios: scenarioStats
+            topScenarios: scenarioStats,
+            hourlyPattern: hourlyArr,
+            channelSentiment: channelSentiment || [],
+            portalPerformance: portalPerformance || [],
+            confidenceDist: confidenceDist || [],
+            resolutionTrend: resolutionTrend || [],
+            channelResolution: channelResolution || [],
+            escalationByChannel: escalationByChannel || []
         };
 
         setCache(cacheKey, response, 'stats', 5 * 60 * 1000);
