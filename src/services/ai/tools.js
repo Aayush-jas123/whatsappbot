@@ -765,6 +765,69 @@ const tools = [
         }
     },
     {
+        name: 'get_location_analytics',
+        description: 'Analyze orders, operational performance, delivery delays, RTO rates, customer complaint concentrations, and COD cancellations by location (pincode, city, or state). Supports officer queries: "Which pincodes have the highest RTO?", "Where are delivery complaints concentrated?", "Which cities have the most orders?", and "What is the COD cancellation rate by location?". Strictly enforces PII protection (zero customer names, phone numbers, or street addresses). Emits report with VERIFIED FACT, POLICY, PATTERN, ANOMALY, and RECOMMENDATION tags.',
+        parameters: {
+            type: 'object',
+            properties: {
+                queryType: {
+                    type: 'string',
+                    description: 'Analysis type: "top_pincodes_rto" (pincodes with highest RTO rate), "top_cities_volume" (cities with highest order volume and GMV), "complaint_concentration" (locations with highest support/delivery grievances), "cod_cancellations" (locations with highest COD cancellation rates), "delivery_delay" (locations with highest delivery transit duration/delays), "location_overview" (deep-dive for a specific pincode, city, or state)'
+                },
+                pincode: {
+                    type: 'string',
+                    description: 'Optional 6-digit destination pincode filter (e.g. "500055", "395001")'
+                },
+                city: {
+                    type: 'string',
+                    description: 'Optional city name filter (e.g. "Mumbai", "Bangalore", "Pune")'
+                },
+                state: {
+                    type: 'string',
+                    description: 'Optional state/province filter (e.g. "Maharashtra", "Karnataka")'
+                },
+                period: {
+                    type: 'string',
+                    description: 'Analysis time window: "today", "this_week", "this_month", or "all"'
+                },
+                minOrders: {
+                    type: ['integer', 'string'],
+                    description: 'Minimum orders/shipments sample threshold (default 10)'
+                },
+                limit: {
+                    type: ['integer', 'string'],
+                    description: 'Max locations to return (default 10)'
+                }
+            },
+            required: []
+        },
+        requiresConfirmation: false,
+        async execute({ queryType, pincode, city, state, period, minOrders, limit }, ctx) {
+            const {
+                getLocationAnalytics,
+                formatLocationAnalyticsReport
+            } = require('../locationAnalyticsService');
+
+            const lim = parseInt(limit) || 10;
+            const minN = parseInt(minOrders) || 10;
+
+            const res = await getLocationAnalytics({
+                queryType: queryType || (pincode ? 'location_overview' : 'top_cities_volume'),
+                pincode,
+                city,
+                state,
+                period: period || 'all',
+                minOrders: minN,
+                limit: lim
+            });
+
+            return {
+                ...res,
+                formatted_report: formatLocationAnalyticsReport(res)
+            };
+        }
+    },
+    {
         name: 'search_messages',
         description: 'Get the recent WhatsApp conversation (incoming and outgoing messages) for a customer phone number.',
         parameters: {
@@ -1732,6 +1795,7 @@ const TOOL_TRIGGERS = {
     detect_delivery_anomalies: /\b(delivery\s*anomal\w*|anomaly\s*detect\w*|unusual\s*delivery|stuck\s*in\s*transit|excessive\s*attempts|rapid\s*deliver\w*|delivery\s*delay\w*|suspicious\s*deliver\w*|tracking\s*anomal\w*|pincode\s*failure\s*cluster|courier\s*surge)\b/i,
     get_complaint_patterns: /\b(complaint\s*patterns?|complaints?\s*analytics|recurring\s*(?:issues?|complaints?)|complaint\s*trend|ticket\s*trend|most\s*common\s*complaints?|grievance\s*pattern|complaint\s*categor\w*|customer\s*complaints?|complaints?\s*by\s*product|complaints?\s*by\s*courier)\b/i,
     get_return_exchange_analytics: /\b(return\s*analytics|exchange\s*analytics|return\s*rate|exchange\s*rate|which\s*sku\s*has\s*the\s*highest\s*return|which\s*size\s*has\s*the\s*most\s*exchanges|why\s*(?:are\s*)?customers\s*returning|returns?\s*by\s*product|returns?\s*by\s*sku|returns?\s*by\s*size|size\s*exchange\s*patterns?|product\s*problems?|defect\s*rate|highest\s*return\s*rate|most\s*exchanges)\b/i,
+    get_location_analytics: /\b(location\s*analytics|pincode\s*analytics|city\s*analytics|state\s*analytics|which\s*pincodes?\s*have\s*the\s*highest\s*rto|where\s*(?:are\s*)?delivery\s*complaints\s*concentrated|which\s*cities\s*have\s*the\s*most\s*orders|orders\s*by\s*(?:city|pincode|state|location)|rto\s*by\s*(?:pincode|city|state|location)|highest\s*rto\s*pincode|delivery\s*delay\s*by\s*(?:city|pincode)|cod\s*cancellation\s*by\s*(?:city|pincode)|pincode\s*rto|city\s*orders|pincode\s*\d{6})\b/i,
     search_messages: /\b(messages?|chats?|conversations?|whatsapp|said|replied|history)\b/i,
     list_tickets: /\b(tickets?|support|complaints?|issues?|queries|grievance)\b/i,
     search_learned_replies: /\b(reply|replies|respond|draft|answer|suggest\w*|how (do|did|should) we)\b/i,
