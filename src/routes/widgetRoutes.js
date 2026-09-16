@@ -88,7 +88,7 @@ router.post('/chat', async (req, res) => {
 // Silently records an exchange handled outside the AI chat (e.g. the direct
 // tracking card) into the AI session, so follow-up AI turns keep context.
 
-router.post('/context', (req, res) => {
+router.post('/context', async (req, res) => {
     try {
         const { sessionId, userMessage, botMessage, entities } = req.body;
 
@@ -96,7 +96,7 @@ router.post('/context', (req, res) => {
             return res.status(400).json({ error: 'sessionId is required' });
         }
 
-        appendSessionExchange({ sessionId, userMessage, botMessage, entities });
+        await appendSessionExchange({ sessionId, userMessage, botMessage, entities });
         res.json({ ok: true });
     } catch (error) {
         console.error('[widget] context error:', error.message);
@@ -121,7 +121,7 @@ router.post('/track-order', async (req, res) => {
         if (sessionId && orderId) {
             const cleanOrderId = String(orderId).replace(/^#/, '').trim();
             if (/^\d{3,6}$/.test(cleanOrderId)) {
-                noteSessionContext({ sessionId, entities: { orderId: cleanOrderId } });
+                await noteSessionContext({ sessionId, entities: { orderId: cleanOrderId } });
             }
         }
 

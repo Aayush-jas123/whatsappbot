@@ -512,7 +512,7 @@
     }
 
     // ========== FLOW 4: CONTACT SUPPORT ==========
-    var MAX_AI_ATTEMPTS = 3; // Try AI resolution this many times before showing Create Ticket
+    var MAX_AI_ATTEMPTS = 3; // Keep conversing for 3 replies before showing Create Ticket
 
     function startContactSupport() {
         flowState = 'awaiting_ticket_order_id';
@@ -570,14 +570,10 @@
             var attempts = flowContext.aiAttempts || 0;
             var exhaustedAttempts = attempts >= MAX_AI_ATTEMPTS;
 
-            // Only offer Create Ticket after 3 AI attempts or if AI explicitly says so
-            if (aiSaysCreateTicket || exhaustedAttempts) {
+            // Only offer Create Ticket after exhausting all AI attempts (ignore AI's create_ticket signal until then)
+            if (exhaustedAttempts) {
                 var escalationMsg = aiReply;
-                if (exhaustedAttempts && !aiSaysCreateTicket) {
-                    escalationMsg += '\n\nIt seems I am not able to fully resolve this. Would you like to create a support ticket so our team can assist you directly?';
-                } else {
-                    escalationMsg += '\n\nWould you like to create a support ticket so our team can assist you further?';
-                }
+                escalationMsg += '\n\nIt seems I am not able to fully resolve this. Would you like to create a support ticket so our team can assist you directly?';
                 addBotMessage(escalationMsg, [
                     { label: 'Create Ticket', action: 'create_support_ticket', primary: true },
                     { label: 'Try Another Question', action: 'retry_support' },

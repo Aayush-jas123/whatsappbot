@@ -32,13 +32,55 @@ const MAX_SESSIONS = 200;  // lowered from 500 — widget sessions are short
 
 function getSession(sessionId) {
     const entry = sessions.get(sessionId);
-    if (!entry) return { history: [], context: {} };
+    if (!entry) return { history: [], context: {}, _fromDb: false };
     if (Date.now() - entry.lastAccess > SESSION_TTL_MS) {
         sessions.delete(sessionId);
-        return { history: [], context: {} };
+        return { history: [], context: {}, _fromDb: false };
     }
     entry.lastAccess = Date.now();
     return { history: entry.history || [], context: entry.context || {} };
+}
+
+/**
+ * Async version: if the in-memory session is missing or expired, try to
+ * restore context (and recent history) from the database so the bot
+ * remembers customer details like order IDs across page reloads.
+ */
+async function getSessionAsync(sessionId) {
+    const sync = getSession(sessionId);
+    if (sync.history.length > 0 || Object.keys(sync.context).length > 0) {
+        return sync; // in-memory hit — use it
+    }
+    // In-memory miss — try to restore from DB
+    try {
+        const sessionRows = await dbAdapter.query(
+            'SELECT context FROM widget_chat_sessions WHERE session_id = $1',
+            [sessionId]
+        );
+        if (!sessionRows || !sessionRows.length) return { history: [], context: {} };
+
+        const context = sessionRows[0].context || {};
+
+        // Restore the last few conversation turns so the AI has continuity
+        const recentMessages = await dbAdapter.query(
+            `SELECT sender, content FROM widget_chats
+             WHERE session_id = $1
+             ORDER BY created_at DESC
+             LIMIT $2`,
+            [sessionId, MAX_HISTORY_TURNS * 2]
+        );
+        const history = (recentMessages || []).reverse().map(m => ({
+            role: m.sender === 'customer' ? 'user' : 'assistant',
+            content: String(m.content || '').slice(0, 500)
+        }));
+
+        // Populate in-memory cache so subsequent turns are fast
+        saveSession(sessionId, history, context);
+        return { history, context };
+    } catch (err) {
+        console.warn('[widget] session restore error:', err.message);
+        return { history: [], context: {} };
+    }
 }
 
 function saveSession(sessionId, history, context) {
@@ -177,11 +219,13 @@ function getCustomerToolSchemas() {
  * into the AI session context so follow-up questions like "where is my
  * order" already know which order the customer means.
  */
-function noteSessionContext({ sessionId, entities }) {
+async function noteSessionContext({ sessionId, entities }) {
     if (!sessionId || !entities) return;
-    const session = getSession(sessionId);
+    const session = await getSessionAsync(sessionId);
     const context = { ...session.context, ...entities };
     saveSession(sessionId, session.history, context);
+    // Persist context to DB immediately
+    persistContextToDb(sessionId, context).catch(err => console.warn('[widget] context persist error:', err.message));
 }
 
 /**
@@ -189,13 +233,14 @@ function noteSessionContext({ sessionId, entities }) {
  * handles something outside the AI chat, e.g. the direct tracking card) so
  * subsequent AI turns see it as prior conversation. No LLM call is made.
  */
-function appendSessionExchange({ sessionId, userMessage, botMessage, entities }) {
+async function appendSessionExchange({ sessionId, userMessage, botMessage, entities }) {
     if (!sessionId) return;
-    const session = getSession(sessionId);
+    const session = await getSessionAsync(sessionId);
     if (userMessage) session.history.push({ role: 'user', content: String(userMessage).slice(0, 500) });
     if (botMessage) session.history.push({ role: 'assistant', content: String(botMessage).slice(0, 500) });
     const context = entities ? { ...session.context, ...entities } : session.context;
     saveSession(sessionId, session.history, context);
+    if (entities) persistContextToDb(sessionId, context).catch(err => console.warn('[widget] context persist error:', err.message));
 }
 
 // ---------- Main chat function ----------
@@ -215,7 +260,7 @@ async function runCustomerAgent({ sessionId, message }) {
         };
     }
 
-    const session = getSession(sessionId);
+    const session = await getSessionAsync(sessionId);
     const toolSchemas = getCustomerToolSchemas();
 
     // Extract entities from this message and merge into session context
@@ -424,6 +469,20 @@ function buildReturnCard(result) {
  * Persist a customer+bot message pair and update the session summary.
  * Fire-and-forget — caller catches rejections.
  */
+// ---------- Persistence helpers ----------
+
+/**
+ * Save the session context (entities) to the database so it survives
+ * server restarts and in-memory session expiry.
+ */
+async function persistContextToDb(sessionId, context) {
+    if (!sessionId || !context || !Object.keys(context).length) return;
+    await dbAdapter.run(
+        `UPDATE widget_chat_sessions SET context = $2 WHERE session_id = $1`,
+        [sessionId, JSON.stringify(context)]
+    );
+}
+
 async function persistWidgetChat(sessionId, customerMsg, botReply, opts) {
     const now = new Date().toISOString();
     const entitiesJson = opts.entities ? JSON.stringify(opts.entities) : null;
@@ -442,17 +501,19 @@ async function persistWidgetChat(sessionId, customerMsg, botReply, opts) {
          opts.suggestedAction || null, entitiesJson, now]
     );
 
-    // 2. Upsert session summary (single atomic statement)
+    // 2. Upsert session summary (single atomic statement) — also persist context
+    const contextJson = opts.entities ? JSON.stringify(opts.entities) : null;
     await dbAdapter.run(
-        `INSERT INTO widget_chat_sessions (session_id, message_count, total_prompt_tokens, total_completion_tokens, total_cost_usd, last_message_at, created_at)
-         VALUES ($1, 2, $2, $3, $4, $5, $5)
+        `INSERT INTO widget_chat_sessions (session_id, message_count, total_prompt_tokens, total_completion_tokens, total_cost_usd, last_message_at, context, created_at)
+         VALUES ($1, 2, $2, $3, $4, $5, $6, $5)
          ON CONFLICT (session_id) DO UPDATE SET
            message_count = widget_chat_sessions.message_count + 2,
            total_prompt_tokens = widget_chat_sessions.total_prompt_tokens + $2,
            total_completion_tokens = widget_chat_sessions.total_completion_tokens + $3,
            total_cost_usd = widget_chat_sessions.total_cost_usd + $4,
-           last_message_at = $5`,
-        [sessionId, opts.promptTokens || 0, opts.completionTokens || 0, opts.costUsd || 0, now]
+           last_message_at = $5,
+           context = COALESCE($6, widget_chat_sessions.context)`,
+        [sessionId, opts.promptTokens || 0, opts.completionTokens || 0, opts.costUsd || 0, now, contextJson]
     );
 }
 

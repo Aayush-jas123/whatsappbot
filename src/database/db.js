@@ -811,6 +811,9 @@ async function initializeWidgetChatTables() {
     await pool.query('CREATE INDEX IF NOT EXISTS idx_wcs_created ON widget_chat_sessions(created_at DESC)');
     await pool.query('CREATE INDEX IF NOT EXISTS idx_wcs_has_ticket ON widget_chat_sessions(has_ticket)');
 
+    // Add context column for persisting customer entities (orderId, awb, etc.)
+    await pool.query('ALTER TABLE widget_chat_sessions ADD COLUMN IF NOT EXISTS context JSONB');
+
     console.log('✅ Widget chat tables initialized');
   } catch (error) {
     console.error('❌ Failed to initialize widget chat tables:', error.message);
