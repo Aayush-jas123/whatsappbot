@@ -680,10 +680,43 @@ router.get('/:slug/customers/:phone/details', verifyPortalToken, async (req, res
             })()
         ]);
 
-        // Build tracking lookup by order_id from the orders table
+        // Build tracking lookup by order_id — start with orders table
         const trackingByOrderId = new Map();
         for (const o of (trackingOrders || [])) {
             if (o.order_id) trackingByOrderId.set(String(o.order_id), o);
+        }
+
+        // Also query shipments table (authoritative source for tracking data)
+        const shopperOrderIds = new Set((shoppers || []).map(s => String(s.order_id)));
+        if (shopperOrderIds.size > 0) {
+            const oidPlaceholders = shopperOrderIds.map(() => '?').join(',');
+            try {
+                const shipments = await dbAdapter.query(
+                    `SELECT order_id, awb, courier_name, tracking_url, status, carrier
+                     FROM shipments
+                     WHERE order_id IN (${oidPlaceholders})
+                       AND status NOT IN ('cancelled', 'failed')
+                     ORDER BY created_at DESC`,
+                    [...shopperOrderIds]
+                );
+                for (const s of (shipments || [])) {
+                    const oid = String(s.order_id);
+                    const existing = trackingByOrderId.get(oid) || {};
+                    // Shipments data takes priority for tracking fields
+                    trackingByOrderId.set(oid, {
+                        ...existing,
+                        order_id: s.order_id,
+                        awb: s.awb || existing.awb,
+                        courier_name: s.courier_name || s.carrier || existing.courier_name,
+                        tracking_url: s.tracking_url || existing.tracking_url,
+                        shiprocket_order_id: existing.shiprocket_order_id,
+                        expected_delivery: existing.expected_delivery
+                    });
+                }
+                console.log(`[PORTAL DETAILS] Shipments lookup: ${shipments?.length || 0} rows for ${shopperOrderIds.size} orders`);
+            } catch (err) {
+                console.warn(`[PORTAL DETAILS] Shipments lookup failed: ${err.message}`);
+            }
         }
 
         // Build unified order list from store_shoppers, enriched with tracking data
@@ -710,7 +743,7 @@ router.get('/:slug/customers/:phone/details', verifyPortalToken, async (req, res
                 city: s.city,
                 province: s.province,
                 delivery_type: s.delivery_type,
-                // Tracking data from orders table
+                // Tracking data from orders + shipments tables
                 awb: tracking?.awb || null,
                 courier_name: tracking?.courier_name || null,
                 tracking_url: tracking?.tracking_url || null,
@@ -720,9 +753,9 @@ router.get('/:slug/customers/:phone/details', verifyPortalToken, async (req, res
         });
 
         // If store_shoppers had no rows but orders table did, include those too
-        const shopperOrderIds = new Set(orders.map(o => String(o.order_id)));
+        const includedOrderIds = new Set(orders.map(o => String(o.order_id)));
         for (const to of (trackingOrders || [])) {
-            if (!shopperOrderIds.has(String(to.order_id))) {
+            if (!includedOrderIds.has(String(to.order_id))) {
                 orders.push({
                     order_id: to.order_id,
                     status: to.status || 'pending',
