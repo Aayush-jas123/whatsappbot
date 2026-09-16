@@ -503,6 +503,11 @@ function renderPortalsList() {
             <div>
                 <div class="portal-item-name">${esc(p.name)}</div>
                 <div class="portal-item-type">${p.type}${p.config?.time_start ? ` · ${p.config.time_start}–${p.config.time_end}` : ''}</div>
+                <div class="portal-item-password" id="pw-${p.id}">
+                    <span class="portal-pw-masked">••••••••</span>
+                    <button class="btn btn-secondary btn-sm portal-pw-btn" onclick="revealPortalPassword(${p.id})" title="Show password">👁</button>
+                    <button class="btn btn-secondary btn-sm portal-pw-btn" onclick="copyPortalPassword(${p.id})" title="Copy password" style="margin-left:4px">📋</button>
+                </div>
             </div>
             <div style="display:flex;gap:6px">
                 <button class="btn btn-secondary btn-sm" onclick="openPortalModal(${p.id})">Edit</button>
@@ -568,6 +573,46 @@ async function savePortal() {
         loadPortals();
     } else {
         alert(data?.error || 'Failed to save portal');
+    }
+}
+
+async function revealPortalPassword(id) {
+    const container = document.getElementById(`pw-${id}`);
+    const btn = container.querySelector('.portal-pw-btn');
+    try {
+        const data = await apiFetch(`/support-portals/${id}/password`);
+        if (data?.success && data.password) {
+            container.querySelector('.portal-pw-masked').textContent = data.password;
+            container.querySelector('.portal-pw-masked').classList.add('revealed');
+            btn.onclick = () => hidePortalPassword(id);
+            btn.title = 'Hide password';
+            btn.textContent = '🙈';
+        } else {
+            container.querySelector('.portal-pw-masked').textContent = data?.message || 'Not available';
+        }
+    } catch {
+        container.querySelector('.portal-pw-masked').textContent = 'Failed to load';
+    }
+}
+
+function hidePortalPassword(id) {
+    const container = document.getElementById(`pw-${id}`);
+    container.querySelector('.portal-pw-masked').textContent = '••••••••';
+    container.querySelector('.portal-pw-masked').classList.remove('revealed');
+    const btn = container.querySelector('.portal-pw-btn');
+    btn.onclick = () => revealPortalPassword(id);
+    btn.title = 'Show password';
+    btn.textContent = '👁';
+}
+
+async function copyPortalPassword(id) {
+    const data = await apiFetch(`/support-portals/${id}/password`);
+    if (data?.success && data.password) {
+        await navigator.clipboard.writeText(data.password);
+        const btn = document.querySelector(`#pw-${id} .portal-pw-btn:last-child`);
+        const orig = btn.textContent;
+        btn.textContent = '✓';
+        setTimeout(() => btn.textContent = orig, 1500);
     }
 }
 

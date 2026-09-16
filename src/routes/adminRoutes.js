@@ -3951,7 +3951,10 @@ router.get('/support-portals', verifyToken, async (req, res) => {
 
         res.json({
             success: true,
-            portals: enrichedPortals
+            portals: enrichedPortals.map(p => {
+                const { password_hash, password_plain, ...rest } = p;
+                return rest;
+            })
         });
     } catch (error) {
         console.error('List support portals error:', error);
