@@ -7723,7 +7723,7 @@ router.get('/widget-chats/sessions', verifyToken, async (req, res) => {
             dbAdapter.query(
                 `SELECT session_id, message_count, has_ticket, ticket_id, ticket_number,
                         total_prompt_tokens, total_completion_tokens, total_cost_usd,
-                        last_message_at, created_at
+                        last_message_at, created_at, visitor_id
                  FROM widget_chat_sessions ${where}
                  ORDER BY created_at DESC
                  LIMIT $${pi} OFFSET $${pi + 1}`,
@@ -7761,6 +7761,29 @@ router.get('/widget-chats/session/:sessionId', verifyToken, async (req, res) => 
     } catch (error) {
         console.error('widget-chats/session error:', error.message);
         res.status(500).json({ success: false, error: 'Failed to load conversation' });
+    }
+});
+
+// GET /api/admin/widget-chats/related/:visitorId — other sessions from same visitor
+router.get('/widget-chats/related/:visitorId', verifyToken, async (req, res) => {
+    try {
+        const { visitorId } = req.params;
+        const excludeSessionId = req.query.exclude || null;
+
+        let query = 'SELECT session_id, message_count, has_ticket, ticket_number, total_prompt_tokens, total_completion_tokens, total_cost_usd, last_message_at, created_at FROM widget_chat_sessions WHERE visitor_id = $1';
+        const params = [visitorId];
+
+        if (excludeSessionId) {
+            query += ' AND session_id != $2';
+            params.push(excludeSessionId);
+        }
+        query += ' ORDER BY created_at DESC LIMIT 20';
+
+        const sessions = await dbAdapter.query(query, params);
+        res.json({ success: true, sessions: sessions || [] });
+    } catch (error) {
+        console.error('widget-chats/related error:', error.message);
+        res.status(500).json({ success: false, error: 'Failed to load related sessions' });
     }
 });
 
@@ -7900,6 +7923,84 @@ router.delete('/widget-chats/purge', verifyToken, async (req, res) => {
     } catch (error) {
         console.error('widget-chats/purge error:', error.message);
         res.status(500).json({ success: false, error: 'Failed to purge' });
+    }
+});
+
+// ════════════════════════════════════════════════════════════════
+// Live Chats — admin real-time monitoring + override
+// ════════════════════════════════════════════════════════════════
+
+// GET /api/admin/widget-chats/live — active sessions (last 15 min)
+router.get('/widget-chats/live', verifyToken, async (req, res) => {
+    try {
+        const windowMs = 15 * 60 * 1000; // 15 minutes
+        const cutoff = new Date(Date.now() - windowMs).toISOString();
+
+        const sessions = await dbAdapter.query(
+            `SELECT session_id, message_count, has_ticket, ticket_number,
+                    total_prompt_tokens, total_completion_tokens, total_cost_usd,
+                    last_message_at, created_at, visitor_id, admin_active
+             FROM widget_chat_sessions
+             WHERE last_message_at >= $1
+             ORDER BY last_message_at DESC
+             LIMIT 50`,
+            [cutoff]
+        );
+
+        res.json({ success: true, sessions: sessions || [], activeCount: (sessions || []).length });
+    } catch (error) {
+        console.error('widget-chats/live error:', error.message);
+        res.status(500).json({ success: false, error: 'Failed to load live sessions' });
+    }
+});
+
+// POST /api/admin/widget-chats/admin-message — admin sends override message
+router.post('/widget-chats/admin-message', verifyToken, async (req, res) => {
+    try {
+        const { sessionId, message } = req.body;
+        if (!sessionId || !message) {
+            return res.status(400).json({ success: false, error: 'sessionId and message are required' });
+        }
+        if (String(message).length > 2000) {
+            return res.status(400).json({ success: false, error: 'Message too long (max 2000 chars)' });
+        }
+
+        const now = new Date().toISOString();
+
+        // Insert admin message with sender = 'admin'
+        await dbAdapter.run(
+            `INSERT INTO widget_chats (session_id, sender, content, created_at)
+             VALUES ($1, 'admin', $2, $3)`,
+            [sessionId, message, now]
+        );
+
+        // Update session: mark admin_active, bump message_count, update last_message_at
+        await dbAdapter.run(
+            `UPDATE widget_chat_sessions
+             SET admin_active = TRUE, message_count = message_count + 1, last_message_at = $2
+             WHERE session_id = $1`,
+            [sessionId, now]
+        );
+
+        res.json({ success: true, timestamp: now });
+    } catch (error) {
+        console.error('widget-chats/admin-message error:', error.message);
+        res.status(500).json({ success: false, error: 'Failed to send admin message' });
+    }
+});
+
+// POST /api/admin/widget-chats/release/:sessionId — admin releases control back to AI
+router.post('/widget-chats/release/:sessionId', verifyToken, async (req, res) => {
+    try {
+        const { sessionId } = req.params;
+        await dbAdapter.run(
+            `UPDATE widget_chat_sessions SET admin_active = FALSE WHERE session_id = $1`,
+            [sessionId]
+        );
+        res.json({ success: true });
+    } catch (error) {
+        console.error('widget-chats/release error:', error.message);
+        res.status(500).json({ success: false, error: 'Failed to release' });
     }
 });
 

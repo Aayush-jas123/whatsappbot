@@ -120,6 +120,22 @@ function setupEventListeners() {
     document.getElementById('wcShowMoreBtn')?.addEventListener('click', () => { wcPage++; loadWidgetChats(true); });
     document.getElementById('wcPurgeBtn')?.addEventListener('click', purgeWidgetChats);
 
+    // Widget chat related sessions toggle
+    document.getElementById('wcRelatedToggle')?.addEventListener('click', function() {
+        const content = document.getElementById('wcRelatedContent');
+        const svg = this.querySelector('svg');
+        const isHidden = content.style.display === 'none';
+        content.style.display = isHidden ? 'flex' : 'none';
+        if (svg) svg.style.transform = isHidden ? 'rotate(180deg)' : '';
+    });
+
+    // Admin override send
+    document.getElementById('wcAdminSendBtn')?.addEventListener('click', sendAdminMessage);
+    document.getElementById('wcAdminInput')?.addEventListener('keydown', e => {
+        if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); sendAdminMessage(); }
+    });
+    document.getElementById('wcAdminReleaseBtn')?.addEventListener('click', releaseAdminControl);
+
     // Modal close buttons
     document.querySelectorAll('[data-action="closeModal"]').forEach(btn => {
         btn.addEventListener('click', () => {
@@ -194,6 +210,10 @@ function showDashboard() {
 // Navigation
 // ===================================
 function navigateTo(page) {
+    // Stop live refresh when leaving widget chats
+    if (currentPage === 'widget-chats' && page !== 'widget-chats') {
+        stopLiveRefresh();
+    }
     currentPage = page;
     document.querySelectorAll('.nav-item').forEach(n => n.classList.remove('active'));
     document.querySelector(`.nav-item[data-page="${page}"]`)?.classList.add('active');
@@ -1277,6 +1297,8 @@ async function loadWidgetChats(append = false) {
         updateWcPagination();
 
         if (analyticsData?.success) updateWcStatsRow(analyticsData.analytics);
+        // Start live session refresh when on conversations tab
+        startLiveRefresh();
     } catch (err) {
         list.innerHTML = '<div class="tickets-loading"><span>Error loading sessions</span></div>';
     }
@@ -1299,6 +1321,9 @@ function renderWidgetSessions(sessions, append) {
             : '<span class="wc-no-ticket">No ticket</span>';
         const tokens = (s.total_prompt_tokens || 0) + (s.total_completion_tokens || 0);
         const cost = parseFloat(s.total_cost_usd || 0);
+        const visitorBadge = s.visitor_id
+            ? `<span class="wc-visitor-badge" title="Visitor: ${esc(s.visitor_id)}">&#x1f464; same device</span>`
+            : '';
 
         row.innerHTML = `
             <div class="wc-session-main">
@@ -1306,6 +1331,7 @@ function renderWidgetSessions(sessions, append) {
                 <div class="wc-session-meta">
                     <span class="wc-msg-count">${s.message_count || 0} msgs</span>
                     ${ticketBadge}
+                    ${visitorBadge}
                     <span class="wc-token-badge" title="${tokens} tokens">${formatTokens(tokens)} tok</span>
                     <span class="wc-cost-badge">$${cost.toFixed(4)}</span>
                 </div>
@@ -1347,6 +1373,15 @@ async function openWidgetChat(sessionId) {
     document.getElementById('wcConvoSubtitle').textContent = sessionId;
     document.getElementById('wcConvoStats').textContent = '';
     document.getElementById('wcConvoMessages').innerHTML = '<div class="chat-loading"><div class="spinner"></div><span>Loading...</span></div>';
+    // Hide related sessions bar until we know the visitor_id
+    const relatedBar = document.getElementById('wcRelatedBar');
+    relatedBar.style.display = 'none';
+    document.getElementById('wcRelatedContent').style.display = 'none';
+    document.getElementById('wcRelatedContent').innerHTML = '';
+    // Track current session for admin actions
+    currentWcSessionId = sessionId;
+    currentWcAdminActive = false;
+    updateAdminStatusUI();
     modal.classList.add('active');
 
     try {
@@ -1361,9 +1396,53 @@ async function openWidgetChat(sessionId) {
             `${sess.message_count || 0} msgs · ${formatTokens(tokens)} tok · $${parseFloat(sess.total_cost_usd || 0).toFixed(4)}` +
             (sess.has_ticket ? ` · ${esc(sess.ticket_number || 'ticket')}` : '');
 
+        // Track admin state from session
+        currentWcAdminActive = sess.admin_active || false;
+        updateAdminStatusUI();
+
         renderWidgetConversation(data.messages || []);
+
+        // Load related sessions if visitor_id exists
+        if (sess.visitor_id) {
+            loadRelatedSessions(sess.visitor_id, sessionId);
+        }
     } catch {
         document.getElementById('wcConvoMessages').innerHTML = '<div class="chat-loading"><span>Error loading</span></div>';
+    }
+}
+
+async function loadRelatedSessions(visitorId, currentSessionId) {
+    const bar = document.getElementById('wcRelatedBar');
+    const content = document.getElementById('wcRelatedContent');
+    const label = document.getElementById('wcRelatedLabel');
+
+    try {
+        const data = await apiFetch(`/widget-chats/related/${encodeURIComponent(visitorId)}?exclude=${encodeURIComponent(currentSessionId)}`);
+        if (!data?.success || !data.sessions?.length) {
+            bar.style.display = 'none';
+            return;
+        }
+
+        label.textContent = `${data.sessions.length} other session${data.sessions.length > 1 ? 's' : ''} from this visitor`;
+        bar.style.display = 'flex';
+
+        // Render collapsed list
+        content.innerHTML = data.sessions.map(s => {
+            const sid = esc(s.session_id || '');
+            const shortSid = sid.length > 18 ? sid.substring(0, 18) + '...' : sid;
+            const ticketBadge = s.has_ticket
+                ? `<span class="wc-ticket-badge" style="font-size:10px">${esc(s.ticket_number || 'T')}</span>`
+                : '';
+            const tokens = (s.total_prompt_tokens || 0) + (s.total_completion_tokens || 0);
+            return `<div class="wc-related-item" onclick="openWidgetChat('${sid}')">
+                <span class="wc-related-item-id" title="${sid}">${shortSid}</span>
+                <span class="wc-related-item-meta">${s.message_count || 0} msgs · ${formatTokens(tokens)} tok</span>
+                ${ticketBadge}
+                <span class="wc-related-item-time">${formatTimeAgo(s.last_message_at || s.created_at)}</span>
+            </div>`;
+        }).join('');
+    } catch {
+        bar.style.display = 'none';
     }
 }
 
@@ -1372,14 +1451,20 @@ function renderWidgetConversation(messages) {
     container.innerHTML = '';
     messages.forEach(m => {
         const div = document.createElement('div');
+        const isAdmin = m.sender === 'admin';
         const isBot = m.sender === 'bot';
-        div.className = `chat-msg ${isBot ? 'outgoing' : 'incoming'}`;
-        let metaHtml = '';
-        if (isBot && (m.prompt_tokens || m.completion_tokens)) {
-            const tok = (m.prompt_tokens || 0) + (m.completion_tokens || 0);
-            metaHtml = `<div class="wc-msg-meta">${formatTokens(tok)} tok · $${parseFloat(m.cost_usd || 0).toFixed(4)}${m.model ? ' · ' + esc(m.model) : ''}${m.suggested_action ? ' · ' + esc(m.suggested_action) : ''}</div>`;
+        if (isAdmin) {
+            div.className = 'chat-msg outgoing wc-admin-msg';
+            div.innerHTML = `<div class="wc-admin-sender-label">Admin (You)</div><div>${esc(m.content || '')}</div><div class="chat-msg-time">${formatTime(m.created_at)}</div>`;
+        } else {
+            div.className = `chat-msg ${isBot ? 'outgoing' : 'incoming'}`;
+            let metaHtml = '';
+            if (isBot && (m.prompt_tokens || m.completion_tokens)) {
+                const tok = (m.prompt_tokens || 0) + (m.completion_tokens || 0);
+                metaHtml = `<div class="wc-msg-meta">${formatTokens(tok)} tok · $${parseFloat(m.cost_usd || 0).toFixed(4)}${m.model ? ' · ' + esc(m.model) : ''}${m.suggested_action ? ' · ' + esc(m.suggested_action) : ''}</div>`;
+            }
+            div.innerHTML = `<div>${esc(m.content || '')}${metaHtml}</div><div class="chat-msg-time">${formatTime(m.created_at)}</div>`;
         }
-        div.innerHTML = `<div>${esc(m.content || '')}${metaHtml}</div><div class="chat-msg-time">${formatTime(m.created_at)}</div>`;
         container.appendChild(div);
     });
     container.scrollTop = container.scrollHeight;
@@ -1488,6 +1573,115 @@ async function purgeWidgetChats() {
         }
     } catch {
         result.textContent = 'Error purging data';
+    }
+}
+
+// ===================================
+// Live Sessions + Admin Override
+// ===================================
+let liveRefreshTimer = null;
+let currentWcSessionId = null;
+let currentWcAdminActive = false;
+const LIVE_REFRESH_MS = 15000; // 15 seconds
+
+function startLiveRefresh() {
+    stopLiveRefresh();
+    loadLiveSessions();
+    liveRefreshTimer = setInterval(loadLiveSessions, LIVE_REFRESH_MS);
+}
+function stopLiveRefresh() {
+    if (liveRefreshTimer) { clearInterval(liveRefreshTimer); liveRefreshTimer = null; }
+}
+
+async function loadLiveSessions() {
+    try {
+        const data = await apiFetch('/widget-chats/live');
+        if (!data?.success) return;
+        const sessions = data.sessions || [];
+        const section = document.getElementById('wcLiveSection');
+        const container = document.getElementById('wcLiveSessions');
+        const countEl = document.getElementById('wcLiveCount');
+
+        if (!sessions.length) {
+            section.style.display = 'none';
+            return;
+        }
+
+        section.style.display = 'flex';
+        countEl.textContent = sessions.length;
+        container.innerHTML = sessions.map(s => {
+            const sid = esc(s.session_id || '');
+            const shortSid = sid.length > 16 ? sid.substring(0, 16) + '...' : sid;
+            const adminBadge = s.admin_active
+                ? '<span class="wc-live-admin-badge" title="Admin in control">Admin</span>'
+                : '<span class="wc-live-ai-badge">AI</span>';
+            const ticketBadge = s.has_ticket
+                ? `<span class="wc-ticket-badge" style="font-size:10px">${esc(s.ticket_number || 'T')}</span>`
+                : '';
+            return `<div class="wc-live-session-item" onclick="openWidgetChat('${sid}')">
+                <div class="wc-live-item-left">
+                    <span class="wc-live-session-id" title="${sid}">${shortSid}</span>
+                    <span class="wc-live-item-meta">${s.message_count || 0} msgs · ${formatTimeAgo(s.last_message_at)}</span>
+                </div>
+                <div class="wc-live-item-right">
+                    ${adminBadge}
+                    ${ticketBadge}
+                </div>
+            </div>`;
+        }).join('');
+    } catch { /* silent */ }
+}
+
+async function sendAdminMessage() {
+    const input = document.getElementById('wcAdminInput');
+    const message = input?.value?.trim();
+    if (!message || !currentWcSessionId) return;
+
+    const btn = document.getElementById('wcAdminSendBtn');
+    btn.disabled = true;
+
+    try {
+        const data = await apiFetch('/widget-chats/admin-message', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ sessionId: currentWcSessionId, message })
+        });
+        if (data?.success) {
+            input.value = '';
+            currentWcAdminActive = true;
+            updateAdminStatusUI();
+            // Append the admin message to the conversation view immediately
+            const container = document.getElementById('wcConvoMessages');
+            const div = document.createElement('div');
+            div.className = 'chat-msg wc-admin-msg';
+            div.innerHTML = `<div class="wc-admin-sender-label">Admin (You)</div><div>${esc(message)}</div><div class="chat-msg-time">${new Date().toLocaleTimeString('en-IN', { hour: '2-digit', minute: '2-digit', hour12: true })}</div>`;
+            container.appendChild(div);
+            container.scrollTop = container.scrollHeight;
+        }
+    } catch { /* silent */ }
+    btn.disabled = false;
+}
+
+async function releaseAdminControl() {
+    if (!currentWcSessionId) return;
+    try {
+        await apiFetch(`/widget-chats/release/${encodeURIComponent(currentWcSessionId)}`, { method: 'POST' });
+        currentWcAdminActive = false;
+        updateAdminStatusUI();
+    } catch { /* silent */ }
+}
+
+function updateAdminStatusUI() {
+    const modeEl = document.getElementById('wcAdminMode');
+    const releaseBtn = document.getElementById('wcAdminReleaseBtn');
+    if (currentWcAdminActive) {
+        modeEl.innerHTML = '<span class="wc-admin-active-dot"></span> You are controlling this chat';
+        modeEl.className = 'wc-admin-mode wc-admin-mode-active';
+        releaseBtn.style.display = 'inline-flex';
+    } else {
+        modeEl.innerHTML = 'AI is handling this chat';
+        modeEl.className = 'wc-admin-mode wc-admin-mode-ai';
+        releaseBtn.style.display = 'none';
     }
 }
 

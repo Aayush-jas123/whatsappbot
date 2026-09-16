@@ -5,7 +5,7 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <meta name="color-scheme" content="dark">
     <title>OffComfrt — Support Command Center</title>
-    <link rel="stylesheet" href="/dashboard/css/style.css?v=24">
+    <link rel="stylesheet" href="/dashboard/css/style.css?v=26">
     <link rel="preconnect" href="https://fonts.googleapis.com">
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
     <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800&display=swap" rel="stylesheet">
@@ -250,6 +250,18 @@
 
                     <!-- ── Conversations Tab ── -->
                     <div id="wcTabConversations" class="wc-tab-panel active">
+                        <!-- Live Now Section -->
+                        <div class="wc-live-section" id="wcLiveSection" style="display:none">
+                            <div class="wc-live-header">
+                                <div class="wc-live-title">
+                                    <span class="wc-live-dot"></span>
+                                    Live Now
+                                    <span class="wc-live-count" id="wcLiveCount">0</span>
+                                </div>
+                                <span class="wc-live-auto">Auto-refreshing</span>
+                            </div>
+                            <div class="wc-live-sessions" id="wcLiveSessions"></div>
+                        </div>
                         <!-- Stats Row -->
                         <div class="stats-row">
                             <div class="mini-stat">
@@ -934,15 +946,37 @@
                 </div>
             </div>
             <div class="chat-body">
+                <div class="wc-related-sessions-bar" id="wcRelatedBar" style="display:none">
+                    <button class="wc-related-toggle" id="wcRelatedToggle">
+                        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="6 9 12 15 18 9"/></svg>
+                        <span id="wcRelatedLabel">Related sessions</span>
+                    </button>
+                    <div class="wc-related-content" id="wcRelatedContent" style="display:none"></div>
+                </div>
                 <div class="chat-messages" id="wcConvoMessages">
                     <div class="chat-loading"><div class="spinner"></div><span>Loading conversation...</span></div>
+                </div>
+                <div class="wc-admin-input-area">
+                    <div class="wc-admin-status" id="wcAdminStatus">
+                        <span class="wc-admin-mode" id="wcAdminMode"></span>
+                        <button class="wc-admin-release-btn" id="wcAdminReleaseBtn" style="display:none" title="Release control back to AI">
+                            <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4"/><polyline points="16 17 21 12 16 7"/><line x1="21" y1="12" x2="9" y2="12"/></svg>
+                            Release to AI
+                        </button>
+                    </div>
+                    <div class="wc-admin-input-row">
+                        <textarea id="wcAdminInput" placeholder="Type a message to override AI and send directly to customer..." rows="2"></textarea>
+                        <button class="btn btn-primary" id="wcAdminSendBtn" title="Send as admin (overrides AI)">
+                            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="22" y1="2" x2="11" y2="13"/><polygon points="22 2 15 22 11 13 2 9 22 2"/></svg>
+                        </button>
+                    </div>
                 </div>
             </div>
         </div>
     </div>
 
     <!-- Scripts -->
-    <script src="/dashboard/js/main.js?v=24" defer></script>
+    <script src="/dashboard/js/main.js?v=26" defer></script>
     <script src="/dashboard/js/comments.js?v=1" defer></script>
     <script src="/dashboard/js/ai-copilot.js?v=2" defer></script>
 </body>

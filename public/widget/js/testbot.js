@@ -18,6 +18,13 @@
     var CUSTOMER_PHONE = config.customerPhone || '';
 
     // ---------- Session ----------
+    // Persistent visitor ID (survives tab close — links all sessions from same browser)
+    var visitorId = localStorage.getItem('offcomfrt_tb_visitor');
+    if (!visitorId) {
+        visitorId = 'v_' + Date.now().toString(36) + '_' + Math.random().toString(36).substr(2, 10);
+        localStorage.setItem('offcomfrt_tb_visitor', visitorId);
+    }
+
     var sessionId = sessionStorage.getItem('offcomfrt_tb_session');
     if (!sessionId) {
         sessionId = 'tb_' + Date.now().toString(36) + '_' + Math.random().toString(36).substr(2, 8);
@@ -28,6 +35,51 @@
     var isTyping = false;
     var flowState = 'idle';
     var flowContext = {};
+
+    // ---------- Admin override polling ----------
+    var lastMessageId = 0;
+    var pollTimer = null;
+    var POLL_INTERVAL = 5000; // 5 seconds
+
+    function startPolling() {
+        stopPolling();
+        // Initial fetch to set baseline
+        pollAdminMessages(true);
+        pollTimer = setInterval(function() { pollAdminMessages(false); }, POLL_INTERVAL);
+    }
+    function stopPolling() {
+        if (pollTimer) { clearInterval(pollTimer); pollTimer = null; }
+    }
+
+    function pollAdminMessages(isInitial) {
+        if (!sessionId) return;
+        var url = API_URL + '/api/widget/poll?sessionId=' + encodeURIComponent(sessionId) + '&afterId=' + lastMessageId;
+        fetch(url)
+            .then(function(r) { return r.json(); })
+            .then(function(data) {
+                if (!data.messages || !data.messages.length) return;
+                data.messages.forEach(function(m) {
+                    if (m.id > lastMessageId) lastMessageId = m.id;
+                    if (m.sender === 'admin') {
+                        addAdminMessage(m.content);
+                    }
+                });
+            })
+            .catch(function() { /* silent */ });
+    }
+
+    function addAdminMessage(text) {
+        var chat = document.getElementById('oftb-chat');
+        if (!chat) return;
+        var wrapper = document.createElement('div');
+        wrapper.className = 'oftb-msg-wrap oftb-align-left';
+        var msg = document.createElement('div');
+        msg.className = 'oftb-msg oftb-msg-admin';
+        msg.innerHTML = '<div class="oftb-admin-label">Support Team</div>' + escapeHtml(text).replace(/\n/g, '<br>');
+        wrapper.appendChild(msg);
+        chat.appendChild(wrapper);
+        scrollToBottom();
+    }
 
     // ---------- Inject CSS ----------
     function injectStyles() {
@@ -83,6 +135,8 @@
             '#offcomfrt-tb .oftb-msg{padding:14px 18px;border-radius:18px;font-size:13.5px;line-height:1.65;word-wrap:break-word;letter-spacing:0.01em;max-width:88%}',
             '#offcomfrt-tb .oftb-msg-bot{align-self:flex-start;background:#fff;color:#1a1a1a;border-bottom-left-radius:6px;border:1px solid #e8e8e8;box-shadow:0 1px 4px rgba(0,0,0,0.04)}',
             '#offcomfrt-tb .oftb-msg-user{align-self:flex-end;background:linear-gradient(135deg,#1a1a1a,#000);color:#fff;border-bottom-right-radius:6px;border:none;box-shadow:0 2px 8px rgba(0,0,0,0.15)}',
+            '#offcomfrt-tb .oftb-msg-admin{align-self:flex-start;background:linear-gradient(135deg,#f0f4ff,#e8edff);color:#1a1a2e;border-bottom-left-radius:6px;border:1px solid #c7d2fe;box-shadow:0 2px 8px rgba(99,102,241,0.1);max-width:85%}',
+            '#offcomfrt-tb .oftb-admin-label{font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:0.5px;color:#6366f1;margin-bottom:4px}',
 
             /* Inline Button Row */
             '#offcomfrt-tb .oftb-btn-row{display:flex;flex-wrap:wrap;gap:8px;margin-top:10px;animation:oftb-slideUp 0.35s cubic-bezier(0.16,1,0.3,1)}',
@@ -230,12 +284,14 @@
         document.getElementById('offcomfrt-tb').classList.add('open');
         document.getElementById('offcomfrt-tb-btn').style.display = 'none';
         isOpen = true;
+        startPolling();
         setTimeout(function () { document.getElementById('oftb-input').focus(); }, 300);
     }
     function closeWidget() {
         document.getElementById('offcomfrt-tb').classList.remove('open');
         document.getElementById('offcomfrt-tb-btn').style.display = 'flex';
         isOpen = false;
+        stopPolling();
     }
 
     // ---------- Welcome ----------
@@ -394,7 +450,7 @@
         flowState = 'tracking';
         showTyping();
 
-        var body = { sessionId: sessionId };
+        var body = { sessionId: sessionId, visitorId: visitorId };
         var cleaned = orderId.replace(/\s/g, '');
         if (/^\d{10,}$/.test(cleaned)) { body.awb = cleaned; body.orderId = cleaned; }
         else { body.orderId = cleaned; }
@@ -453,21 +509,30 @@
     function startTrackRequest() {
         flowState = 'awaiting_request_track_id';
         flowContext = {};
-        setInputMode('order');
-        addBotMessage('Enter your *order number* to check your return or exchange request status.', [
+        setInputMode('text');
+        addBotMessage('Enter your *order number* or *request ID* (e.g. REQ-12345) to check your return or exchange request status.', [
             { label: 'Back to Menu', action: 'main_menu' }
         ]);
     }
     
-    function doTrackRequest(orderId) {
+    function doTrackRequest(input) {
         flowState = 'tracking_request';
         showTyping();
-        addUserMessage('Order #' + orderId);
-    
+        addUserMessage(input);
+
+        // Detect if user entered a REQ-XXXX request ID or an order number
+        var reqMatch = input.match(/\b(REQ-\d{4,6})\b/i);
+        var payload = {};
+        if (reqMatch) {
+            payload.requestId = reqMatch[1].toUpperCase();
+        } else {
+            payload.orderId = String(input).replace(/^#/, '').replace(/\s/g, '').trim();
+        }
+
         fetch(API_URL + '/api/widget/track-request', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ orderId: orderId })
+            body: JSON.stringify(payload)
         })
         .then(function (r) { return r.json(); })
         .then(function (data) {
@@ -559,6 +624,7 @@
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({
                 sessionId: sessionId,
+                visitorId: visitorId,
                 message: (flowContext.orderId ? '[Order #' + flowContext.orderId + '] ' : '') + '[' + (flowContext.supportTopic || 'General') + '] ' + message
             })
         })
@@ -622,7 +688,8 @@
                 message: ticketMessage,
                 orderId: flowContext.orderId || null,
                 source: 'website',
-                sessionId: sessionId
+                sessionId: sessionId,
+                visitorId: visitorId
             })
         })
         .then(function (r) { return r.json(); })
@@ -801,7 +868,16 @@
             addUserMessage(text);
             doTrackOrder(text);
         } else if (flowState === 'awaiting_request_track_id') {
-            doTrackRequest(text);
+            var reqCheck = input.match(/\b(REQ-\d{4,6})\b/i);
+            if (reqCheck) {
+                doTrackRequest(input);
+            } else if (/^#?\d{4,}$/.test(input.replace(/\s/g, ''))) {
+                doTrackRequest(input);
+            } else {
+                addBotMessage('Please enter a valid *order number* or *request ID* (e.g. REQ-12345).', [
+                    { label: 'Back to Menu', action: 'main_menu' }
+                ]);
+            }
         } else if (flowState === 'awaiting_support_message') {
             addUserMessage(text);
             doResolveWithAI(text);
@@ -810,7 +886,10 @@
             doCreateSupportTicket(text);
         } else {
             addUserMessage(text);
-            if (/^#?\d{4,}$/.test(text.replace(/\s/g, ''))) {
+            var reqIdleMatch = text.match(/\b(REQ-\d{4,6})\b/i);
+            if (reqIdleMatch) {
+                doTrackRequest(text);
+            } else if (/^#?\d{4,}$/.test(text.replace(/\s/g, ''))) {
                 doTrackOrder(text.replace(/^#/, ''));
             } else {
                 addBotMessage('Please select an option:', [

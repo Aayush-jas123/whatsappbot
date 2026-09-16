@@ -252,7 +252,7 @@ async function appendSessionExchange({ sessionId, userMessage, botMessage, entit
  * @param {string} opts.message    - Customer's message
  * @returns {{ reply: string, suggestedAction: string|null }}
  */
-async function runCustomerAgent({ sessionId, message }) {
+async function runCustomerAgent({ sessionId, message, visitorId }) {
     if (!isConfigured()) {
         return {
             reply: 'Our support assistant is currently unavailable. Please reach out to us on WhatsApp for help.',
@@ -387,7 +387,8 @@ async function runCustomerAgent({ sessionId, message }) {
         costUsd: totalCost,
         toolCalls: totalToolCalls,
         suggestedAction,
-        entities: Object.keys(context).length ? context : null
+        entities: Object.keys(context).length ? context : null,
+        visitorId
     }).catch(err => console.warn('[widget] persist error:', err.message));
 
     return {
@@ -485,7 +486,8 @@ async function persistContextToDb(sessionId, context) {
 
 async function persistWidgetChat(sessionId, customerMsg, botReply, opts) {
     const now = new Date().toISOString();
-    const entitiesJson = opts.entities ? JSON.stringify(opts.entities) : null;
+    const entitiesJSON = opts.entities ? JSON.stringify(opts.entities) : null;
+    const visitorId = opts.visitorId || null;
 
     // 1. Insert both messages in one batch via two INSERTs
     await dbAdapter.run(
@@ -498,22 +500,23 @@ async function persistWidgetChat(sessionId, customerMsg, botReply, opts) {
         [sessionId, 'bot', botReply, opts.model || null,
          opts.promptTokens || 0, opts.completionTokens || 0,
          opts.costUsd || 0, opts.toolCalls || 0,
-         opts.suggestedAction || null, entitiesJson, now]
+         opts.suggestedAction || null, entitiesJSON, now]
     );
 
-    // 2. Upsert session summary (single atomic statement) — also persist context
+    // 2. Upsert session summary (single atomic statement) — also persist context + visitor_id
     const contextJson = opts.entities ? JSON.stringify(opts.entities) : null;
     await dbAdapter.run(
-        `INSERT INTO widget_chat_sessions (session_id, message_count, total_prompt_tokens, total_completion_tokens, total_cost_usd, last_message_at, context, created_at)
-         VALUES ($1, 2, $2, $3, $4, $5, $6, $5)
+        `INSERT INTO widget_chat_sessions (session_id, message_count, total_prompt_tokens, total_completion_tokens, total_cost_usd, last_message_at, context, visitor_id, created_at)
+         VALUES ($1, 2, $2, $3, $4, $5, $6, $7, $5)
          ON CONFLICT (session_id) DO UPDATE SET
            message_count = widget_chat_sessions.message_count + 2,
            total_prompt_tokens = widget_chat_sessions.total_prompt_tokens + $2,
            total_completion_tokens = widget_chat_sessions.total_completion_tokens + $3,
            total_cost_usd = widget_chat_sessions.total_cost_usd + $4,
            last_message_at = $5,
-           context = COALESCE($6, widget_chat_sessions.context)`,
-        [sessionId, opts.promptTokens || 0, opts.completionTokens || 0, opts.costUsd || 0, now, contextJson]
+           context = COALESCE($6, widget_chat_sessions.context),
+           visitor_id = COALESCE($7, widget_chat_sessions.visitor_id)`,
+        [sessionId, opts.promptTokens || 0, opts.completionTokens || 0, opts.costUsd || 0, now, contextJson, visitorId]
     );
 }
 
@@ -523,7 +526,7 @@ async function persistWidgetChat(sessionId, customerMsg, botReply, opts) {
  * Create a support ticket from the widget.
  * @returns {{ ticketNumber: string, whatsappLink: string, ticketId: number }}
  */
-async function createWidgetTicket({ name, phone, email, message, orderId, source, sessionId }) {
+async function createWidgetTicket({ name, phone, email, message, orderId, source, sessionId, visitorId }) {
     const ticketNumber = 'WDG-' + Date.now().toString(36).toUpperCase();
 
     // Assign portal via round-robin so every portal gets its fair share of widget tickets
@@ -560,6 +563,14 @@ async function createWidgetTicket({ name, phone, email, message, orderId, source
             `UPDATE widget_chats SET ticket_id = $1 WHERE session_id = $2 AND ticket_id IS NULL`,
             [ticketId, sessionId]
         ).catch(err => console.warn('[widget] chat stamp error:', err.message));
+    }
+
+    // Stamp visitor_id on the session if provided
+    if (sessionId && visitorId) {
+        dbAdapter.run(
+            `UPDATE widget_chat_sessions SET visitor_id = $1 WHERE session_id = $2 AND visitor_id IS NULL`,
+            [visitorId, sessionId]
+        ).catch(err => console.warn('[widget] visitor_id stamp error:', err.message));
     }
 
     // Build WhatsApp deep link

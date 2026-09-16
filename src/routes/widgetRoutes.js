@@ -48,7 +48,7 @@ router.get('/session', (req, res) => {
 
 router.post('/chat', async (req, res) => {
     try {
-        const { sessionId, message } = req.body;
+        const { sessionId, message, visitorId } = req.body;
 
         if (!sessionId || !message) {
             return res.status(400).json({ error: 'sessionId and message are required' });
@@ -58,7 +58,7 @@ router.post('/chat', async (req, res) => {
             return res.status(400).json({ error: 'Message too long (max 1000 characters)' });
         }
 
-        const result = await runCustomerAgent({ sessionId, message });
+        const result = await runCustomerAgent({ sessionId, message, visitorId });
 
         res.json({
             reply: result.reply,
@@ -380,13 +380,13 @@ router.post('/track-order', async (req, res) => {
 
 router.post('/ticket', async (req, res) => {
     try {
-        const { name, phone, email, message, orderId, source, sessionId } = req.body;
+        const { name, phone, email, message, orderId, source, sessionId, visitorId } = req.body;
 
         if (!message) {
             return res.status(400).json({ error: 'Message is required' });
         }
 
-        const result = await createWidgetTicket({ name, phone, email, message, orderId, source, sessionId });
+        const result = await createWidgetTicket({ name, phone, email, message, orderId, source, sessionId, visitorId });
 
         res.json({
             success: true,
@@ -486,6 +486,43 @@ router.post('/track-request', async (req, res) => {
     } catch (error) {
         console.error('[widget] track-request error:', error.message);
         res.status(500).json({ error: 'Failed to fetch request data' });
+    }
+});
+
+// ---------- GET /api/widget/poll ----------
+// Widget polls this to check for admin override messages since a given message ID.
+// Returns any new messages (admin or otherwise) the widget hasn't seen yet.
+
+router.get('/poll', async (req, res) => {
+    try {
+        const { sessionId, afterId } = req.query;
+        if (!sessionId) {
+            return res.status(400).json({ error: 'sessionId is required' });
+        }
+
+        const { dbAdapter } = require('../database/db');
+        let query = 'SELECT id, sender, content, created_at FROM widget_chats WHERE session_id = $1';
+        const params = [sessionId];
+
+        if (afterId) {
+            query += ' AND id > $2';
+            params.push(parseInt(afterId) || 0);
+        }
+        query += ' ORDER BY created_at ASC LIMIT 20';
+
+        const messages = await dbAdapter.query(query, params);
+
+        // Also check if admin is active on this session
+        const sessRows = await dbAdapter.query(
+            'SELECT admin_active FROM widget_chat_sessions WHERE session_id = $1',
+            [sessionId]
+        );
+        const adminActive = sessRows?.[0]?.admin_active || false;
+
+        res.json({ messages: messages || [], adminActive });
+    } catch (error) {
+        console.error('[widget] poll error:', error.message);
+        res.status(500).json({ error: 'Poll failed' });
     }
 });
 

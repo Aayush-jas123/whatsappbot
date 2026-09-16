@@ -814,6 +814,14 @@ async function initializeWidgetChatTables() {
     // Add context column for persisting customer entities (orderId, awb, etc.)
     await pool.query('ALTER TABLE widget_chat_sessions ADD COLUMN IF NOT EXISTS context JSONB');
 
+    // Add visitor_id to link sessions from the same browser/device
+    await pool.query('ALTER TABLE widget_chat_sessions ADD COLUMN IF NOT EXISTS visitor_id VARCHAR(100)');
+    await pool.query('CREATE INDEX IF NOT EXISTS idx_wcs_visitor ON widget_chat_sessions(visitor_id) WHERE visitor_id IS NOT NULL');
+
+    // Add admin_active flag — true when admin has taken over the conversation
+    await pool.query('ALTER TABLE widget_chat_sessions ADD COLUMN IF NOT EXISTS admin_active BOOLEAN DEFAULT FALSE');
+    await pool.query('CREATE INDEX IF NOT EXISTS idx_wcs_admin_active ON widget_chat_sessions(admin_active) WHERE admin_active = TRUE');
+
     console.log('✅ Widget chat tables initialized');
   } catch (error) {
     console.error('❌ Failed to initialize widget chat tables:', error.message);
