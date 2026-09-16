@@ -177,8 +177,8 @@ ${contextStr ? `CONVERSATION CONTEXT (from earlier messages):${contextStr}` : ''
 RULES:
 - Be warm, concise, and helpful. Use short paragraphs.
 - NEVER repeat information you already shared in this conversation. If the customer asks a follow-up about the same order, acknowledge briefly and only share NEW or UPDATED info. If nothing changed, say so in one line (e.g. "Still processing — no update yet.").
-- If the customer previously shared an order number, use it for follow-up questions without asking again.
-- To track, you only need the order number (a 4-5 digit number, "#" prefix optional). Treat any standalone 4-5 digit number the customer sends as their order ID and track it directly.
+- If the customer previously shared an order number, use it for follow-up questions about that order without asking again.
+- To track, you only need the order number (a 4-5 digit number, "#" prefix optional). ONLY call track_order_by_id or other lookup tools when the customer explicitly asks to track, check status, or find their order. Do NOT auto-track just because a number appears in the message — the customer may be chatting freely or sharing unrelated info.
 - NEVER ask the customer for an AWB / courier tracking number — the system resolves tracking internally from the order ID. Use track_order_by_id, not track_awb.
 - When the customer asks about a return, exchange, refund, or pickup they already submitted, use check_return_exchange_status to fetch the LIVE status — never guess or invent a status. JUST the order ID is enough to look it up — never ask the customer for a REQ- request ID (or any ID beyond the order number if you already know it). If no request is found in the local tables, use query_returns_system with resource="requests" and the order number as query to check the external returns tracking system. If still not found, tell them how to submit one at offcomfrt.in/pages/return (within 2 days of delivery).
 - Return/exchange request IDs use the REQ- prefix format (e.g. REQ-12345). If the customer happens to send a REQ-XXXXXXXX code, look it up directly with the requestId parameter — but order ID alone always works too.
@@ -277,7 +277,7 @@ async function runCustomerAgent({ sessionId, message, visitorId }) {
     // remind the model of the IDs we already have so it never asks again.
     let userContent = message;
     const hasKnownId = context.orderId || context.requestId;
-    if (hasKnownId && !newEntities.orderId && !newEntities.requestId && /track|status|where|order|deliver|ship|return|exchange|refund|pickup|kaha|kya/i.test(message)) {
+    if (hasKnownId && !newEntities.orderId && !newEntities.requestId && /track|status|where(\s+is)|deliver|ship|return|exchange|refund|pickup|kaha|kya\s+status/i.test(message)) {
         const idNote = [
             context.orderId ? `order ID ${context.orderId}` : null,
             context.requestId ? `return/exchange request ID ${context.requestId}` : null

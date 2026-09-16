@@ -474,6 +474,7 @@ async function initializeSupportPortalsTable() {
     await addColumnIfNotExists('support_tickets', 'ai_scenario', 'VARCHAR(50)');
     await addColumnIfNotExists('support_tickets', 'source', "VARCHAR(20) DEFAULT 'whatsapp'");
     await addColumnIfNotExists('support_tickets', 'customer_email', 'VARCHAR(255)');
+    await addColumnIfNotExists('support_tickets', 'order_id', 'VARCHAR(100)');
 
     // AI classification indexes
     await pool.query('CREATE INDEX IF NOT EXISTS idx_tickets_sentiment ON support_tickets(sentiment) WHERE sentiment IS NOT NULL');
