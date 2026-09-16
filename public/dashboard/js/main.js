@@ -643,7 +643,7 @@ function loadUrgentKeywordsPreview() {
 // ===================================
 async function loadAiAnalytics() {
     const container = document.getElementById('aiInsightsList');
-    if (container) container.innerHTML = '<div class="ai-insight-empty"><svg width="48" height="48" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1"><path d="M12 2a4 4 0 0 1 4 4v2H8V6a4 4 0 0 1 4-4z"/><path d="M6 8H4a2 2 0 0 0-2 2v10a2 2 0 0 0 2 2h16a2 2 0 0 0 2-2V10a2 2 0 0 0-2-2h-2"/><circle cx="12" cy="16" r="3"/></svg><p>Loading AI insights...</p></div>';
+    if (container) container.innerHTML = '<div class="ai-insight-empty"><p>Loading AI insights...</p></div>';
 
     try {
         const [aiOverview, recentTickets] = await Promise.all([
@@ -651,28 +651,76 @@ async function loadAiAnalytics() {
             apiFetch('/support-tickets?limit=200&sort=newest')
         ]);
 
-        const overview = aiOverview?.overview || {};
-        document.getElementById('aiTotalConvos').textContent = overview.total || 0;
-        document.getElementById('aiResolved').textContent = overview.resolved || 0;
-        document.getElementById('aiEscalated').textContent = overview.open || 0;
-        document.getElementById('aiAvgResponse').textContent = overview.resolutionRate ? `${overview.resolutionRate}%` : '—';
+        const ov = aiOverview?.overview || {};
+        const tickets = recentTickets?.tickets || [];
 
-        // Channel breakdown from API
+        // ── KPI Cards ──
+        setText('aiTotalConvos', ov.total || 0);
+        setText('aiResolved', ov.resolved || 0);
+        setText('aiEscalated', ov.open || 0);
+        setText('aiTodayTotal', `${ov.todayTotal || 0} today`);
+        setText('aiTodayResolved', `${ov.todayResolved || 0} today`);
+        setText('aiTodayOpen', `${ov.todayOpen || 0} today`);
+        setText('aiNegativeToday', ov.todayNegative || 0);
+        setText('aiNegativeTotal', `${ov.negativeCount || 0} total`);
+        setText('aiAvgResponse', ov.avgResponseFormatted || '\u2014');
+        setText('aiResolutionRate', `${ov.resolutionRate || 0}%`);
+        if (ov.peakHour !== null && ov.peakHour !== undefined) {
+            const h = ov.peakHour;
+            setText('aiPeakHour', `${h}:00`);
+            setText('aiPeakHourCount', `${ov.peakHourCount || 0} tickets`);
+        }
+        if (ov.peakDay) {
+            const d = new Date(ov.peakDay + 'T00:00:00');
+            setText('aiPeakDay', d.toLocaleDateString('en', { month: 'short', day: 'numeric' }));
+            setText('aiPeakDayCount', `${ov.peakDayCount || 0} tickets`);
+        }
+
+        // ── Volume trend badge ──
+        const dv = aiOverview?.dailyVolume || [];
+        renderVolumeFromApi(dv);
+        if (dv.length >= 2) {
+            const last = dv[dv.length - 1].count;
+            const prev = dv[dv.length - 2].count;
+            const diff = last - prev;
+            const badge = document.getElementById('volumeTrendBadge');
+            if (badge) badge.textContent = diff >= 0 ? `\u2191${diff} vs yesterday` : `\u2193${Math.abs(diff)} vs yesterday`;
+        }
+
+        // ── Hourly Heatmap ──
+        renderHourlyHeatmap(aiOverview?.hourlyPattern || []);
+
+        // ── Channel + Sentiment ──
         renderChannelBreakdownFromApi(aiOverview?.channels || []);
-        // Sentiment from API
-        renderSentimentFromApi(aiOverview?.sentiments || [], overview);
-        // Volume chart from API
-        renderVolumeFromApi(aiOverview?.dailyVolume || []);
-        // Top issues from AI scenarios
+        renderSentimentFromApi(aiOverview?.sentiments || [], ov);
+
+        // ── Cross-tab + Confidence ──
+        renderChannelSentimentMatrix(aiOverview?.channelSentiment || []);
+        renderConfidenceDist(aiOverview?.confidenceDist || []);
+
+        // ── Channel Resolution + Escalation ──
+        renderChannelResolution(aiOverview?.channelResolution || []);
+        renderEscalationChart(aiOverview?.escalationByChannel || []);
+
+        // ── Resolution Trend ──
+        renderResolutionTrend(aiOverview?.resolutionTrend || []);
+
+        // ── Top Scenarios + Portal Perf ──
         renderTopScenarios(aiOverview?.topScenarios || []);
-        // Recent conversations
-        renderAiConversations(recentTickets?.tickets || []);
-        // Generate insights
-        generateAiInsights(recentTickets?.tickets || [], overview);
+        renderPortalPerformance(aiOverview?.portalPerformance || []);
+
+        // ── Conversations + Insights ──
+        renderAiConversations(tickets);
+        generateAiInsights(tickets, ov);
 
     } catch (err) {
         console.error('AI Analytics error:', err);
     }
+}
+
+function setText(id, val) {
+    const el = document.getElementById(id);
+    if (el) el.textContent = val;
 }
 
 function renderChannelBreakdownFromApi(channels) {
@@ -730,19 +778,25 @@ function renderVolumeFromApi(dailyVolume) {
 function renderTopScenarios(scenarios) {
     const el = document.getElementById('topIssuesList');
     if (!el) return;
+    const badge = document.getElementById('scenariosBadge');
+    if (badge) badge.textContent = `${scenarios.length} scenarios`;
     if (!scenarios.length) { el.innerHTML = '<p class="text-muted text-small">No AI scenarios detected yet</p>'; return; }
-    el.innerHTML = scenarios.map((s, i) => `
-        <div class="issue-item">
+    el.innerHTML = scenarios.map((s, i) => {
+        const conf = s.avg_confidence ? Math.round(s.avg_confidence * 100) + '%' : '';
+        return `<div class="issue-item">
             <span class="issue-rank">${i + 1}</span>
             <span class="issue-name">${esc(s.ai_scenario || 'Unknown')}</span>
-            <span class="issue-count">${s.count} tickets</span>
-        </div>
-    `).join('');
+            ${conf ? `<span class="issue-count" style="color:var(--text-tertiary)">${conf} conf</span>` : ''}
+            <span class="issue-count">${s.count}</span>
+        </div>`;
+    }).join('');
 }
 
 function renderAiConversations(tickets) {
     const el = document.getElementById('aiConversationsList');
     if (!el) return;
+    const badge = document.getElementById('conversationsBadge');
+    if (badge) badge.textContent = `${tickets.length} recent`;
     const recent = tickets.slice(0, 10);
     el.innerHTML = recent.length
         ? recent.map(t => {
@@ -819,6 +873,203 @@ function generateAiInsights(tickets, overview) {
             </div>
         </div>
     `).join('');
+}
+
+// ===================================
+// Hourly Heatmap
+// ===================================
+function renderHourlyHeatmap(hourly) {
+    const el = document.getElementById('hourlyHeatmap');
+    if (!el) return;
+    if (!hourly.length) { el.innerHTML = '<p class="text-muted text-small" style="text-align:center;padding:24px;width:100%">No hourly data</p>'; return; }
+    const max = Math.max(...hourly.map(h => h.count), 1);
+    const badge = document.getElementById('hourlyBadge');
+    const peak = hourly.reduce((m, h) => h.count > (m?.count || 0) ? h : m, null);
+    if (badge && peak) badge.textContent = `Peak: ${peak.hour}:00`;
+
+    let html = '';
+    for (let h = 0; h < 24; h++) {
+        const data = hourly.find(x => x.hour === h);
+        const count = data ? data.count : 0;
+        const ratio = count / max;
+        let heat = 'heat-1';
+        if (ratio > 0.8) heat = 'heat-5';
+        else if (ratio > 0.6) heat = 'heat-4';
+        else if (ratio > 0.4) heat = 'heat-3';
+        else if (ratio > 0.2) heat = 'heat-2';
+        html += `<div class="heatmap-cell ${heat}" title="${h}:00 — ${count} tickets">${count || ''}</div>`;
+    }
+    el.innerHTML = html + '<div class="heatmap-labels" style="width:100%"><span>00:00</span><span>06:00</span><span>12:00</span><span>18:00</span><span>23:00</span></div>';
+}
+
+// ===================================
+// Channel x Sentiment Matrix
+// ===================================
+function renderChannelSentimentMatrix(data) {
+    const el = document.getElementById('channelSentimentMatrix');
+    if (!el) return;
+    if (!data.length) { el.innerHTML = '<p class="text-muted text-small">No data</p>'; return; }
+    const channels = [...new Set(data.map(d => d.channel))];
+    const sentiments = ['positive', 'neutral', 'negative'];
+    const labels = { whatsapp: 'WhatsApp', instagram: 'Instagram', website: 'Website', widget: 'Website' };
+    const max = Math.max(...data.map(d => d.count), 1);
+
+    let html = '<table class="cross-tab-table"><thead><tr><th>Channel</th>';
+    sentiments.forEach(s => html += `<th>${s}</th>`);
+    html += '</tr></thead><tbody>';
+    channels.forEach(ch => {
+        const key = (ch || 'other').toLowerCase();
+        html += `<tr><td>${labels[key] || key}</td>`;
+        sentiments.forEach(s => {
+            const row = data.find(d => d.channel === ch && d.sentiment === s);
+            const count = row ? row.count : 0;
+            const ratio = count / max;
+            const cls = ratio > 0.6 ? 'ct-high' : ratio > 0.3 ? 'ct-med' : 'ct-low';
+            html += `<td><span class="cross-tab-cell ${cls}">${count}</span></td>`;
+        });
+        html += '</tr>';
+    });
+    html += '</tbody></table>';
+    el.innerHTML = html;
+}
+
+// ===================================
+// Confidence Distribution
+// ===================================
+function renderConfidenceDist(data) {
+    const el = document.getElementById('confidenceDist');
+    if (!el) return;
+    if (!data.length) { el.innerHTML = '<p class="text-muted text-small">No confidence data</p>'; return; }
+    const total = data.reduce((s, d) => s + d.count, 0) || 1;
+    const order = ['high', 'medium', 'low', 'none'];
+    const labels = { high: 'High (>80%)', medium: 'Med (50-80%)', low: 'Low (<50%)', none: 'Unclassified' };
+    const sorted = order.map(tier => data.find(d => d.tier === tier) || { tier, count: 0 });
+
+    el.innerHTML = sorted.map(d => {
+        const pct = Math.round(d.count / total * 100);
+        return `<div class="confidence-tier">
+            <span class="confidence-label">${labels[d.tier] || d.tier}</span>
+            <div class="confidence-bar-track">
+                <div class="confidence-bar-fill conf-${d.tier}" style="width:${Math.max(pct, 3)}%">${pct}%</div>
+            </div>
+            <span class="confidence-count">${d.count}</span>
+        </div>`;
+    }).join('');
+}
+
+// ===================================
+// Channel Resolution
+// ===================================
+function renderChannelResolution(data) {
+    const el = document.getElementById('channelResolution');
+    if (!el) return;
+    if (!data.length) { el.innerHTML = '<p class="text-muted text-small">No data</p>'; return; }
+    const labels = { whatsapp: 'WhatsApp', instagram: 'Instagram', website: 'Website', widget: 'Website' };
+    el.innerHTML = data.map(d => {
+        const key = (d.channel || 'other').toLowerCase();
+        const rate = d.total > 0 ? Math.round(d.resolved / d.total * 100) : 0;
+        const resPct = d.total > 0 ? (d.resolved / d.total * 100) : 0;
+        const openPct = d.total > 0 ? (d.open_count / d.total * 100) : 0;
+        return `<div class="channel-res-item">
+            <div class="channel-res-header">
+                <span class="channel-res-name">${labels[key] || key}</span>
+                <span class="channel-res-rate">${rate}%</span>
+            </div>
+            <div class="channel-res-track">
+                <div class="channel-res-fill-resolved" style="width:${resPct}%"></div>
+                <div class="channel-res-fill-open" style="width:${openPct}%"></div>
+            </div>
+            <div class="channel-res-legend">
+                <span class="leg-resolved">${d.resolved} resolved</span>
+                <span class="leg-open">${d.open_count} open</span>
+            </div>
+        </div>`;
+    }).join('');
+}
+
+// ===================================
+// Escalation Chart
+// ===================================
+function renderEscalationChart(data) {
+    const el = document.getElementById('escalationChart');
+    if (!el) return;
+    if (!data.length) { el.innerHTML = '<p class="text-muted text-small">No data</p>'; return; }
+    const labels = { whatsapp: 'WhatsApp', instagram: 'Instagram', website: 'Website', widget: 'Website' };
+    el.innerHTML = data.map(d => {
+        const key = (d.channel || 'other').toLowerCase();
+        const escPct = d.total > 0 ? Math.round(d.escalated / d.total * 100) : 0;
+        const selfPct = d.total > 0 ? Math.round(d.self_served / d.total * 100) : 0;
+        return `<div class="escalation-item">
+            <div class="escalation-header">
+                <span class="escalation-name">${labels[key] || key}</span>
+                <span class="escalation-pct">${escPct}% escalated</span>
+            </div>
+            <div class="escalation-track">
+                <div class="escalation-fill-escalated" style="width:${escPct}%"></div>
+                <div class="escalation-fill-self" style="width:${selfPct}%"></div>
+            </div>
+        </div>`;
+    }).join('');
+}
+
+// ===================================
+// Resolution Trend
+// ===================================
+function renderResolutionTrend(data) {
+    const el = document.getElementById('resolutionTrend');
+    if (!el) return;
+    if (!data.length) { el.innerHTML = '<p class="text-muted text-small" style="text-align:center;padding:24px;width:100%">No trend data</p>'; return; }
+    const max = Math.max(...data.map(d => d.total), 1);
+    el.innerHTML = data.map(d => {
+        const totalH = (d.total / max) * 100;
+        const resH = d.total > 0 ? (d.resolved / d.total) * totalH : 0;
+        const openH = totalH - resH;
+        const label = new Date(d.day + 'T00:00:00').toLocaleDateString('en', { weekday: 'short' });
+        return `<div class="res-trend-bar">
+            <span class="res-trend-count">${d.total}</span>
+            <div class="res-trend-stack" style="height:${totalH}%">
+                <div class="res-trend-resolved" style="flex:${d.resolved || 0.1}"></div>
+                <div class="res-trend-open" style="flex:${(d.total - d.resolved) || 0.1}"></div>
+            </div>
+            <span class="res-trend-label">${label}</span>
+        </div>`;
+    }).join('');
+}
+
+// ===================================
+// Portal Performance
+// ===================================
+function renderPortalPerformance(data) {
+    const el = document.getElementById('portalPerformance');
+    if (!el) return;
+    if (!data.length) { el.innerHTML = '<p class="text-muted text-small">No portals configured</p>'; return; }
+    el.innerHTML = data.map(d => {
+        const rate = d.assigned > 0 ? Math.round(d.resolved / d.assigned * 100) : 0;
+        return `<div class="portal-perf-item">
+            <span class="portal-perf-name">${esc(d.portal_name || 'Unknown')}</span>
+            <div class="portal-perf-stats">
+                <div class="portal-perf-stat">
+                    <div class="portal-perf-stat-val">${d.assigned}</div>
+                    <div class="portal-perf-stat-label">Total</div>
+                </div>
+                <div class="portal-perf-stat">
+                    <div class="portal-perf-stat-val" style="color:var(--success)">${d.resolved}</div>
+                    <div class="portal-perf-stat-label">Resolved</div>
+                </div>
+                <div class="portal-perf-stat">
+                    <div class="portal-perf-stat-val" style="color:var(--warning)">${d.open_count}</div>
+                    <div class="portal-perf-stat-label">Open</div>
+                </div>
+                <div class="portal-perf-stat">
+                    <div class="portal-perf-stat-val">${rate}%</div>
+                    <div class="portal-perf-stat-label">Rate</div>
+                </div>
+            </div>
+            <div class="portal-perf-bar">
+                <div class="portal-perf-bar-fill" style="width:${rate}%"></div>
+            </div>
+        </div>`;
+    }).join('');
 }
 
 // ===================================
