@@ -546,6 +546,7 @@ async function createWidgetTicket({ name, phone, email, message, orderId, source
         portal_id: portalId,
         status: 'open',
         source: ticketSource,
+        channel: 'website',
         created_at: new Date().toISOString(),
         updated_at: new Date().toISOString()
     });
