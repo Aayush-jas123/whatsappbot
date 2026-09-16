@@ -981,12 +981,11 @@
             } else if (/^#?\d{4,}$/.test(text.replace(/\s/g, ''))) {
                 doTrackOrder(text.replace(/^#/, ''));
             } else {
-                addBotMessage('Please select an option:', [
-                    { label: 'Track Order', action: 'track_order' },
-                    { label: 'Return / Exchange', action: 'file_return' },
-                    { label: 'Track Your Request', action: 'track_request' },
-                    { label: 'Contact Support', action: 'contact_support' }
-                ]);
+                // Free-text in idle state — continue the AI conversation instead of showing the menu
+                if (typeof flowContext.aiAttempts !== 'number') {
+                    flowContext = { aiAttempts: 0 };
+                }
+                doResolveWithAI(text);
             }
         }
     }
