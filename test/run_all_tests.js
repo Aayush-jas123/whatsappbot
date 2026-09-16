@@ -18,7 +18,8 @@ const testSuites = [
     { name: 'Reqs 16-20: RTO, Courier, Pickup, Anomalies & Complaints', file: 'test/test_rto_courier_pickup_anomaly_complaints.js' },
     { name: 'Req 21: Return & Exchange Analytics', file: 'test/test_return_exchange_analytics.js' },
     { name: 'Copilot Core: Smart Memory & Entity Context', file: 'test/test_ai_memory_smart.js' },
-    { name: 'Req 22: Pincode & Location Analytics', file: 'test/test_location_analytics.js' }
+    { name: 'Req 22: Pincode & Location Analytics', file: 'test/test_location_analytics.js' },
+    { name: 'Req 23: Next-Action Decision Assistant', file: 'test/test_decision_assistant.js' }
 ];
 
 async function runSuite(suite) {
@@ -50,7 +51,7 @@ async function runSuite(suite) {
 
 (async () => {
     console.log('\n============================================================');
-    console.log('MASTER REGRESSION TEST RUNNER: REQUIREMENTS 1 TO 22');
+    console.log('MASTER REGRESSION TEST RUNNER: REQUIREMENTS 1 TO 23');
     console.log('============================================================\n');
 
     let allPassed = true;
@@ -70,7 +71,7 @@ async function runSuite(suite) {
     }
 
     if (allPassed) {
-        console.log('\n🎉 ALL 13 TEST SUITES (367 TESTS) PASSED WITH 0 REGRESSIONS!');
+        console.log('\n🎉 ALL 14 TEST SUITES (386 TESTS) PASSED WITH 0 REGRESSIONS!');
         process.exit(0);
     } else {
         console.error('\n⚠️ SOME REGRESSION SUITES FAILED!');

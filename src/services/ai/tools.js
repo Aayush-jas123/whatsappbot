@@ -828,6 +828,56 @@ const tools = [
         }
     },
     {
+        name: 'get_next_action_recommendation',
+        description: 'Provide operational decision-support for customer support situations. Evaluates codified brand SOPs, live order data, carrier tracking, payment mode, return history, and customer profile to recommend the exact next operational step. Answers: "What should I do?", "What\'s the correct process?", and "How should I handle this?". Strictly enforces human-in-the-loop safety (recommends next action but never auto-executes destructive or financial actions). Emits structured Situation, Evidence, Applicable Policy, Recommended Action, and Customer-Facing Response.',
+        parameters: {
+            type: 'object',
+            properties: {
+                problemDescription: {
+                    type: 'string',
+                    description: 'Description of the customer issue, complaint, or operational question (e.g. "Order marked delivered but customer says they didn\'t receive it", "Customer received size M instead of L", "Wants cash refund for return")'
+                },
+                orderId: {
+                    type: 'string',
+                    description: 'Order ID or number if known (e.g. "50992", "#42248")'
+                },
+                phone: {
+                    type: 'string',
+                    description: 'Customer phone number if known'
+                },
+                customerIdentifier: {
+                    type: 'string',
+                    description: 'Optional customer identifier (phone, order ID, email, name)'
+                },
+                customerFacingRequested: {
+                    type: 'boolean',
+                    description: 'Whether to include a ready-to-send draft message for the customer (default true)'
+                }
+            },
+            required: ['problemDescription']
+        },
+        requiresConfirmation: false,
+        async execute({ problemDescription, orderId, phone, customerIdentifier, customerFacingRequested }, ctx) {
+            const {
+                evaluateNextAction,
+                formatDecisionReport
+            } = require('../decisionAssistantService');
+
+            const res = await evaluateNextAction({
+                problemDescription,
+                orderId,
+                phone,
+                customerIdentifier,
+                customerFacingRequested: customerFacingRequested !== false
+            });
+
+            return {
+                ...res,
+                formatted_report: formatDecisionReport(res)
+            };
+        }
+    },
+    {
         name: 'search_messages',
         description: 'Get the recent WhatsApp conversation (incoming and outgoing messages) for a customer phone number.',
         parameters: {
@@ -1796,6 +1846,7 @@ const TOOL_TRIGGERS = {
     get_complaint_patterns: /\b(complaint\s*patterns?|complaints?\s*analytics|recurring\s*(?:issues?|complaints?)|complaint\s*trend|ticket\s*trend|most\s*common\s*complaints?|grievance\s*pattern|complaint\s*categor\w*|customer\s*complaints?|complaints?\s*by\s*product|complaints?\s*by\s*courier)\b/i,
     get_return_exchange_analytics: /\b(return\s*analytics|exchange\s*analytics|return\s*rate|exchange\s*rate|which\s*sku\s*has\s*the\s*highest\s*return|which\s*size\s*has\s*the\s*most\s*exchanges|why\s*(?:are\s*)?customers\s*returning|returns?\s*by\s*product|returns?\s*by\s*sku|returns?\s*by\s*size|size\s*exchange\s*patterns?|product\s*problems?|defect\s*rate|highest\s*return\s*rate|most\s*exchanges)\b/i,
     get_location_analytics: /\b(location\s*analytics|pincode\s*analytics|city\s*analytics|state\s*analytics|which\s*pincodes?\s*have\s*the\s*highest\s*rto|where\s*(?:are\s*)?delivery\s*complaints\s*concentrated|which\s*cities\s*have\s*the\s*most\s*orders|orders\s*by\s*(?:city|pincode|state|location)|rto\s*by\s*(?:pincode|city|state|location)|highest\s*rto\s*pincode|delivery\s*delay\s*by\s*(?:city|pincode)|cod\s*cancellation\s*by\s*(?:city|pincode)|pincode\s*rto|city\s*orders|pincode\s*\d{6})\b/i,
+    get_next_action_recommendation: /\b(what\s*(?:should|do|can)\s*(?:i|we)\s*do|what(?:'s|\s*is)\s*the\s*correct\s*process|how\s*(?:should|do|can)\s*(?:i|we)\s*handle|next\s*action|decision\s*assistant|sop\s*procedure|how\s*to\s*proceed|what\s*action\s*to\s*take|advise\s*me|customer\s*says?\s*.*(?:what\s*should\s*i|how\s*to\s*handle))\b/i,
     search_messages: /\b(messages?|chats?|conversations?|whatsapp|said|replied|history)\b/i,
     list_tickets: /\b(tickets?|support|complaints?|issues?|queries|grievance)\b/i,
     search_learned_replies: /\b(reply|replies|respond|draft|answer|suggest\w*|how (do|did|should) we)\b/i,

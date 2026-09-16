@@ -33,10 +33,60 @@
 | 21 | Return and Exchange Analytics | ✅ Complete (Localhost) | 2026-09-09 | 20 / 20 tests passed (Live Verified) |
 | Core | Smart Conversational Memory & In-Memory Acceleration | ✅ Complete (Localhost) | 2026-09-16 | 11 / 11 tests passed (Live Verified) |
 | 22 | Pincode and Location Analytics | ✅ Complete (Localhost) | 2026-09-16 | 16 / 16 tests passed (Live Verified) |
+| 23 | Next-Action Decision Assistant | ✅ Complete (Localhost) | 2026-09-16 | 19 / 19 tests passed (Live Verified) |
 
 ---
 
 ## Detailed Entries
+
+### Requirement 23: Next-Action Decision Assistant
+
+- **Goal**: Empower Customer Care Officers to describe any customer problem or operational dilemma and receive the authoritative, policy-compliant next operational step by synthesizing live order data, shipment tracking, payment status, return/exchange records, customer history, and brand SOP policies.
+- **Why**: The biggest value of an internal Copilot is eliminating cognitive load, guesswork, and time-consuming manual SOP lookups for officers while enforcing brand policy guardrails and preventing unauthorized actions.
+- **Key Capabilities Implemented**:
+  1. **Multi-Source Operational Synthesis (Step 1)**:
+     - Cross-references `orderIntelligenceService.investigateOrder()` (34,410+ store orders & items).
+     - Cross-references `shipmentIntelligenceService.getShipmentIntelligence()` (19,275+ carrier tracking records).
+     - Cross-references `paymentInvestigationService.investigatePayment()` (Razorpay / Cashfree / COD reconciliation).
+     - Cross-references `returnInvestigationService.investigateReturnExchange()` (reverse logistics & proof validation).
+     - Cross-references `customer360Service.getCustomer360()` (customer loyalty, LTV, and risk tier).
+  2. **6-Stage Decision-Support Pipeline (Step 2)**:
+     `Understand Issue` → `Retrieve Relevant Data` → `Identify Scenario` → `Retrieve Applicable SOP` → `Evaluate Conditions` → `Recommend Next Action`.
+  3. **13 Codified Operational Scenarios (Step 2 & 3)**:
+     - `DELIVERED_NOT_RECEIVED`: 24-hour false delivery POD investigation workflow. Checks household/security; raises carrier dispute for signed proof of delivery. Zero auto-refund before courier POD verification.
+     - `TRANSIT_DELAY_STUCK`: Flags shipments stalled >48h without scan; triggers courier escalation and customer reassurance.
+     - `RTO_IN_TRANSIT`: Enforces prepaid 100% refund upon warehouse check-in vs COD zero refund.
+     - `WRONG_PRODUCT`: Enforces mandatory continuous unboxing video requirement; arranges replacement dispatch upon video verification.
+     - `DAMAGED_DEFECTIVE`: Enforces clear photo evidence requirement within 72 hours; initiates immediate reverse pickup and replacement/refund.
+     - `SIZE_EXCHANGE`: Verifies 7-day delivery window and warehouse variant stock; directs customer to self-service portal (`offcomfrt.in/pages/return`).
+     - `DISCRETIONARY_REFUND`: Strictly enforces store credit only (valid 1 year); cash/bank refunds for change of mind are prohibited by policy.
+     - `PREPAID_DOUBLE_CHARGE`: Detects gateway double-debits and auto-initiates reconciliation difference refund within 5–7 banking days.
+     - `ADDRESS_CHANGE`: Post-dispatch carrier redirection prevention; handles courier recall or door refusal based on prepaid vs COD.
+     - `CANCELLATION`: Checks dispatch state; processes immediate refund if unfulfilled or guides customer to refuse delivery if already shipped.
+     - `RETURN_PICKUP_DELAY`: Checks 24–48h reverse pickup SLA; escalates to courier partner or reschedules pickup slot.
+     - `CUSTOMER_ESCALATION`: Escalates to senior team leader / supervisor when standard resolution cannot satisfy customer.
+     - `GENERAL_SOP`: Fallback to codified brand SOP guidelines.
+  4. **Required 5-Section Structured Output Layout (Step 4)**:
+     - **Situation**: Concise summary of the active dilemma, order status, and customer issue.
+     - **Evidence**: Live multi-source facts (Order status, financial status, carrier tracking, return status, customer tier).
+     - **Applicable Policy**: Quoted SOP section and brand policy rule (e.g. SOP Section 3, Section 5, Section 7, Section 9).
+     - **Recommended Action**: Immediate step, conditional follow-up, and safety guardrail.
+     - **Customer-Facing Response**: Ready-to-send empathetic, professional message draft.
+  5. **Human-in-the-Loop Safety Guardrail (Step 5 & Acceptance)**:
+     - `action_executed: false` is permanently enforced on all decision outputs.
+     - Copilot NEVER executes financial disbursements, cancellations, or shipment redirects automatically simply because they were recommended. All actions remain purely advisory for human officer execution.
+- **Changes Made**:
+  1. **New Service**: [`src/services/decisionAssistantService.js`](file:///d:/offcom/src/services/decisionAssistantService.js)
+  2. **AI Tool Integration**: Registered `get_next_action_recommendation` (50 total specialized tools) in [`src/services/ai/tools.js`](file:///d:/offcom/src/services/ai/tools.js) with zero-shot `TOOL_TRIGGERS`.
+  3. **System Prompt Updates**: Added Section 26: Next-Action Decision Assistant to [`src/services/ai/agent.js`](file:///d:/offcom/src/services/ai/agent.js).
+  4. **Automated Test Suite**: Created 19-test suite in [`test/test_decision_assistant.js`](file:///d:/offcom/test/test_decision_assistant.js) (19/19 passed, 0 failed).
+  5. **Master Regression Suite**: Integrated into [`test/run_all_tests.js`](file:///d:/offcom/test/run_all_tests.js) (14 suites, 386 tests).
+- **Verification Results**:
+  - `node test/test_decision_assistant.js`: **19 passed, 0 failed**
+  - Full Regression Pass (`node test/run_all_tests.js`): **386 passed, 0 failed across all 14 test suites**
+  - Zero git push constraint respected: **Localhost only**
+
+---
 
 ### Requirement 22: Pincode and Location Analytics
 
@@ -594,11 +644,12 @@
 - `src/services/complaintPatternService.js` *(NEW - Req 20)*
 - `src/services/returnAnalyticsService.js` *(NEW - Req 21)*
 - `src/services/locationAnalyticsService.js` *(NEW - Req 22: Pincode & Location Analytics)*
+- `src/services/decisionAssistantService.js` *(NEW - Req 23: Next-Action Decision Assistant)*
 - `src/services/ai/aiMemoryService.js` *(NEW - Copilot Core: Working Memory & Compression)*
 
 ### AI Integration & Routes
-- `src/services/ai/tools.js` *(MODIFIED - 49 specialized tools + PostgreSQL fallback)*
-- `src/services/ai/agent.js` *(MODIFIED - System prompt with Section 25 Location Analytics, active memory injection)*
+- `src/services/ai/tools.js` *(MODIFIED - 50 specialized tools + PostgreSQL fallback)*
+- `src/services/ai/agent.js` *(MODIFIED - System prompt with Section 26 Next-Action Decision Assistant, Section 25 Location Analytics, active memory injection)*
 - `src/services/ai/aiStore.js` *(MODIFIED - High-speed in-memory LRU chat history cache)*
 - `src/database/db.js` *(MODIFIED - Optimized query pool & cache integration)*
 - `src/routes/adminRoutes.js` *(MODIFIED - AI chat with active memory, clear memory endpoint)*
@@ -609,8 +660,8 @@
 - `public/dashboard/js/ai-copilot-pro/chat.js` *(MODIFIED - Active memory pill rendering, forget context action, Markdown bold/italic parser, IST metadata pills, denominator chips, tier badges)*
 - `public/dashboard/js/ai-copilot.js` *(MODIFIED - Rich markdown parser & badge pills)*
 
-### Regression Test Suites (All 13 Suites / 367 Tests Passing)
-- `test/run_all_tests.js` *(NEW - Master test runner across Reqs 1-22)*
+### Regression Test Suites (All 14 Suites / 386 Tests Passing)
+- `test/run_all_tests.js` *(NEW - Master test runner across Reqs 1-23)*
 - `test/test_order_intelligence.js` *(NEW - 47 tests)*
 - `test/test_customer_360.js` *(NEW - 36 tests)*
 - `test/test_conversation_history.js` *(NEW - 24 tests)*
@@ -624,6 +675,7 @@
 - `test/test_return_exchange_analytics.js` *(NEW - 20 tests)*
 - `test/test_ai_memory_smart.js` *(NEW - 11 tests)*
 - `test/test_location_analytics.js` *(NEW - 16 tests)*
+- `test/test_decision_assistant.js` *(NEW - 19 tests)*
 - `COPILOT_CHANGELOG.md` *(UPDATED)*
 
 ---
