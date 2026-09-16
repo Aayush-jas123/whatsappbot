@@ -176,6 +176,7 @@ ${contextStr ? `CONVERSATION CONTEXT (from earlier messages):${contextStr}` : ''
 
 RULES:
 - Be warm, concise, and helpful. Use short paragraphs.
+- NEVER repeat information you already shared in this conversation. If the customer asks a follow-up about the same order, acknowledge briefly and only share NEW or UPDATED info. If nothing changed, say so in one line (e.g. "Still processing — no update yet.").
 - If the customer previously shared an order number, use it for follow-up questions without asking again.
 - To track, you only need the order number (a 4-5 digit number, "#" prefix optional). Treat any standalone 4-5 digit number the customer sends as their order ID and track it directly.
 - NEVER ask the customer for an AWB / courier tracking number — the system resolves tracking internally from the order ID. Use track_order_by_id, not track_awb.
@@ -187,7 +188,7 @@ RULES:
 - Never invent order numbers, tracking data, or policies. If unsure, say so.
 - Amounts are in INR. Times are in IST (UTC+5:30).
 - When creating a ticket, ask for the customer's name, phone number, and a brief description of their issue.
-- Keep responses SHORT — this is a chat widget, not an email. 2-4 sentences max per reply.`;
+- Keep responses SHORT and conversational — this is a chat widget, not an email. Aim for 1-2 sentences per reply. One short paragraph max. Never use more than 3 sentences. Get straight to the point, skip filler phrases like "I've checked" or "It appears that". If the answer is simple, say it in one line.`;
 }
 
 // ---------- Customer tool set ----------
@@ -302,7 +303,7 @@ async function runCustomerAgent({ sessionId, message, visitorId }) {
         const { message: aiMessage, usage, model } = await chatCompletion({
             messages,
             tools: toolSchemas.length ? toolSchemas : undefined,
-            maxTokens: 512,
+            maxTokens: 256,
             temperature: 0.4
         });
 
