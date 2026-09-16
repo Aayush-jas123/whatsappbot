@@ -910,7 +910,7 @@
         var html =
             '<div class="oftb-ticket-confirm-icon"><svg viewBox="0 0 24 24"><polyline points="20 6 9 17 4 12"/></svg></div>' +
             '<h4>Ticket Created</h4>' +
-            '<p>Our team will respond within 24 hours.</p>' +
+            '<p>Please continue on WhatsApp.</p>' +
             '<div class="oftb-ticket-number">' + escapeHtml(data.ticketNumber) + '</div>';
 
         if (data.whatsappLink) {
