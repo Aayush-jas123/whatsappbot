@@ -4966,6 +4966,85 @@ router.put('/support-portals/:id/password', verifyToken, async (req, res) => {
 });
 
 // ============================================================
+// AI SUPPORT ANALYTICS — aggregated insights for the dashboard
+// ============================================================
+
+router.get('/support-analytics/ai-overview', verifyToken, async (req, res) => {
+    try {
+        const cacheKey = 'ai_support_overview';
+        const cached = getCached(cacheKey);
+        if (cached) return res.json(cached);
+
+        const [
+            totalStats,
+            channelStats,
+            sentimentStats,
+            dailyVolume,
+            scenarioStats
+        ] = await Promise.all([
+            // Overall ticket stats
+            dbAdapter.query(`SELECT
+                COUNT(*)::int AS total,
+                COUNT(*) FILTER (WHERE status = 'open')::int AS open,
+                COUNT(*) FILTER (WHERE status = 'resolved')::int AS resolved,
+                COUNT(*) FILTER (WHERE is_read = false)::int AS unread,
+                COUNT(*) FILTER (WHERE sentiment = 'negative')::int AS negative,
+                COUNT(*) FILTER (WHERE sentiment = 'positive')::int AS positive,
+                COUNT(*) FILTER (WHERE sentiment = 'neutral')::int AS neutral
+            FROM support_tickets`),
+
+            // Channel breakdown
+            dbAdapter.query(`SELECT channel, COUNT(*)::int AS count
+                FROM support_tickets GROUP BY channel ORDER BY count DESC`),
+
+            // Sentiment breakdown
+            dbAdapter.query(`SELECT sentiment, COUNT(*)::int AS count
+                FROM support_tickets WHERE sentiment IS NOT NULL GROUP BY sentiment ORDER BY count DESC`),
+
+            // Daily volume (last 14 days, IST)
+            dbAdapter.query(`SELECT
+                TO_CHAR(DATE(created_at AT TIME ZONE 'UTC' AT TIME ZONE 'Asia/Kolkata'), 'YYYY-MM-DD') AS day,
+                COUNT(*)::int AS count
+            FROM support_tickets
+            WHERE created_at >= NOW() - INTERVAL '14 days'
+            GROUP BY DATE(created_at AT TIME ZONE 'UTC' AT TIME ZONE 'Asia/Kolkata')
+            ORDER BY day ASC`),
+
+            // AI scenario breakdown
+            dbAdapter.query(`SELECT ai_scenario, COUNT(*)::int AS count
+                FROM support_tickets WHERE ai_scenario IS NOT NULL GROUP BY ai_scenario ORDER BY count DESC LIMIT 10`)
+        ]);
+
+        const stats = totalStats[0] || {};
+        const resolutionRate = stats.total > 0 ? Math.round((stats.resolved / stats.total) * 100) : 0;
+
+        const response = {
+            success: true,
+            overview: {
+                total: stats.total || 0,
+                open: stats.open || 0,
+                resolved: stats.resolved || 0,
+                unread: stats.unread || 0,
+                resolutionRate,
+                negativeCount: stats.negative || 0,
+                positiveCount: stats.positive || 0,
+                neutralCount: stats.neutral || 0
+            },
+            channels: channelStats,
+            sentiments: sentimentStats,
+            dailyVolume,
+            topScenarios: scenarioStats
+        };
+
+        setCache(cacheKey, response, 'stats', 5 * 60 * 1000);
+        res.json(response);
+    } catch (error) {
+        console.error('AI support analytics error:', error);
+        res.status(500).json({ success: false, error: 'Failed to fetch AI analytics' });
+    }
+});
+
+// ============================================================
 // SHIPPING MODULE (Shopper Hub) — carrier-agnostic shipping API
 // ============================================================
 const shippingService = require('../services/shippingService');
