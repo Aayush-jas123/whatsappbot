@@ -552,8 +552,9 @@
                     { label: 'Menu', action: 'main_menu' }
                 ]);
             } else {
+                var label = payload.requestId || ('#' + payload.orderId);
                 addBotMessage(
-                    'No return or exchange request found for order *#' + orderId + '*.\n\n' +
+                    'No return or exchange request found for *' + label + '*.\n\n' +
                     'You can submit a request on our pages.',
                     [
                         { label: 'Return Page', action: 'open_return_url', primary: true },
@@ -868,11 +869,11 @@
             addUserMessage(text);
             doTrackOrder(text);
         } else if (flowState === 'awaiting_request_track_id') {
-            var reqCheck = input.match(/\b(REQ-\d{4,6})\b/i);
+            var reqCheck = text.match(/\b(REQ-\d{4,6})\b/i);
             if (reqCheck) {
-                doTrackRequest(input);
-            } else if (/^#?\d{4,}$/.test(input.replace(/\s/g, ''))) {
-                doTrackRequest(input);
+                doTrackRequest(text);
+            } else if (/^#?\d{4,}$/.test(text.replace(/\s/g, ''))) {
+                doTrackRequest(text);
             } else {
                 addBotMessage('Please enter a valid *order number* or *request ID* (e.g. REQ-12345).', [
                     { label: 'Back to Menu', action: 'main_menu' }

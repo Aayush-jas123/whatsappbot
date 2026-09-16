@@ -404,13 +404,104 @@ router.post('/ticket', async (req, res) => {
 
 router.post('/track-request', async (req, res) => {
     try {
-        const { orderId } = req.body;
-        if (!orderId) {
-            return res.status(400).json({ error: 'Order ID is required' });
+        const { orderId, requestId } = req.body;
+        if (!orderId && !requestId) {
+            return res.status(400).json({ error: 'Order ID or Request ID is required' });
         }
 
-        const cleanOrderId = String(orderId).replace(/^#/, '').trim();
         const { dbAdapter } = require('../database/db');
+
+        // --- Request ID lookup (REQ-XXXX) ---
+        if (requestId) {
+            const reqId = String(requestId).trim().toUpperCase();
+            const bareId = reqId.replace(/^REQ-/, '');
+
+            // Check local returns table
+            const returnRows = await dbAdapter.query(
+                `SELECT return_id, order_id, reason, status, pickup_scheduled_date, refund_amount, created_at
+                 FROM returns WHERE return_id = ? OR return_id = ? ORDER BY created_at DESC LIMIT 5`,
+                [reqId, bareId]
+            );
+            // Check local exchanges table
+            const exchangeRows = await dbAdapter.query(
+                `SELECT exchange_id, order_id, reason, status, pickup_scheduled_date, created_at
+                 FROM exchanges WHERE exchange_id = ? OR exchange_id = ? ORDER BY created_at DESC LIMIT 5`,
+                [reqId, bareId]
+            );
+
+            const localReturns = returnRows.map(r => ({
+                request_id: r.return_id,
+                order_number: r.order_id,
+                type: 'return',
+                status: r.status,
+                reason: r.reason,
+                items: [],
+                created_at: r.created_at
+            }));
+            const localExchanges = exchangeRows.map(r => ({
+                request_id: r.exchange_id,
+                order_number: r.order_id,
+                type: 'exchange',
+                status: r.status,
+                reason: r.reason,
+                items: [],
+                created_at: r.created_at
+            }));
+
+            // Also check external returns server by request_id
+            let externalRequests = [];
+            const baseUrl = process.env.RETURNS_SERVER_URL;
+            const token = process.env.WHATSAPP_INTERNAL_TOKEN;
+            if (baseUrl) {
+                try {
+                    const axios = require('axios');
+                    const response = await axios.get(
+                        `${baseUrl.replace(/\/$/, '')}/api/internal/inventory-open-requests?window=90`,
+                        { headers: { 'x-internal-token': token || '' }, timeout: 15000 }
+                    );
+                    if (response.data?.success && Array.isArray(response.data.requests)) {
+                        externalRequests = response.data.requests.filter(r =>
+                            String(r.request_id).toUpperCase() === reqId ||
+                            String(r.request_id).toUpperCase() === bareId
+                        );
+                    }
+                } catch (err) {
+                    console.warn('[widget] returns server fetch failed:', err.message);
+                }
+            }
+
+            const allRequests = [
+                ...externalRequests.map(r => ({
+                    request_id: r.request_id,
+                    order_number: r.order_number,
+                    type: r.type,
+                    status: r.status,
+                    reason: r.reason || null,
+                    items: Array.isArray(r.items) ? r.items : [],
+                    created_at: r.created_at
+                })),
+                ...localReturns,
+                ...localExchanges
+            ];
+
+            // Deduplicate by request_id
+            const seen = new Set();
+            const deduped = allRequests.filter(r => {
+                const key = String(r.request_id).toUpperCase();
+                if (seen.has(key)) return false;
+                seen.add(key);
+                return true;
+            });
+
+            return res.json({
+                requestId: reqId,
+                requests: deduped,
+                count: deduped.length
+            });
+        }
+
+        // --- Order ID lookup ---
+        const cleanOrderId = String(orderId).replace(/^#/, '').trim();
 
         // Fetch from external returns server
         let requests = [];
@@ -433,16 +524,16 @@ router.post('/track-request', async (req, res) => {
             }
         }
 
-        // Also check local tables
+        // Check local tables — match with and without # prefix
         const returnRows = await dbAdapter.query(
             `SELECT return_id, order_id, reason, status, pickup_scheduled_date, refund_amount, created_at
-             FROM returns WHERE order_id = ? ORDER BY created_at DESC LIMIT 5`,
-            [cleanOrderId]
+             FROM returns WHERE (order_id = ? OR order_id = ? OR order_id LIKE ?) ORDER BY created_at DESC LIMIT 5`,
+            [cleanOrderId, `#${cleanOrderId}`, `%${cleanOrderId}`]
         );
         const exchangeRows = await dbAdapter.query(
             `SELECT exchange_id, order_id, reason, status, pickup_scheduled_date, created_at
-             FROM exchanges WHERE order_id = ? ORDER BY created_at DESC LIMIT 5`,
-            [cleanOrderId]
+             FROM exchanges WHERE (order_id = ? OR order_id = ? OR order_id LIKE ?) ORDER BY created_at DESC LIMIT 5`,
+            [cleanOrderId, `#${cleanOrderId}`, `%${cleanOrderId}`]
         );
 
         const localReturns = returnRows.map(r => ({
@@ -478,10 +569,19 @@ router.post('/track-request', async (req, res) => {
             ...localExchanges
         ];
 
+        // Deduplicate by request_id
+        const seen = new Set();
+        const deduped = allRequests.filter(r => {
+            const key = String(r.request_id || '').toUpperCase() + '|' + (r.order_number || '');
+            if (seen.has(key)) return false;
+            seen.add(key);
+            return true;
+        });
+
         res.json({
             orderId: cleanOrderId,
-            requests: allRequests,
-            count: allRequests.length
+            requests: deduped,
+            count: deduped.length
         });
     } catch (error) {
         console.error('[widget] track-request error:', error.message);
