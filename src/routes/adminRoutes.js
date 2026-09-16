@@ -5036,9 +5036,23 @@ router.put('/support-portals/:id/password', verifyToken, async (req, res) => {
 
 router.get('/support-analytics/ai-overview', verifyToken, async (req, res) => {
     try {
-        const cacheKey = 'ai_support_overview';
+        const { date_from, date_to } = req.query;
+        const cacheKey = `ai_support_overview_${date_from || 'all'}_${date_to || 'all'}`;
         const cached = getCached(cacheKey);
         if (cached) return res.json(cached);
+
+        // Build reusable date filter
+        const dateClauses = [];
+        const dateParams = [];
+        if (date_from) {
+            dateClauses.push('created_at >= ?::date AT TIME ZONE \'Asia/Kolkata\'');
+            dateParams.push(date_from);
+        }
+        if (date_to) {
+            dateClauses.push('created_at < (?::date + INTERVAL \'1 day\') AT TIME ZONE \'Asia/Kolkata\'');
+            dateParams.push(date_to);
+        }
+        const dateWhere = dateClauses.length ? ` AND ${dateClauses.join(' AND ')}` : '';
 
         const [
             totalStats,
@@ -5069,49 +5083,46 @@ router.get('/support-analytics/ai-overview', verifyToken, async (req, res) => {
                 COUNT(*) FILTER (WHERE sentiment = 'neutral')::int AS neutral,
                 COUNT(*) FILTER (WHERE ai_scenario IS NOT NULL)::int AS ai_classified,
                 COUNT(*) FILTER (WHERE portal_id IS NOT NULL)::int AS portal_assigned
-            FROM support_tickets`),
+            FROM support_tickets WHERE 1=1${dateWhere}`, dateParams),
 
             // Channel breakdown
             dbAdapter.query(`SELECT channel, COUNT(*)::int AS count
-                FROM support_tickets GROUP BY channel ORDER BY count DESC`),
+                FROM support_tickets WHERE 1=1${dateWhere} GROUP BY channel ORDER BY count DESC`, dateParams),
 
             // Sentiment breakdown
             dbAdapter.query(`SELECT sentiment, COUNT(*)::int AS count
-                FROM support_tickets WHERE sentiment IS NOT NULL GROUP BY sentiment ORDER BY count DESC`),
+                FROM support_tickets WHERE sentiment IS NOT NULL${dateWhere} GROUP BY sentiment ORDER BY count DESC`, dateParams),
 
-            // Daily volume (last 14 days, IST)
+            // Daily volume (range or last 14 days, IST)
             dbAdapter.query(`SELECT
                 TO_CHAR(DATE(created_at AT TIME ZONE 'UTC' AT TIME ZONE 'Asia/Kolkata'), 'YYYY-MM-DD') AS day,
                 COUNT(*)::int AS count
             FROM support_tickets
-            WHERE created_at >= NOW() - INTERVAL '14 days'
+            WHERE 1=1${dateWhere}${dateClauses.length ? '' : " AND created_at >= NOW() - INTERVAL '14 days'"}
             GROUP BY DATE(created_at AT TIME ZONE 'UTC' AT TIME ZONE 'Asia/Kolkata')
-            ORDER BY day ASC`),
+            ORDER BY day ASC`, dateParams),
 
             // AI scenario breakdown
             dbAdapter.query(`SELECT ai_scenario, COUNT(*)::int AS count,
                 ROUND(AVG(ai_confidence)::numeric, 2)::float AS avg_confidence
-                FROM support_tickets WHERE ai_scenario IS NOT NULL GROUP BY ai_scenario ORDER BY count DESC LIMIT 15`),
+                FROM support_tickets WHERE ai_scenario IS NOT NULL${dateWhere} GROUP BY ai_scenario ORDER BY count DESC LIMIT 15`, dateParams),
 
-            // ── NEW: Hourly distribution (0-23h IST) ──
+            // Hourly distribution (0-23h IST)
             dbAdapter.query(`SELECT
                 EXTRACT(HOUR FROM created_at AT TIME ZONE 'UTC' AT TIME ZONE 'Asia/Kolkata')::int AS hour,
                 COUNT(*)::int AS count
-            FROM support_tickets
+            FROM support_tickets WHERE 1=1${dateWhere}
             GROUP BY EXTRACT(HOUR FROM created_at AT TIME ZONE 'UTC' AT TIME ZONE 'Asia/Kolkata')
-            ORDER BY hour ASC`),
+            ORDER BY hour ASC`, dateParams),
 
-            // ── NEW: Channel × Sentiment cross-tab ──
-            dbAdapter.query(`SELECT
-                channel,
-                sentiment,
-                COUNT(*)::int AS count
+            // Channel x Sentiment cross-tab
+            dbAdapter.query(`SELECT channel, sentiment, COUNT(*)::int AS count
             FROM support_tickets
-            WHERE channel IS NOT NULL AND sentiment IS NOT NULL
+            WHERE channel IS NOT NULL AND sentiment IS NOT NULL${dateWhere}
             GROUP BY channel, sentiment
-            ORDER BY channel, count DESC`),
+            ORDER BY channel, count DESC`, dateParams),
 
-            // ── NEW: Portal performance (assigned count, resolved count) ──
+            // Portal performance
             dbAdapter.query(`SELECT
                 p.name AS portal_name,
                 COUNT(t.id)::int AS assigned,
@@ -5119,11 +5130,11 @@ router.get('/support-analytics/ai-overview', verifyToken, async (req, res) => {
                 COUNT(t.id) FILTER (WHERE t.status = 'open')::int AS open_count,
                 COUNT(t.id) FILTER (WHERE t.is_read = false)::int AS unread
             FROM support_portals p
-            LEFT JOIN support_tickets t ON t.portal_id = p.id
+            LEFT JOIN support_tickets t ON t.portal_id = p.id${dateWhere ? ` AND t.created_at >= '${date_from || '1970-01-01'}'::date AT TIME ZONE 'Asia/Kolkata'` : ''}
             GROUP BY p.id, p.name
             ORDER BY assigned DESC`),
 
-            // ── NEW: AI confidence distribution ──
+            // AI confidence distribution
             dbAdapter.query(`SELECT
                 CASE
                     WHEN ai_confidence >= 0.8 THEN 'high'
@@ -5132,11 +5143,11 @@ router.get('/support-analytics/ai-overview', verifyToken, async (req, res) => {
                     ELSE 'none'
                 END AS tier,
                 COUNT(*)::int AS count
-            FROM support_tickets
+            FROM support_tickets WHERE 1=1${dateWhere}
             GROUP BY tier
-            ORDER BY tier ASC`),
+            ORDER BY tier ASC`, dateParams),
 
-            // ── NEW: Resolution trend (last 7 days) ──
+            // Resolution trend (last 7 days)
             dbAdapter.query(`SELECT
                 TO_CHAR(DATE(updated_at AT TIME ZONE 'UTC' AT TIME ZONE 'Asia/Kolkata'), 'YYYY-MM-DD') AS day,
                 COUNT(*) FILTER (WHERE status = 'resolved')::int AS resolved,
@@ -5146,7 +5157,7 @@ router.get('/support-analytics/ai-overview', verifyToken, async (req, res) => {
             GROUP BY DATE(updated_at AT TIME ZONE 'UTC' AT TIME ZONE 'Asia/Kolkata')
             ORDER BY day ASC`),
 
-            // ── NEW: Today's stats ──
+            // Today's stats
             dbAdapter.query(`SELECT
                 COUNT(*)::int AS today_total,
                 COUNT(*) FILTER (WHERE status = 'open')::int AS today_open,
@@ -5155,42 +5166,40 @@ router.get('/support-analytics/ai-overview', verifyToken, async (req, res) => {
             FROM support_tickets
             WHERE created_at >= (NOW() AT TIME ZONE 'Asia/Kolkata')::date AT TIME ZONE 'Asia/Kolkata'`),
 
-            // ── NEW: Average response time (time from creation to first agent reply) ──
+            // Average response time
             dbAdapter.query(`SELECT
                 ROUND(AVG(EXTRACT(EPOCH FROM (updated_at - created_at)))::numeric, 0)::int AS avg_seconds
             FROM support_tickets
-            WHERE status = 'resolved' AND updated_at > created_at`),
+            WHERE status = 'resolved' AND updated_at > created_at${dateWhere.replace('created_at', 'created_at')}`, dateParams),
 
-            // ── NEW: Peak day (highest volume day in last 14 days) ──
+            // Peak day
             dbAdapter.query(`SELECT
                 TO_CHAR(DATE(created_at AT TIME ZONE 'UTC' AT TIME ZONE 'Asia/Kolkata'), 'YYYY-MM-DD') AS day,
                 COUNT(*)::int AS count
             FROM support_tickets
-            WHERE created_at >= NOW() - INTERVAL '14 days'
+            WHERE 1=1${dateWhere}${dateClauses.length ? '' : " AND created_at >= NOW() - INTERVAL '14 days'"}
             GROUP BY DATE(created_at AT TIME ZONE 'UTC' AT TIME ZONE 'Asia/Kolkata')
-            ORDER BY count DESC LIMIT 1`),
+            ORDER BY count DESC LIMIT 1`, dateParams),
 
-            // ── NEW: Channel resolution rate ──
-            dbAdapter.query(`SELECT
-                channel,
+            // Channel resolution rate
+            dbAdapter.query(`SELECT channel,
                 COUNT(*)::int AS total,
                 COUNT(*) FILTER (WHERE status = 'resolved')::int AS resolved,
                 COUNT(*) FILTER (WHERE status = 'open')::int AS open_count
             FROM support_tickets
-            WHERE channel IS NOT NULL
+            WHERE channel IS NOT NULL${dateWhere}
             GROUP BY channel
-            ORDER BY total DESC`),
+            ORDER BY total DESC`, dateParams),
 
-            // ── NEW: Escalation rate by channel (% that went to human) ──
-            dbAdapter.query(`SELECT
-                channel,
+            // Escalation rate by channel
+            dbAdapter.query(`SELECT channel,
                 COUNT(*)::int AS total,
                 COUNT(*) FILTER (WHERE portal_id IS NOT NULL)::int AS escalated,
                 COUNT(*) FILTER (WHERE portal_id IS NULL)::int AS self_served
             FROM support_tickets
-            WHERE channel IS NOT NULL
+            WHERE channel IS NOT NULL${dateWhere}
             GROUP BY channel
-            ORDER BY total DESC`)
+            ORDER BY total DESC`, dateParams)
         ]);
 
         const stats = totalStats[0] || {};

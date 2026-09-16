@@ -199,7 +199,7 @@ function navigateTo(page) {
 function loadPageData(page) {
     switch (page) {
         case 'support': loadTickets(); loadPortals(); break;
-        case 'ai-analytics': loadAiAnalytics(); break;
+        case 'ai-analytics': initAnalyticsDateFilter(); loadAiAnalytics(); break;
         case 'templates': loadTemplates(); break;
         case 'ig-comments': if (typeof loadIgComments === 'function') loadIgComments(); break;
         case 'settings': loadPortals(); loadUrgentKeywordsPreview(); break;
@@ -641,14 +641,69 @@ function loadUrgentKeywordsPreview() {
 // ===================================
 // AI Analytics
 // ===================================
+let analyticsDateRange = 'all';
+
+function initAnalyticsDateFilter() {
+    const group = document.getElementById('analyticsDateFilter');
+    if (!group) return;
+    group.addEventListener('click', (e) => {
+        const btn = e.target.closest('.date-filter-btn');
+        if (!btn) return;
+        group.querySelectorAll('.date-filter-btn').forEach(b => b.classList.remove('active'));
+        btn.classList.add('active');
+        analyticsDateRange = btn.dataset.range;
+        const info = document.getElementById('analyticsDateInfo');
+        if (info) info.textContent = `Showing ${btn.textContent.toLowerCase()}`;
+        loadAiAnalytics();
+    });
+}
+
+function getDateRangeParams() {
+    const now = new Date();
+    const fmt = d => d.toISOString().split('T')[0];
+    switch (analyticsDateRange) {
+        case 'today':
+            return { date_from: fmt(now), date_to: fmt(now) };
+        case 'yesterday': {
+            const y = new Date(now); y.setDate(y.getDate() - 1);
+            return { date_from: fmt(y), date_to: fmt(y) };
+        }
+        case '7d': {
+            const s = new Date(now); s.setDate(s.getDate() - 6);
+            return { date_from: fmt(s), date_to: fmt(now) };
+        }
+        case '30d': {
+            const s = new Date(now); s.setDate(s.getDate() - 29);
+            return { date_from: fmt(s), date_to: fmt(now) };
+        }
+        case '90d': {
+            const s = new Date(now); s.setDate(s.getDate() - 89);
+            return { date_from: fmt(s), date_to: fmt(now) };
+        }
+        case 'this_month': {
+            const s = new Date(now.getFullYear(), now.getMonth(), 1);
+            return { date_from: fmt(s), date_to: fmt(now) };
+        }
+        case 'last_month': {
+            const s = new Date(now.getFullYear(), now.getMonth() - 1, 1);
+            const e = new Date(now.getFullYear(), now.getMonth(), 0);
+            return { date_from: fmt(s), date_to: fmt(e) };
+        }
+        default:
+            return {};
+    }
+}
+
 async function loadAiAnalytics() {
     const container = document.getElementById('aiInsightsList');
     if (container) container.innerHTML = '<div class="ai-insight-empty"><p>Loading AI insights...</p></div>';
 
     try {
+        const dateParams = getDateRangeParams();
+        const qs = new URLSearchParams(dateParams).toString();
         const [aiOverview, recentTickets] = await Promise.all([
-            apiFetch('/support-analytics/ai-overview'),
-            apiFetch('/support-tickets?limit=200&sort=newest')
+            apiFetch(`/support-analytics/ai-overview${qs ? '?' + qs : ''}`),
+            apiFetch(`/support-tickets?limit=200&sort=newest${qs ? '&' + qs : ''}`)
         ]);
 
         const ov = aiOverview?.overview || {};

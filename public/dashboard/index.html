@@ -5,7 +5,7 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <meta name="color-scheme" content="dark">
     <title>OffComfrt — Support Command Center</title>
-    <link rel="stylesheet" href="/dashboard/css/style.css?v=22">
+    <link rel="stylesheet" href="/dashboard/css/style.css?v=23">
     <link rel="preconnect" href="https://fonts.googleapis.com">
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
     <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800&display=swap" rel="stylesheet">
@@ -237,6 +237,20 @@
 
                 <!-- ===================== AI ANALYTICS PAGE ===================== -->
                 <div id="ai-analyticsPage" class="page-section">
+                    <!-- Date Range Filter -->
+                    <div class="analytics-date-filter">
+                        <div class="date-filter-group" id="analyticsDateFilter">
+                            <button class="date-filter-btn active" data-range="all">All Time</button>
+                            <button class="date-filter-btn" data-range="today">Today</button>
+                            <button class="date-filter-btn" data-range="yesterday">Yesterday</button>
+                            <button class="date-filter-btn" data-range="7d">Last 7 Days</button>
+                            <button class="date-filter-btn" data-range="30d">Last 30 Days</button>
+                            <button class="date-filter-btn" data-range="90d">Last 90 Days</button>
+                            <button class="date-filter-btn" data-range="this_month">This Month</button>
+                            <button class="date-filter-btn" data-range="last_month">Last Month</button>
+                        </div>
+                        <div class="date-filter-info" id="analyticsDateInfo">Showing all time</div>
+                    </div>
                     <!-- Row 1: KPI Summary Cards (8 cards) -->
                     <div class="ai-kpi-grid">
                         <div class="ai-kpi-card">
@@ -740,7 +754,7 @@
     </div>
 
     <!-- Scripts -->
-    <script src="/dashboard/js/main.js?v=22" defer></script>
+    <script src="/dashboard/js/main.js?v=23" defer></script>
     <script src="/dashboard/js/comments.js?v=1" defer></script>
     <script src="/dashboard/js/ai-copilot.js?v=2" defer></script>
 </body>
