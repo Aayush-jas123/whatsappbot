@@ -117,7 +117,6 @@
             '#offcomfrt-tb .oftb-header-brand{display:flex;align-items:center;gap:14px}',
             '#offcomfrt-tb .oftb-header-avatar{width:44px;height:44px;border-radius:50%;background:#fff;display:flex;align-items:center;justify-content:center;position:relative;box-shadow:0 2px 8px rgba(0,0,0,0.3);overflow:hidden;border:1px solid rgba(255,255,255,0.15)}',
             '#offcomfrt-tb .oftb-header-avatar img{width:100%;height:100%;object-fit:cover}',
-            '#offcomfrt-tb .oftb-header-avatar::after{content:"";position:absolute;bottom:1px;right:1px;width:9px;height:9px;background:#fff;border-radius:50%;border:2px solid #0a0a0a;box-shadow:0 0 0 1px rgba(255,255,255,0.3)}',
             '#offcomfrt-tb .oftb-header-info{display:flex;flex-direction:column;gap:2px}',
             '#offcomfrt-tb .oftb-header-title{font-size:16px;font-weight:700;letter-spacing:2.5px;text-transform:uppercase}',
             '#offcomfrt-tb .oftb-header-subtitle{font-size:11px;opacity:0.5;font-weight:500;letter-spacing:0.5px;text-transform:uppercase}',
