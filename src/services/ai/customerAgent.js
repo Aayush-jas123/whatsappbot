@@ -117,9 +117,16 @@ function extractEntities(text) {
     const reqMatch = str.match(/\b(REQ-\d{4,6})\b/i);
     if (reqMatch) entities.requestId = reqMatch[1].toUpperCase();
 
-    // AWB: 10-16 digit numbers
-    const awbMatch = str.match(/\b(\d{10,16})\b/);
-    if (awbMatch) entities.awb = awbMatch[1];
+    // AWB: only extract if explicitly labeled (AWB:, tracking:, courier:) or 12+ digits alongside tracking keywords.
+    // Bare 10-digit numbers are mobile numbers, NOT AWBs.
+    const awbLabeledMatch = str.match(/\b(?:AWB|tracking|courier)[-_ :]*(\d{10,16})\b/i);
+    if (awbLabeledMatch) {
+        entities.awb = awbLabeledMatch[1];
+    } else {
+        const awbBareMatch = str.match(/\b(\d{12,16})\b/);
+        const hasTrackingKeyword = /\b(track|tracking|courier|shipment|dispatch|delivered|shipping)\b/i.test(str);
+        if (awbBareMatch && hasTrackingKeyword) entities.awb = awbBareMatch[1];
+    }
 
     // Order IDs: #1234, ORD-1234, #53388orderstatus, or standalone 4-6 digit order numbers (e.g. "53388")
     const orderMatch = str.match(/#(\d{4,6})/i)
