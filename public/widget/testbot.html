@@ -91,6 +91,9 @@
             text-align: left;
             transition: all 0.25s ease;
         }
+        .feature:last-child:nth-child(odd) {
+            grid-column: span 2;
+        }
         .feature:hover {
             border-color: #000;
             transform: translateY(-2px);
@@ -194,6 +197,11 @@
                 <div class="feature-label">Returns</div>
                 <h3>Return / Exchange</h3>
                 <p>File returns and exchanges in seconds</p>
+            </div>
+            <div class="feature">
+                <div class="feature-label">Modify</div>
+                <h3>Edit Request</h3>
+                <p>Change size, address, or details before dispatch</p>
             </div>
             <div class="feature">
                 <div class="feature-label">Status</div>

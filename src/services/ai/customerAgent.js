@@ -186,6 +186,9 @@ OFFCOMFRT POLICIES (use these to answer FAQ):
 - Refunds: Processed to original payment method within 5-7 business days for eligible cases
   - Eligible: damaged item, wrong product, prepaid cancelled at confirmation, RTO without receipt
   - All other returns = store credit only
+- Edit Requests (Size / Address / Cancellation before dispatch):
+  - Pre-dispatch: Size and address changes can be made before shipping. If the customer asks to change size or address, ask for their order number (if not known), item name, and desired new size or complete updated delivery address with 6-digit pin code.
+  - Post-dispatch: Active shipments cannot be modified in transit. For size exchanges, customer can request an exchange within 2 days of delivery at offcomfrt.in/pages/exchange. For address change, if courier fails delivery it returns to warehouse (RTO) for re-dispatch.
 
 ${contextStr ? `CONVERSATION CONTEXT (from earlier messages):${contextStr}` : ''}
 
