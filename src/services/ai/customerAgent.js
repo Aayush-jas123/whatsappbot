@@ -347,7 +347,8 @@ async function runCustomerAgent({ sessionId, message, visitorId }) {
                 }
             }
 
-            // Clamp result size
+            // Clamp result size — guard against undefined/null results from tools
+            if (result === undefined || result === null) result = { error: 'Tool returned no data' };
             let json = JSON.stringify(result);
             if (json.length > 3000) json = json.substring(0, 3000) + '...';
 

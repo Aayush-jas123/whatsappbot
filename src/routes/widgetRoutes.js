@@ -363,7 +363,7 @@ router.post('/track-order', async (req, res) => {
             || null;
 
         const timeline = Array.isArray(rawTimeline)
-            ? rawTimeline.map(t => ({
+            ? rawTimeline.filter(Boolean).map(t => ({
                 date: t.date || t.ScanDateTime || null,
                 location: t.location || t.ScannedLocation || '',
                 activity: t.activity || t.description || t.Instructions || t.status || '',
