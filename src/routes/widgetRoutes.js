@@ -115,11 +115,30 @@ router.post('/track-order', async (req, res) => {
             return res.status(400).json({ error: 'Provide an order ID or phone number' });
         }
 
-        // Remember the order ID in the AI session even though this request
-        // bypasses the AI chat — so follow-ups like "where is my order"
-        // already know which order the customer means.
-        if (sessionId && orderId) {
-            const cleanOrderId = String(orderId).replace(/^#/, '').trim();
+        let cleanAwb = awb ? String(awb).trim() : null;
+        let cleanOrderId = null;
+
+        if (orderId) {
+            const raw = String(orderId).trim();
+            // AWB: 10-16 digit numbers
+            const awbMatch = raw.match(/\b(\d{10,16})\b/);
+            if (awbMatch && !cleanAwb) {
+                cleanAwb = awbMatch[1];
+            }
+            // Order ID: #53388, ORD-53388, 53388 order status, or standalone 4-6 digits
+            const orderMatch = raw.match(/#(\d{4,6})/i)
+                || raw.match(/\b(?:ORD|ORDER)[-_ #]?(\d{4,6})\b/i)
+                || raw.match(/\b(\d{4,6})\b/)
+                || raw.match(/(\d{4,6})/);
+            if (orderMatch) {
+                cleanOrderId = orderMatch[1];
+            } else {
+                cleanOrderId = raw.replace(/^#/, '').replace(/\s/g, '');
+            }
+        }
+
+        // Remember the order ID in the AI session
+        if (sessionId && cleanOrderId) {
             if (/^\d{3,6}$/.test(cleanOrderId)) {
                 await noteSessionContext({ sessionId, entities: { orderId: cleanOrderId } });
             }
@@ -127,10 +146,10 @@ router.post('/track-order', async (req, res) => {
 
         let trackingResult = null;
         let carrierUsed = null;
-        let resolvedAwb = awb || null;
+        let resolvedAwb = cleanAwb || null;
 
         // Case 1: AWB provided — try all carriers in sequence
-        if (awb) {
+        if (cleanAwb) {
             const carriers = getConfiguredCarriers().map(c => c.key);
             // Prefer Delhivery -> Ekart -> Shiprocket order
             const preferredOrder = ['delhivery', 'ekart', 'shiprocket'];
@@ -142,7 +161,7 @@ router.post('/track-order', async (req, res) => {
                 try {
                     const adapter = getAdapter(carrierKey);
                     if (!adapter || !adapter.isConfigured()) continue;
-                    const result = await adapter.track(awb);
+                    const result = await adapter.track(cleanAwb);
                     if (result && result.success !== false && result.data) {
                         trackingResult = result.data;
                         carrierUsed = carrierKey;
@@ -156,8 +175,8 @@ router.post('/track-order', async (req, res) => {
         }
 
         // Case 2: Order ID provided — resolve AWB internally (customer never needs one)
-        if (!trackingResult && orderId) {
-            const orderName = String(orderId).replace(/^#/, '').trim();
+        if (!trackingResult && cleanOrderId) {
+            const orderName = cleanOrderId;
 
             // 2a. Shoppers Hub shipment data — shipments/orders tables carry the booked AWB
             try {
@@ -528,7 +547,12 @@ router.post('/track-request', async (req, res) => {
         }
 
         // --- Order ID lookup ---
-        const cleanOrderId = String(orderId).replace(/^#/, '').trim();
+        const rawOrder = orderId ? String(orderId).trim() : '';
+        const orderMatch = rawOrder.match(/#(\d{4,6})/i)
+            || rawOrder.match(/\b(?:ORD|ORDER)[-_ #]?(\d{4,6})\b/i)
+            || rawOrder.match(/\b(\d{4,6})\b/)
+            || rawOrder.match(/(\d{4,6})/);
+        const cleanOrderId = orderMatch ? orderMatch[1] : rawOrder.replace(/^#/, '').trim();
 
         // Fetch from external returns server
         let requests = [];
