@@ -111,20 +111,27 @@ setInterval(() => {
 
 function extractEntities(text) {
     const entities = {};
+    const str = String(text || '').trim();
+
     // Return/exchange request IDs: REQ-1234 to REQ-123456 (issued by the returns portal)
-    const reqMatch = text.match(/\b(REQ-\d{4,6})\b/i);
+    const reqMatch = str.match(/\b(REQ-\d{4,6})\b/i);
     if (reqMatch) entities.requestId = reqMatch[1].toUpperCase();
-    // Order IDs: #1234, ORD-1234, or a standalone 4-5 digit order number (e.g. "42000")
-    const orderMatch = text.match(/#(\d{3,})/)
-        || text.match(/\b(?:ORD|ORDER)[-_ ]?(\d{3,})\b/i)
-        || text.match(/\b(\d{4,5})\b/);
+
+    // AWB: 10-16 digit numbers
+    const awbMatch = str.match(/\b(\d{10,16})\b/);
+    if (awbMatch) entities.awb = awbMatch[1];
+
+    // Order IDs: #1234, ORD-1234, #53388orderstatus, or standalone 4-6 digit order numbers (e.g. "53388")
+    const orderMatch = str.match(/#(\d{4,6})/i)
+        || str.match(/\b(?:ORD|ORDER)[-_ #]?(\d{4,6})\b/i)
+        || str.match(/\b(\d{4,6})\b/)
+        || str.match(/(\d{4,6})/);
     if (orderMatch) entities.orderId = orderMatch[1];
-    // AWB: 10-16 digit numbers (order IDs are only 4-5 digits, so no clash)
-    const awbMatch = text.match(/\b(\d{10,16})\b/);
-    if (awbMatch && !entities.orderId) entities.awb = awbMatch[1];
-    // Pin code: 6-digit number
-    const pinMatch = text.match(/\b(\d{6})\b/);
-    if (pinMatch) entities.pincode = pinMatch[1];
+
+    // Pin code: 6-digit number (only if not already matched as orderId)
+    const pinMatch = str.match(/\b([1-9]\d{5})\b/);
+    if (pinMatch && pinMatch[1] !== entities.orderId) entities.pincode = pinMatch[1];
+
     return entities;
 }
 

@@ -533,14 +533,43 @@
         ]);
     }
 
-    function doTrackOrder(orderId) {
+    // ---------- Entity Extraction Helper ----------
+    function parseOrderOrTracking(text) {
+        if (!text) return null;
+        var str = String(text).trim();
+
+        // 1. Return/exchange request ID: REQ-1234 to REQ-123456
+        var reqMatch = str.match(/\b(REQ-\d{4,6})\b/i);
+        if (reqMatch) return { type: 'request', id: reqMatch[1].toUpperCase() };
+
+        // 2. AWB number (10 to 16 digits)
+        var awbMatch = str.match(/\b(\d{10,16})\b/);
+        if (awbMatch) return { type: 'awb', id: awbMatch[1] };
+
+        // 3. Order ID: matches #53388, Order #53388, 53388 order status, or standalone 4-6 digits
+        var orderMatch = str.match(/#(\d{4,6})/i)
+            || str.match(/\b(?:ORD|ORDER)[-_ #]?(\d{4,6})\b/i)
+            || str.match(/\b(\d{4,6})\b/)
+            || str.match(/(\d{4,6})/);
+        if (orderMatch) return { type: 'order', id: orderMatch[1] };
+
+        return null;
+    }
+
+    function doTrackOrder(orderInput) {
         flowState = 'tracking';
         showTyping();
 
+        var parsed = parseOrderOrTracking(orderInput);
+        var targetId = parsed ? parsed.id : String(orderInput || '').replace(/\s/g, '');
         var body = { sessionId: sessionId, visitorId: visitorId };
-        var cleaned = orderId.replace(/\s/g, '');
-        if (/^\d{10,}$/.test(cleaned)) { body.awb = cleaned; body.orderId = cleaned; }
-        else { body.orderId = cleaned; }
+
+        if ((parsed && parsed.type === 'awb') || /^\d{10,}$/.test(targetId)) {
+            body.awb = targetId;
+            body.orderId = targetId;
+        } else {
+            body.orderId = targetId;
+        }
 
         fetch(API_URL + '/api/widget/track-order', {
             method: 'POST',
@@ -550,7 +579,6 @@
         .then(function (r) { return r.json(); })
         .then(function (data) {
             hideTyping();
-            addUserMessage('Order #' + cleaned);
             if (data.error) {
                 addBotMessage(data.error, [
                     { label: 'Try Another', action: 'track_order', primary: true },
@@ -605,13 +633,14 @@
     function doTrackRequest(input) {
         flowState = 'tracking_request';
         showTyping();
-        addUserMessage(input);
 
         // Detect if user entered a REQ-XXXX request ID or an order number
-        var reqMatch = input.match(/\b(REQ-\d{4,6})\b/i);
+        var parsed = parseOrderOrTracking(input);
         var payload = {};
-        if (reqMatch) {
-            payload.requestId = reqMatch[1].toUpperCase();
+        if (parsed && parsed.type === 'request') {
+            payload.requestId = parsed.id;
+        } else if (parsed && parsed.type === 'order') {
+            payload.orderId = parsed.id;
         } else {
             payload.orderId = String(input).replace(/^#/, '').replace(/\s/g, '').trim();
         }
@@ -941,26 +970,44 @@
 
         if (flowState === 'awaiting_ticket_order_id') {
             addUserMessage(text);
-            var cleaned = text.replace(/^#/, '').replace(/\s/g, '').trim();
-            flowContext.orderId = cleaned;
-            // Now ask for the topic
-            flowState = 'awaiting_support_topic';
-            setInputMode('text');
-            addBotMessage('Got it — Order *#' + cleaned + '*. What do you need help with?', [
-                { label: 'Order Issue', action: 'support_order_issue' },
-                { label: 'Product Question', action: 'support_product' },
-                { label: 'Delivery Problem', action: 'support_delivery' },
-                { label: 'Other', action: 'support_other' }
-            ]);
+            var parsedTicket = parseOrderOrTracking(text);
+            if (parsedTicket && parsedTicket.type === 'order') {
+                flowContext.orderId = parsedTicket.id;
+                flowState = 'awaiting_support_topic';
+                setInputMode('text');
+                addBotMessage('Got it — Order *#' + parsedTicket.id + '*. What do you need help with?', [
+                    { label: 'Order Issue', action: 'support_order_issue' },
+                    { label: 'Product Question', action: 'support_product' },
+                    { label: 'Delivery Problem', action: 'support_delivery' },
+                    { label: 'Other', action: 'support_other' }
+                ]);
+            } else {
+                // Customer typed an issue description without an explicit order number
+                flowContext.supportTopic = 'General';
+                flowState = 'awaiting_support_message';
+                doResolveWithAI(text);
+            }
         } else if (flowState === 'awaiting_order_id') {
             addUserMessage(text);
-            doTrackOrder(text);
+            var parsedOrder = parseOrderOrTracking(text);
+            if (parsedOrder) {
+                if (parsedOrder.type === 'request') {
+                    doTrackRequest(parsedOrder.id);
+                } else {
+                    doTrackOrder(parsedOrder.id);
+                }
+            } else {
+                // Free-text/question in order tracking — let AI handle it instead of hard rejecting
+                if (typeof flowContext.aiAttempts !== 'number') {
+                    flowContext = { aiAttempts: 0 };
+                }
+                doResolveWithAI(text);
+            }
         } else if (flowState === 'awaiting_request_track_id') {
-            var reqCheck = text.match(/\b(REQ-\d{4,6})\b/i);
-            if (reqCheck) {
-                doTrackRequest(text);
-            } else if (/^#?\d{4,}$/.test(text.replace(/\s/g, ''))) {
-                doTrackRequest(text);
+            addUserMessage(text);
+            var parsedReq = parseOrderOrTracking(text);
+            if (parsedReq) {
+                doTrackRequest(parsedReq.id);
             } else {
                 addBotMessage('Please enter a valid *order number* or *request ID* (e.g. REQ-12345).', [
                     { label: 'Back to Menu', action: 'main_menu' }
@@ -974,11 +1021,13 @@
             doCreateSupportTicket(text);
         } else {
             addUserMessage(text);
-            var reqIdleMatch = text.match(/\b(REQ-\d{4,6})\b/i);
-            if (reqIdleMatch) {
-                doTrackRequest(text);
-            } else if (/^#?\d{4,}$/.test(text.replace(/\s/g, ''))) {
-                doTrackOrder(text.replace(/^#/, ''));
+            var parsedIdle = parseOrderOrTracking(text);
+            if (parsedIdle) {
+                if (parsedIdle.type === 'request') {
+                    doTrackRequest(parsedIdle.id);
+                } else {
+                    doTrackOrder(parsedIdle.id);
+                }
             } else {
                 // Free-text in idle state — continue the AI conversation instead of showing the menu
                 if (typeof flowContext.aiAttempts !== 'number') {
