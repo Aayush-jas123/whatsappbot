@@ -176,7 +176,10 @@
             '#offcomfrt-tb .oftb-tracking-status{font-size:10px;font-weight:700;padding:4px 10px;border-radius:100px;text-transform:uppercase;letter-spacing:0.8px}',
             '#offcomfrt-tb .oftb-status-delivered{background:#1a1a1a;color:#fff}',
             '#offcomfrt-tb .oftb-status-transit{background:#e5e5e5;color:#1a1a1a}',
+            '#offcomfrt-tb .oftb-status-confirmed{background:#e6f4ea;color:#137333}',
             '#offcomfrt-tb .oftb-status-pending{background:#fff3cd;color:#856404}',
+            '#offcomfrt-tb .oftb-status-cancelled{background:#fce8e6;color:#c5221f}',
+            '#offcomfrt-tb .oftb-status-rto{background:#feefe3;color:#b06000}',
             '#offcomfrt-tb .oftb-status-unknown{background:#f3f4f6;color:#999}',
             '#offcomfrt-tb .oftb-tracking-row{display:flex;justify-content:space-between;align-items:center;padding:8px 0;border-bottom:1px solid #f5f5f5}',
             '#offcomfrt-tb .oftb-tracking-row:last-child{border-bottom:none}',
@@ -526,6 +529,33 @@
             return;
         }
         if (action === 'track_order') startTrackOrder();
+        else if (action === 'track_order_phone') {
+            flowState = 'awaiting_order_id';
+            flowContext = {};
+            setInputMode('tel');
+            addBotMessage('Please enter your *10-digit registered mobile number*:', [
+                { label: 'Back to Menu', action: 'main_menu' }
+            ]);
+        }
+        else if (action === 'delayed_pod_check') {
+            addUserMessage("I haven't received my delivered order");
+            addBotMessage(
+                "We understand your concern! Couriers sometimes mark parcels as delivered right before arrival, or leave them with security or neighbours.\n\n" +
+                "1. Please check with your household members, security guard, or reception desk.\n" +
+                "2. If still not found, we will request official Proof of Delivery (POD) from the courier partner.\n\n" +
+                "Would you like us to raise a POD inquiry for Order *#" + (flowContext.orderId || '') + "*?",
+                [
+                    { label: 'Request POD Investigation', action: 'raise_pod_ticket', primary: true },
+                    { label: 'I Found It', action: 'main_menu' },
+                    { label: 'Menu', action: 'main_menu' }
+                ]
+            );
+        }
+        else if (action === 'raise_pod_ticket') {
+            addUserMessage("Please request POD investigation");
+            flowContext.supportTopic = 'Delayed Delivery / POD';
+            doCreateSupportTicket('Customer reports package marked as delivered was not received. Requesting Proof of Delivery (POD) from courier partner. Update promised within 24 hours per SOP.');
+        }
         else if (action === 'file_return') startFileReturn();
         else if (action === 'edit_request') startEditRequest();
         else if (action === 'edit_size') startEditSize();
@@ -622,26 +652,89 @@
         .then(function (r) { return r.json(); })
         .then(function (data) {
             hideTyping();
-            if (data.error) {
-                addBotMessage(data.error, [
-                    { label: 'Try Another', action: 'track_order', primary: true },
+            if (data.error || data.notFound) {
+                var errMessage = data.message || data.error || 'No tracking data found. Please verify your order number and try again.';
+                addBotMessage(errMessage, [
+                    { label: 'Search by Mobile', action: 'track_order_phone', primary: true },
+                    { label: 'Try Order Number', action: 'track_order' },
+                    { label: 'Contact Support', action: 'contact_support' },
                     { label: 'Menu', action: 'main_menu' }
                 ]);
             } else {
                 addTrackingCard(data);
-                addBotMessage('Anything else?', [
-                    { label: 'Track Another', action: 'track_order', primary: true },
-                    { label: 'Return / Exchange', action: 'file_return' },
-                    { label: 'Menu', action: 'main_menu' }
-                ]);
+                flowContext.orderId = data.orderId || flowContext.orderId;
+
+                var stage = data.stage;
+                var st = (data.status || '').toLowerCase();
+
+                if (stage === 'delivered' || /delivered/i.test(st)) {
+                    addBotMessage(
+                        'Your package is marked as *Delivered*.\n\n' +
+                        '\u2022 Size exchanges and returns are accepted within *2 days* of delivery.\n' +
+                        '\u2022 If you haven\u2019t received your package yet, let us know and we will investigate with the courier immediately.',
+                        [
+                            { label: 'Return / Exchange', action: 'file_return', primary: true },
+                            { label: "Haven't Received It?", action: 'delayed_pod_check' },
+                            { label: 'Track Another', action: 'track_order' },
+                            { label: 'Menu', action: 'main_menu' }
+                        ]
+                    );
+                } else if (stage === 'confirmed' || /confirm/i.test(st)) {
+                    addBotMessage(
+                        'Your order is *Confirmed* and preparing for dispatch (ships within 24 to 48 hours).\n\n' +
+                        'Since your package has not been dispatched yet, you can still edit your size or delivery address if needed.',
+                        [
+                            { label: 'Edit Request', action: 'edit_request', primary: true },
+                            { label: 'Track Another', action: 'track_order' },
+                            { label: 'Menu', action: 'main_menu' }
+                        ]
+                    );
+                } else if (stage === 'pending_confirmation' || /pending|awaiting/i.test(st)) {
+                    addBotMessage(
+                        'Your order is *Awaiting Confirmation*.\n\n' +
+                        'Please confirm your order via the WhatsApp message sent to your registered mobile number so our team can prepare and dispatch your package.',
+                        [
+                            { label: 'Contact Support', action: 'contact_support', primary: true },
+                            { label: 'Track Another', action: 'track_order' },
+                            { label: 'Menu', action: 'main_menu' }
+                        ]
+                    );
+                } else if (stage === 'cancelled' || /cancelled/i.test(st)) {
+                    addBotMessage(
+                        'This order has been *Cancelled*.\n\n' +
+                        (data.note ? data.note : 'If you have questions regarding a refund or cancellation, our support team is here to assist you.'),
+                        [
+                            { label: 'Contact Support', action: 'contact_support', primary: true },
+                            { label: 'Track Another', action: 'track_order' },
+                            { label: 'Menu', action: 'main_menu' }
+                        ]
+                    );
+                } else if (stage === 'rto' || /rto|undelivered/i.test(st)) {
+                    addBotMessage(
+                        'Your shipment is marked as *Undelivered / RTO*.\n\n' +
+                        'Please contact our support team to verify your delivery address or arrange re-delivery.',
+                        [
+                            { label: 'Contact Support', action: 'contact_support', primary: true },
+                            { label: 'Track Another', action: 'track_order' },
+                            { label: 'Menu', action: 'main_menu' }
+                        ]
+                    );
+                } else {
+                    addBotMessage('Your order is on the way! What else can we assist you with?', [
+                        { label: 'Track Another', action: 'track_order', primary: true },
+                        { label: 'Contact Support', action: 'contact_support' },
+                        { label: 'Menu', action: 'main_menu' }
+                    ]);
+                }
             }
             setInputMode('text');
             flowState = 'idle';
         })
         .catch(function () {
             hideTyping();
-            addBotMessage('Unable to fetch tracking right now. Please try again later.', [
-                { label: 'Try Again', action: 'track_order', primary: true },
+            addBotMessage('Unable to fetch tracking right now. Please try again later or search using your registered mobile number.', [
+                { label: 'Search by Mobile', action: 'track_order_phone', primary: true },
+                { label: 'Try Again', action: 'track_order' },
                 { label: 'Menu', action: 'main_menu' }
             ]);
             setInputMode('text');
@@ -1226,12 +1319,19 @@
         card.className = 'oftb-tracking-card';
 
         var statusText = data.status || 'Unknown';
+        var stage = data.stage || '';
         var statusClass = 'oftb-status-unknown';
-        if (/delivered/i.test(statusText)) statusClass = 'oftb-status-delivered';
-        else if (/transit|shipped|dispatched|in.?transit|out.?for.?delivery/i.test(statusText)) statusClass = 'oftb-status-transit';
-        else if (/pending|unfulfilled|confirm/i.test(statusText)) statusClass = 'oftb-status-pending';
+        if (/delivered/i.test(statusText) || stage === 'delivered') statusClass = 'oftb-status-delivered';
+        else if (/cancelled/i.test(statusText) || stage === 'cancelled') statusClass = 'oftb-status-cancelled';
+        else if (/rto|undelivered|failed/i.test(statusText) || stage === 'rto') statusClass = 'oftb-status-rto';
+        else if (/transit|shipped|dispatched|out.?for.?delivery/i.test(statusText) || stage === 'in_transit' || stage === 'out_for_delivery') statusClass = 'oftb-status-transit';
+        else if (/confirm/i.test(statusText) || stage === 'confirmed') statusClass = 'oftb-status-confirmed';
+        else if (/pending|unfulfilled|awaiting/i.test(statusText) || stage === 'pending_confirmation') statusClass = 'oftb-status-pending';
 
-        var carrierName = data.carrierName || 'Carrier';
+        var carrierName = data.carrierName;
+        if (!carrierName || carrierName === 'Shopify' || carrierName === 'shopify') {
+            carrierName = 'OFFCOMFRT Fulfillment';
+        }
         var html = '<div class="oftb-tracking-card-header">';
         html += '<span class="oftb-tracking-carrier">' + escapeHtml(carrierName) + '</span>';
         html += '<span class="oftb-tracking-status ' + statusClass + '">' + escapeHtml(statusText) + '</span>';

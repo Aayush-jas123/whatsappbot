@@ -381,7 +381,7 @@ const tools = [
             let shopper = null;
             try {
                 const rows = await dbAdapter.query(
-                    `SELECT order_id, status, product_name, delivery_type
+                    `SELECT order_id, status, items_json, delivery_type
                      FROM store_shoppers WHERE order_id = ? ORDER BY created_at DESC LIMIT 1`,
                     [name]
                 );

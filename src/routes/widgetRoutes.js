@@ -292,25 +292,75 @@ router.post('/track-order', async (req, res) => {
                 } else {
                     // No AWB yet — check if the order exists in Shoppers Hub and report its stage
                     const shopperRows = await dbAdapter.query(
-                        'SELECT status FROM store_shoppers WHERE order_id = ? ORDER BY created_at DESC LIMIT 1',
+                        'SELECT status, payment_method, cancel_reason, shopify_cancelled_at, created_at FROM store_shoppers WHERE order_id = ? ORDER BY created_at DESC LIMIT 1',
                         [orderName]
                     );
                     if (shopperRows && shopperRows.length > 0) {
-                        const shopperStatus = (shopperRows[0].status || '').toLowerCase();
-                        let note;
-                        if (shopperStatus === 'delivered') {
-                            note = 'Your order has been delivered.';
+                        const row = shopperRows[0];
+                        const shopperStatus = (row.status || '').toLowerCase();
+                        const isCancelled = shopperStatus === 'cancelled' || !!row.cancel_reason || !!row.shopify_cancelled_at;
+                        const isPrepaid = /prepaid/i.test(row.payment_method || '');
+                        
+                        let displayStatus = 'Confirmed';
+                        let note = 'Your order will be shipped within 24 to 48 hours.';
+                        let stage = 'confirmed';
+
+                        if (isCancelled) {
+                            stage = 'cancelled';
+                            displayStatus = 'Cancelled';
+                            note = isPrepaid
+                                ? 'Your order has been cancelled. Your refund has been initiated and will reflect in your original payment method within 5 to 7 business days.'
+                                : 'Your order has been cancelled. Since this was a Cash on Delivery (COD) order, no amount was charged.';
+                        } else if (shopperStatus === 'delivered') {
+                            stage = 'delivered';
+                            displayStatus = 'Delivered';
+                            note = 'Your order has been delivered. Size exchanges and returns are accepted within 2 days of delivery.';
                         } else if (shopperStatus === 'confirmed') {
+                            stage = 'confirmed';
+                            displayStatus = 'Confirmed';
                             note = 'Your order will be shipped within 24 to 48 hours.';
                         } else {
-                            note = 'Please confirm your order via the template message sent to you.';
+                            stage = 'pending_confirmation';
+                            displayStatus = 'Awaiting Confirmation';
+                            note = 'Please confirm your order via the WhatsApp confirmation message sent to your registered mobile number.';
                         }
+
                         trackingResult = {
                             orderId: orderName,
-                            fulfillmentStatus: shopperRows[0].status,
+                            stage: stage,
+                            fulfillmentStatus: displayStatus,
                             note: note
                         };
-                        carrierUsed = 'shopify';
+                        carrierUsed = 'offcomfrt';
+                    } else {
+                        // Check orders table
+                        const orderRows = await dbAdapter.query(
+                            'SELECT status, payment_method, created_at FROM orders WHERE order_id = ? LIMIT 1',
+                            [orderName]
+                        );
+                        if (orderRows && orderRows.length > 0) {
+                            const oRow = orderRows[0];
+                            const oStatus = (oRow.status || '').toLowerCase();
+                            let stage = 'confirmed';
+                            let displayStatus = oRow.status || 'Confirmed';
+                            let note = 'Your order will be shipped within 24 to 48 hours.';
+                            if (oStatus === 'delivered') {
+                                stage = 'delivered';
+                                displayStatus = 'Delivered';
+                                note = 'Your order has been delivered. Size exchanges and returns are accepted within 2 days of delivery.';
+                            } else if (oStatus === 'cancelled') {
+                                stage = 'cancelled';
+                                displayStatus = 'Cancelled';
+                                note = 'This order has been cancelled.';
+                            }
+                            trackingResult = {
+                                orderId: orderName,
+                                stage: stage,
+                                fulfillmentStatus: displayStatus,
+                                note: note
+                            };
+                            carrierUsed = 'offcomfrt';
+                        }
                     }
                 }
             } catch (hubErr) {
@@ -371,12 +421,13 @@ router.post('/track-order', async (req, res) => {
                                     createdAt: order.created_at,
                                     note: 'Your order will be shipped within 24 to 48 hours.'
                                 };
-                                carrierUsed = 'shopify';
+                                carrierUsed = 'offcomfrt';
                             }
                         } else {
                             // No AWB yet — return order status
                             const isUnfulfilled = !order.fulfillment_status || order.fulfillment_status === 'unfulfilled';
                             let note;
+                            let stage = 'confirmed';
                             if (!isUnfulfilled) {
                                 note = 'Your order will be shipped within 24 to 48 hours.';
                             } else {
@@ -390,21 +441,26 @@ router.post('/track-order', async (req, res) => {
                                     );
                                     if (hubRows && hubRows.length > 0) {
                                         const hs = (hubRows[0].status || '').toLowerCase();
-                                        hubNote = hs === 'confirmed'
-                                            ? 'Your order will be shipped within 24 to 48 hours.'
-                                            : 'Please confirm your order via the template message sent to you.';
+                                        if (hs === 'confirmed') {
+                                            hubNote = 'Your order will be shipped within 24 to 48 hours.';
+                                            stage = 'confirmed';
+                                        } else {
+                                            hubNote = 'Please confirm your order via the template message sent to you.';
+                                            stage = 'pending_confirmation';
+                                        }
                                     }
                                 } catch (e) { /* best-effort */ }
                                 note = hubNote || 'Please confirm your order via the template message sent to you.';
                             }
                             trackingResult = {
                                 orderId: order.name,
-                                fulfillmentStatus: order.fulfillment_status,
+                                stage: stage,
+                                fulfillmentStatus: order.fulfillment_status || 'Confirmed',
                                 financialStatus: order.financial_status,
                                 createdAt: order.created_at,
                                 note: note
                             };
-                            carrierUsed = 'shopify';
+                            carrierUsed = 'offcomfrt';
                         }
                     }
                 }
@@ -415,17 +471,18 @@ router.post('/track-order', async (req, res) => {
         }
 
         if (!trackingResult) {
+            const cleanDisplayId = (cleanOrderId || orderId || '').replace(/^#/, '').trim();
             return res.status(404).json({
-                error: 'No tracking data found. Please verify your order number and try again.',
-                triedCarriers: getConfiguredCarriers().map(c => c.name)
+                error: 'Order Not Found',
+                message: cleanDisplayId
+                    ? `We could not find order #${cleanDisplayId} in our system.\n\nPlease check your confirmation SMS or email for your 4-6 digit order number, or search using your 10-digit registered mobile number.`
+                    : 'We could not find tracking details for that request. Please verify your order number or registered mobile number and try again.',
+                notFound: true,
+                orderId: cleanDisplayId || null
             });
         }
 
         // Format the response for the widget UI.
-        // Carrier adapters return the normalized shape
-        //   { currentStatus, expectedDelivery, timeline: [{date, location, activity, status}] }
-        // while raw Shiprocket payloads use shipment_track[0] with snake_case keys —
-        // support both so the card never renders empty.
         const trackData = trackingResult.shipment_track?.[0] || trackingResult;
 
         const rawTimeline = trackingResult.timeline
@@ -454,12 +511,35 @@ router.post('/track-order', async (req, res) => {
             });
         }
 
+        const rawStatus = trackData.currentStatus || trackData.current_status || trackData.fulfillmentStatus || 'Unknown';
+        let stage = trackData.stage || 'in_transit';
+        if (/delivered/i.test(rawStatus)) {
+            stage = 'delivered';
+        } else if (/cancelled/i.test(rawStatus)) {
+            stage = 'cancelled';
+        } else if (/rto|undelivered|failed/i.test(rawStatus)) {
+            stage = 'rto';
+        } else if (/out.?for.?delivery/i.test(rawStatus)) {
+            stage = 'out_for_delivery';
+        } else if (/confirm/i.test(rawStatus)) {
+            stage = 'confirmed';
+        } else if (/pending|unfulfilled|awaiting/i.test(rawStatus)) {
+            stage = 'pending_confirmation';
+        }
+
+        let carrierDisplayName = 'OFFCOMFRT Fulfillment';
+        if (carrierUsed && carrierUsed !== 'shopify' && carrierUsed !== 'offcomfrt') {
+            const found = getConfiguredCarriers().find(c => c.key === carrierUsed);
+            carrierDisplayName = found ? found.name : (carrierUsed.charAt(0).toUpperCase() + carrierUsed.slice(1));
+        }
+
         res.json({
             carrier: carrierUsed,
-            carrierName: carrierUsed === 'shopify' ? 'Shopify' : (getConfiguredCarriers().find(c => c.key === carrierUsed)?.name || carrierUsed),
+            carrierName: carrierDisplayName,
             awb: trackData.awb_code || trackData.awb || resolvedAwb || null,
             orderId: orderId ? String(orderId).replace(/^#/, '').trim() : null,
-            status: trackData.currentStatus || trackData.current_status || trackData.fulfillmentStatus || 'Unknown',
+            status: rawStatus,
+            stage: stage,
             location: trackData.current_location || latestScan?.location || null,
             shippedDate: trackData.shipped_date || null,
             expectedDelivery: trackData.expectedDelivery || trackData.edd || trackData.etd || null,
