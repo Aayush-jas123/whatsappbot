@@ -228,7 +228,7 @@ router.post('/track-order', async (req, res) => {
                             fulfillmentStatus: shopperRows[0].status,
                             note: shopperRows[0].status === 'delivered'
                                 ? 'Your order has been delivered.'
-                                : 'Your order is being processed and will ship soon. Tracking will appear here once it ships.'
+                                : 'Your order is confirmed and will be shipped in 24 to 48 hours.'
                         };
                         carrierUsed = 'shopify';
                     }
@@ -289,7 +289,7 @@ router.post('/track-order', async (req, res) => {
                                     fulfillmentStatus: order.fulfillment_status,
                                     financialStatus: order.financial_status,
                                     createdAt: order.created_at,
-                                    note: 'Tracking not yet available. Please check back later or contact support.'
+                                    note: 'Your order will be shipped in 24 to 48 hours. Live tracking will be available once handed over to the courier partner.'
                                 };
                                 carrierUsed = 'shopify';
                             }
@@ -300,9 +300,9 @@ router.post('/track-order', async (req, res) => {
                                 fulfillmentStatus: order.fulfillment_status,
                                 financialStatus: order.financial_status,
                                 createdAt: order.created_at,
-                                note: order.fulfillment_status === 'unfulfilled'
-                                    ? 'Your order is being prepared and will ship soon.'
-                                    : 'Tracking information is not yet available.'
+                                note: (!order.fulfillment_status || order.fulfillment_status === 'unfulfilled')
+                                    ? 'Your order is confirmed and will be shipped in 24 to 48 hours.'
+                                    : 'Your order will be shipped in 24 to 48 hours. Live tracking will be available once handed over to the courier partner.'
                             };
                             carrierUsed = 'shopify';
                         }

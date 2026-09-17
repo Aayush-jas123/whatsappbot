@@ -228,7 +228,8 @@ const tools = [
                 total: o.total_price,
                 currency: o.currency,
                 financialStatus: o.financial_status,
-                fulfillmentStatus: o.fulfillment_status,
+                fulfillmentStatus: o.fulfillment_status || 'unfulfilled (will be shipped in 24 to 48 hours)',
+                note: o.fulfillment_status ? null : 'This order is confirmed and will be shipped in 24 to 48 hours. Live tracking will be available once handed over to the courier.',
                 customer: o.customer ? `${o.customer.first_name || ''} ${o.customer.last_name || ''}`.trim() : null,
                 phone: o.customer?.phone || o.shipping_address?.phone || null,
                 items: (o.line_items || []).map(li => `${li.title} x${li.quantity}`)
@@ -359,8 +360,43 @@ const tools = [
                     shipmentStatus: shipment?.status || null,
                     shopperStatus: shopper?.status || null,
                     orderStatus: orderRow?.status || null,
-                    note: 'This order has not been handed to a courier yet, so live tracking is not available. Tracking will appear here as soon as it ships.'
+                    note: 'This order is confirmed and will be shipped in 24 to 48 hours. Live tracking will be available once handed over to the courier partner.'
                 };
+            }
+
+            // 5. Fallback: Check Shopify Admin API if not found in local DB
+            try {
+                const shop = process.env.SHOPIFY_STORE;
+                const token = process.env.SHOPIFY_ACCESS_TOKEN;
+                if (shop && token) {
+                    const fields = 'id,name,financial_status,fulfillment_status,fulfillments,created_at';
+                    const shopifyRes = await axios.get(
+                        `https://${shop}/admin/api/2024-01/orders.json?name=${encodeURIComponent(name)}&status=any&fields=${fields}`,
+                        { headers: { 'X-Shopify-Access-Token': token }, timeout: 10000 }
+                    );
+                    const order = shopifyRes.data?.orders?.[0];
+                    if (order) {
+                        const fulfillment = order.fulfillments?.[0];
+                        const trackingInfo = fulfillment?.tracking_info?.[0] || fulfillment?.tracking_info;
+                        const orderAwb = trackingInfo?.number || trackingInfo?.tracking_number;
+                        if (orderAwb) {
+                            return {
+                                orderId: order.name,
+                                awb: orderAwb,
+                                fulfillmentStatus: order.fulfillment_status,
+                                note: 'Your order has been shipped. Live tracking updates are in progress.'
+                            };
+                        }
+                        return {
+                            orderId: order.name,
+                            fulfillmentStatus: order.fulfillment_status || 'unfulfilled (will be shipped in 24 to 48 hours)',
+                            financialStatus: order.financial_status,
+                            note: 'This order is confirmed and will be shipped in 24 to 48 hours. Live tracking will be available once handed over to the courier partner.'
+                        };
+                    }
+                }
+            } catch (shopifyErr) {
+                // ignore
             }
 
             return { error: `No order found with ID ${name}` };
