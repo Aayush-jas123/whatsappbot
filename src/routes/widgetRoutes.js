@@ -164,6 +164,32 @@ router.post('/track-order', async (req, res) => {
                 cleanOrderId = raw.replace(/^#/, '').replace(/\s/g, '');
             }
         }
+        
+        // If no orderId was provided, resolve the latest order from the phone number
+        if (!cleanOrderId && !cleanAwb && phone) {
+            const digits = String(phone).replace(/\D/g, '');
+            if (digits.length >= 10) {
+                const phonePattern = `%${digits.slice(-10)}`;
+                try {
+                    const { dbAdapter } = require('../database/db');
+                    const shopperRows = await dbAdapter.query(
+                        'SELECT order_id FROM store_shoppers WHERE phone LIKE ? ORDER BY created_at DESC LIMIT 1',
+                        [phonePattern]
+                    );
+                    if (shopperRows && shopperRows.length > 0) {
+                        cleanOrderId = String(shopperRows[0].order_id || '').replace(/^#/, '').trim();
+                    } else {
+                        const orderRows = await dbAdapter.query(
+                            'SELECT order_id FROM orders WHERE customer_phone LIKE ? ORDER BY created_at DESC LIMIT 1',
+                            [phonePattern]
+                        );
+                        if (orderRows && orderRows.length > 0) {
+                            cleanOrderId = String(orderRows[0].order_id || '').replace(/^#/, '').trim();
+                        }
+                    }
+                } catch (e) { /* best-effort lookup */ }
+            }
+        }
 
         // Remember the order ID in the AI session
         if (sessionId && cleanOrderId) {
@@ -493,6 +519,90 @@ router.post('/lookup-order', async (req, res) => {
     } catch (error) {
         console.error('[widget] lookup-order error:', error.message);
         res.status(500).json({ error: 'Failed to lookup order details' });
+    }
+});
+
+// ---------- POST /api/widget/search-by-phone ----------
+// Search orders for a given customer phone number (strictly sanitized, no PII returned)
+router.post('/search-by-phone', async (req, res) => {
+    try {
+        const { phone } = req.body;
+        const digits = String(phone || '').replace(/\D/g, '');
+        if (digits.length < 10) {
+            return res.status(400).json({ error: 'Please provide a valid 10-digit mobile number' });
+        }
+        const last10 = digits.slice(-10);
+        const phonePattern = `%${last10}`;
+
+        const { dbAdapter } = require('../database/db');
+        const orders = [];
+        const seen = new Set();
+
+        // 1. Query store_shoppers
+        try {
+            const shopperRows = await dbAdapter.query(
+                `SELECT order_id, status, product_name, total, created_at
+                 FROM store_shoppers
+                 WHERE phone LIKE ?
+                 ORDER BY created_at DESC LIMIT 5`,
+                [phonePattern]
+            );
+            if (shopperRows && shopperRows.length > 0) {
+                shopperRows.forEach(r => {
+                    const cleanId = String(r.order_id || '').replace(/^#/, '').trim();
+                    if (cleanId && !seen.has(cleanId)) {
+                        seen.add(cleanId);
+                        orders.push({
+                            orderId: cleanId,
+                            status: r.status || 'Confirmed',
+                            item: r.product_name || null,
+                            total: r.total || null,
+                            createdAt: r.created_at || null
+                        });
+                    }
+                });
+            }
+        } catch (err) {
+            console.warn('[widget] search-by-phone shoppers query error:', err.message);
+        }
+
+        // 2. Query orders table
+        try {
+            const orderRows = await dbAdapter.query(
+                `SELECT order_id, status, product_name, total, created_at
+                 FROM orders
+                 WHERE customer_phone LIKE ?
+                 ORDER BY created_at DESC LIMIT 5`,
+                [phonePattern]
+            );
+            if (orderRows && orderRows.length > 0) {
+                orderRows.forEach(r => {
+                    const cleanId = String(r.order_id || '').replace(/^#/, '').trim();
+                    if (cleanId && !seen.has(cleanId)) {
+                        seen.add(cleanId);
+                        orders.push({
+                            orderId: cleanId,
+                            status: r.status || 'Processing',
+                            item: r.product_name || null,
+                            total: r.total || null,
+                            createdAt: r.created_at || null
+                        });
+                    }
+                });
+            }
+        } catch (err) {
+            console.warn('[widget] search-by-phone orders query error:', err.message);
+        }
+
+        // Return strictly sanitized order list (no names, no phone, no addresses)
+        res.json({
+            success: true,
+            count: orders.length,
+            orders
+        });
+    } catch (error) {
+        console.error('[widget] search-by-phone error:', error.message);
+        res.status(500).json({ error: 'Failed to search orders by phone' });
     }
 });
 

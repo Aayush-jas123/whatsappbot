@@ -503,6 +503,28 @@
             setInputPlaceholder('Describe your issue...');
             return;
         }
+        if (action && action.indexOf('select_phone_order_') === 0) {
+            var parts = action.replace('select_phone_order_', '').split('_');
+            var selectedOrderId = parts[0];
+            var selectedIntent = parts[1] || 'track';
+            addUserMessage('Order #' + selectedOrderId);
+            if (selectedIntent === 'edit') {
+                doCheckEditOrder(selectedOrderId);
+            } else if (selectedIntent === 'ticket') {
+                flowContext.orderId = selectedOrderId;
+                flowState = 'awaiting_support_topic';
+                setInputMode('text');
+                addBotMessage('Got it — Order *#' + selectedOrderId + '*. What do you need help with?', [
+                    { label: 'Order Issue', action: 'support_order_issue' },
+                    { label: 'Product Question', action: 'support_product' },
+                    { label: 'Delivery Problem', action: 'support_delivery' },
+                    { label: 'Other', action: 'support_other' }
+                ]);
+            } else {
+                doTrackOrder(selectedOrderId);
+            }
+            return;
+        }
         if (action === 'track_order') startTrackOrder();
         else if (action === 'file_return') startFileReturn();
         else if (action === 'edit_request') startEditRequest();
@@ -536,7 +558,7 @@
         flowState = 'awaiting_order_id';
         flowContext = {};
         setInputMode('order');
-        addBotMessage('Please enter your *order number*.\n\nYou can find it in your confirmation email or SMS.', [
+        addBotMessage('Please enter your *order number* or registered *mobile number*.\n\nYou can find your order number in your confirmation email or SMS.', [
             { label: 'Back to Menu', action: 'main_menu' }
         ]);
     }
@@ -550,11 +572,19 @@
         var reqMatch = str.match(/\b(REQ-\d{4,6})\b/i);
         if (reqMatch) return { type: 'request', id: reqMatch[1].toUpperCase() };
 
-        // 2. AWB number (10 to 16 digits)
-        var awbMatch = str.match(/\b(\d{10,16})\b/);
-        if (awbMatch) return { type: 'awb', id: awbMatch[1] };
+        // 2. Explicitly labeled AWB (AWB:, tracking:, courier:)
+        var awbLabeled = str.match(/\b(?:AWB|tracking|courier)[-_ :]*(\d{10,16})\b/i);
+        if (awbLabeled) return { type: 'awb', id: awbLabeled[1] };
 
-        // 3. Order ID: matches #53388, Order #53388, 53388 order status, or standalone 4-6 digits
+        // 3. Mobile phone number: 10 digits starting with 6-9 (optional +91 or 0 prefix)
+        var phoneMatch = str.match(/(?:\+?91[\s-]?)?\b([6-9]\d{9})\b/);
+        if (phoneMatch) return { type: 'phone', id: phoneMatch[1] };
+
+        // 4. Long courier tracking code: 12-16 digits
+        var awbLong = str.match(/\b(\d{12,16})\b/);
+        if (awbLong) return { type: 'awb', id: awbLong[1] };
+
+        // 4. Order ID: matches #53388, Order #53388, 53388 order status, or standalone 4-6 digits
         var orderMatch = str.match(/#(\d{4,6})/i)
             || str.match(/\b(?:ORD|ORDER)[-_ #]?(\d{4,6})\b/i)
             || str.match(/\b(\d{4,6})\b/)
@@ -569,10 +599,15 @@
         showTyping();
 
         var parsed = parseOrderOrTracking(orderInput);
+        if (parsed && parsed.type === 'phone') {
+            doSearchOrdersByPhone(parsed.id, 'track');
+            return;
+        }
+
         var targetId = parsed ? parsed.id : String(orderInput || '').replace(/\s/g, '');
         var body = { sessionId: sessionId, visitorId: visitorId };
 
-        if ((parsed && parsed.type === 'awb') || /^\d{10,}$/.test(targetId)) {
+        if ((parsed && parsed.type === 'awb') || /^\d{12,}$/.test(targetId)) {
             body.awb = targetId;
             body.orderId = targetId;
         } else {
@@ -610,6 +645,83 @@
                 { label: 'Menu', action: 'main_menu' }
             ]);
             setInputMode('text');
+            flowState = 'idle';
+        });
+    }
+
+    // ---------- Phone-based Order Lookup Helper ----------
+    function doSearchOrdersByPhone(phone, intent) {
+        flowState = 'searching_phone_orders';
+        showTyping();
+
+        fetch(API_URL + '/api/widget/search-by-phone', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ phone: phone, sessionId: sessionId, visitorId: visitorId })
+        })
+        .then(function (r) { return r.json(); })
+        .then(function (data) {
+            hideTyping();
+            if (!data.success || !data.orders || data.orders.length === 0) {
+                var last4 = String(phone).slice(-4);
+                addBotMessage(
+                    'No recent orders found for mobile number ending in *' + last4 + '*.\n\n' +
+                    'Please verify your number or enter your 4-6 digit *order number* directly.',
+                    [
+                        { label: 'Try Again', action: intent === 'edit' ? 'edit_request' : 'track_order', primary: true },
+                        { label: 'Contact Support', action: 'contact_support' },
+                        { label: 'Menu', action: 'main_menu' }
+                    ]
+                );
+                flowState = 'idle';
+                return;
+            }
+
+            // Exactly 1 order found -> proceed directly
+            if (data.orders.length === 1) {
+                var single = data.orders[0];
+                var singleId = single.orderId;
+                if (intent === 'edit') {
+                    addBotMessage('Found Order *#' + singleId + '* (' + escapeHtml(single.status) + '). Checking modification status...');
+                    doCheckEditOrder(singleId);
+                } else if (intent === 'ticket') {
+                    flowContext.orderId = singleId;
+                    flowState = 'awaiting_support_topic';
+                    setInputMode('text');
+                    addBotMessage('Found Order *#' + singleId + '*. What do you need help with?', [
+                        { label: 'Order Issue', action: 'support_order_issue' },
+                        { label: 'Product Question', action: 'support_product' },
+                        { label: 'Delivery Problem', action: 'support_delivery' },
+                        { label: 'Other', action: 'support_other' }
+                    ]);
+                } else {
+                    addBotMessage('Found Order *#' + singleId + '* (' + escapeHtml(single.status) + '). Fetching tracking details...');
+                    doTrackOrder(singleId);
+                }
+                return;
+            }
+
+            // Multiple orders found -> show selectable order buttons
+            var buttons = [];
+            data.orders.slice(0, 4).forEach(function (o) {
+                var label = '#' + o.orderId + ' (' + (o.status || 'Order') + ')';
+                var actionName = 'select_phone_order_' + o.orderId + '_' + intent;
+                buttons.push({ label: label, action: actionName });
+            });
+            buttons.push({ label: 'Menu', action: 'main_menu' });
+
+            addBotMessage(
+                'Found ' + data.orders.length + ' orders for mobile ending in *' + String(phone).slice(-4) + '*.\n\nPlease select which order you want to ' + (intent === 'edit' ? 'modify' : 'track') + ':',
+                buttons
+            );
+            flowState = 'awaiting_order_selection';
+        })
+        .catch(function () {
+            hideTyping();
+            addBotMessage('Unable to look up orders by phone right now. Please enter your *order number* directly.', [
+                { label: 'Try Order Number', action: intent === 'edit' ? 'edit_request' : 'track_order', primary: true },
+                { label: 'Menu', action: 'main_menu' }
+            ]);
             flowState = 'idle';
         });
     }
@@ -708,7 +820,7 @@
         setInputMode('order');
         addBotMessage(
             'Need to change your size, address, or details before dispatch?\n\n' +
-            'Please enter your *order number* (e.g. 42000) so we can check your order status.',
+            'Please enter your *order number* or registered *mobile number* so we can check your order status.',
             [
                 { label: 'Back to Menu', action: 'main_menu' }
             ]
@@ -1244,7 +1356,9 @@
         if (flowState === 'awaiting_ticket_order_id') {
             addUserMessage(text);
             var parsedTicket = parseOrderOrTracking(text);
-            if (parsedTicket && parsedTicket.type === 'order') {
+            if (parsedTicket && parsedTicket.type === 'phone') {
+                doSearchOrdersByPhone(parsedTicket.id, 'ticket');
+            } else if (parsedTicket && parsedTicket.type === 'order') {
                 var cleaned = parsedTicket.id;
                 flowContext.orderId = cleaned;
                 
@@ -1298,6 +1412,8 @@
             if (parsedOrder) {
                 if (parsedOrder.type === 'request') {
                     doTrackRequest(parsedOrder.id);
+                } else if (parsedOrder.type === 'phone') {
+                    doSearchOrdersByPhone(parsedOrder.id, 'track');
                 } else {
                     doTrackOrder(parsedOrder.id);
                 }
@@ -1321,8 +1437,14 @@
         } else if (flowState === 'awaiting_edit_order_id') {
             addUserMessage(text);
             var parsedEdit = parseOrderOrTracking(text);
-            if (parsedEdit && parsedEdit.type === 'order') {
-                doCheckEditOrder(parsedEdit.id);
+            if (parsedEdit) {
+                if (parsedEdit.type === 'phone') {
+                    doSearchOrdersByPhone(parsedEdit.id, 'edit');
+                } else if (parsedEdit.type === 'order') {
+                    doCheckEditOrder(parsedEdit.id);
+                } else {
+                    doCheckEditOrder(parsedEdit.id);
+                }
             } else {
                 doCheckEditOrder(text);
             }
@@ -1342,8 +1464,14 @@
             if (/^(edit\s*request|edit\s*order|change\s*(my\s*)?(size|address|details?)|modify\s*order)\b/i.test(text.trim())) {
                 addUserMessage(text);
                 var parsedEditDirect = parseOrderOrTracking(text);
-                if (parsedEditDirect && parsedEditDirect.type === 'order') {
-                    doCheckEditOrder(parsedEditDirect.id);
+                if (parsedEditDirect) {
+                    if (parsedEditDirect.type === 'phone') {
+                        doSearchOrdersByPhone(parsedEditDirect.id, 'edit');
+                    } else if (parsedEditDirect.type === 'order') {
+                        doCheckEditOrder(parsedEditDirect.id);
+                    } else {
+                        startEditRequest();
+                    }
                 } else {
                     startEditRequest();
                 }
@@ -1354,6 +1482,8 @@
             if (parsedIdle) {
                 if (parsedIdle.type === 'request') {
                     doTrackRequest(parsedIdle.id);
+                } else if (parsedIdle.type === 'phone') {
+                    doSearchOrdersByPhone(parsedIdle.id, 'track');
                 } else {
                     doTrackOrder(parsedIdle.id);
                 }
