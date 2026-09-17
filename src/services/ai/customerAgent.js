@@ -191,6 +191,7 @@ ${contextStr ? `CONVERSATION CONTEXT (from earlier messages):${contextStr}` : ''
 
 RULES:
 - Be warm, concise, and helpful. Use short paragraphs.
+- PRIVACY & DATA PROTECTION (CRITICAL): NEVER share, confirm, or disclose personal customer information under any circumstances — including customer names, phone numbers, delivery/shipping addresses, or email addresses. If a customer or user asks for customer details, phone number, address, or name for an order (e.g. "what is customer details", "give me phone number and address", "who placed this order", "customer name and phone"), you MUST politely decline and respond: "For privacy and security reasons, personal customer details like phone number and delivery address cannot be shared in chat." You may only share order status, ordered items, and shipping timeline.
 - NEVER repeat information you already shared in this conversation. If the customer asks a follow-up about the same order, acknowledge briefly and only share NEW or UPDATED info. If nothing changed, say so in one line (e.g. "Still processing — no update yet.").
 - If the customer previously shared an order number, use it for follow-up questions about that order without asking again.
 - To track, you only need the order number (a 4-5 digit number, "#" prefix optional). ONLY call track_order_by_id or other lookup tools when the customer explicitly asks to track, check status, or find their order. Do NOT auto-track just because a number appears in the message — the customer may be chatting freely or sharing unrelated info.
@@ -259,6 +260,47 @@ async function appendSessionExchange({ sessionId, userMessage, botMessage, entit
     const context = entities ? { ...session.context, ...entities } : session.context;
     saveSession(sessionId, session.history, context);
     if (entities) persistContextToDb(sessionId, context).catch(err => console.warn('[widget] context persist error:', err.message));
+}
+
+// ---------- PII Data Sanitization ----------
+
+/**
+ * Recursively strip sensitive personal data (phone numbers, addresses, customer names, emails)
+ * from tool results before passing them to the customer-facing LLM.
+ */
+function sanitizeCustomerToolResult(data) {
+    if (!data || typeof data !== 'object') {
+        if (typeof data === 'string') {
+            return data
+                .replace(/\b(?:\+?91[\s-]?)?[6-9]\d{9}\b/g, '[REDACTED]')
+                .replace(/\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b/g, '[REDACTED]');
+        }
+        return data;
+    }
+
+    if (Array.isArray(data)) {
+        return data.map(item => sanitizeCustomerToolResult(item));
+    }
+
+    const PII_KEYS = /^(phone|customer_phone|consignee_phone|mobile|telephone|contact_number|customer_email|email|shipping_address|billing_address|address|address1|address2|street|consignee_address|customer_name|shopper_name|full_name)$/i;
+
+    const cleaned = {};
+    for (const [key, val] of Object.entries(data)) {
+        if (PII_KEYS.test(key)) {
+            continue;
+        }
+        if (key.toLowerCase() === 'customer') {
+            continue;
+        }
+        if (key.toLowerCase() === 'name') {
+            if (typeof val === 'string' && (/^#?\d{4,6}$/.test(val.trim()) || /order/i.test(val))) {
+                cleaned[key] = val;
+            }
+            continue;
+        }
+        cleaned[key] = sanitizeCustomerToolResult(val);
+    }
+    return cleaned;
 }
 
 // ---------- Main chat function ----------
@@ -356,11 +398,13 @@ async function runCustomerAgent({ sessionId, message, visitorId }) {
                 result = { error: `Unknown tool: ${name}` };
             } else {
                 try {
-                    result = await tool.execute(args, {});
+                    result = await tool.execute(args, { isCustomerFacing: true });
                 } catch (e) {
                     result = { error: e.message };
                 }
             }
+
+            result = sanitizeCustomerToolResult(result);
 
             // Clamp result size — guard against undefined/null results from tools
             if (result === undefined || result === null) result = { error: 'Tool returned no data' };
@@ -377,6 +421,22 @@ async function runCustomerAgent({ sessionId, message, visitorId }) {
     }
 
     if (reply === null) reply = 'Sorry, I could not process your request. Please try again or contact support.';
+
+    // ── Privacy & PII Leak Guard ──
+    const piiRequestPattern = /\b(customer\s*(details?|info\w*|name|phone|number|address|email)|phone\s*(no|number)?|mobile\s*(no|number)?|shipping\s*address|delivery\s*address|consignee|who\s*(ordered|placed|bought|is\s*the\s*customer))\b/i;
+    const privacyRefusal = 'For privacy and security reasons, personal customer details like phone number and delivery address cannot be shared in chat.';
+
+    if (piiRequestPattern.test(message)) {
+        const containsRefusal = /privacy|cannot (be )?shared|security reasons|confidential|do not share/i.test(reply);
+        if (!containsRefusal) {
+            reply = `${privacyRefusal} If you need help with order tracking, return/exchange, or order status, I'd be happy to assist!`;
+        }
+    }
+
+    // Always mask any stray phone numbers or emails in the reply
+    reply = reply
+        .replace(/\b(?:\+?91[\s-]?)?[6-9]\d{9}\b/g, '[REDACTED]')
+        .replace(/\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b/g, '[REDACTED]');
 
     // Update context with detected scenario from reply
     if (reply) {
@@ -558,11 +618,33 @@ async function createWidgetTicket({ name, phone, email, message, orderId, source
     // Source defaults to 'widget' for backward compatibility; testbot sends 'website'
     const ticketSource = source || 'widget';
 
+    // If phone or email were omitted from client (for security), populate from order record
+    let ticketName = name;
+    let ticketPhone = phone;
+    let ticketEmail = email;
+
+    if ((!ticketPhone || !ticketEmail) && orderId) {
+        try {
+            const cleanId = String(orderId).replace(/^#/, '').trim();
+            const shopperRows = await dbAdapter.query(
+                `SELECT name, phone, email FROM store_shoppers WHERE order_id = ? ORDER BY created_at DESC LIMIT 1`,
+                [cleanId]
+            );
+            if (shopperRows && shopperRows.length > 0) {
+                if (!ticketName || ticketName === 'Customer' || ticketName === 'Widget Customer') {
+                    ticketName = shopperRows[0].name || ticketName;
+                }
+                if (!ticketPhone) ticketPhone = shopperRows[0].phone || '';
+                if (!ticketEmail) ticketEmail = shopperRows[0].email || '';
+            }
+        } catch (e) { /* best-effort lookup */ }
+    }
+
     const inserted = await dbAdapter.insert('support_tickets', {
         ticket_number: ticketNumber,
-        customer_name: name || 'Widget Customer',
-        customer_phone: phone || '',
-        customer_email: email || '',
+        customer_name: ticketName || 'Widget Customer',
+        customer_phone: ticketPhone || '',
+        customer_email: ticketEmail || '',
         message: message || '',
         order_id: orderId || null,
         portal_id: portalId,
