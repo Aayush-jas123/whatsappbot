@@ -472,19 +472,15 @@ router.post('/lookup-order', async (req, res) => {
 
         if (shopperRows && shopperRows.length > 0) {
             const row = shopperRows[0];
-            // Normalize phone to digits only
-            const rawPhone = row.phone || '';
-            const digitsOnly = rawPhone.replace(/\D/g, '');
-            // Remove leading 91 if present (country code)
-            const phone = digitsOnly.startsWith('91') && digitsOnly.length > 10
-                ? digitsOnly.substring(2)
-                : digitsOnly;
+            // Only return first name for friendly greeting (e.g. "Thanks, Ketan.")
+            // Never expose phone number or email over public unauthenticated endpoint
+            const firstName = (row.name || '').trim().split(/\s+/)[0] || null;
 
             res.json({
                 success: true,
-                name: row.name || null,
-                phone: phone || null,
-                email: row.email || null
+                name: firstName,
+                phone: null,
+                email: null
             });
         } else {
             res.json({

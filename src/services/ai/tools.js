@@ -204,11 +204,14 @@ const tools = [
             required: []
         },
         requiresConfirmation: false,
-        async execute({ orderName, limit }) {
+        async execute({ orderName, limit }, ctx) {
             const shop = process.env.SHOPIFY_STORE;
             const token = process.env.SHOPIFY_ACCESS_TOKEN;
             if (!shop || !token) throw new Error('Shopify is not configured on this server');
-            const fields = 'id,name,created_at,total_price,currency,financial_status,fulfillment_status,customer,line_items,shipping_address';
+            const isCustomerFacing = !!(ctx && ctx.isCustomerFacing);
+            const fields = isCustomerFacing
+                ? 'id,name,created_at,total_price,currency,financial_status,fulfillment_status,line_items'
+                : 'id,name,created_at,total_price,currency,financial_status,fulfillment_status,customer,line_items,shipping_address';
             let url;
             if (orderName) {
                 const name = String(orderName).replace(/^#/, '');
@@ -261,8 +264,8 @@ const tools = [
                     fulfillmentStatus: o.fulfillment_status || 'unfulfilled',
                     shopperStatus: hubStatus,
                     note,
-                    customer: o.customer ? `${o.customer.first_name || ''} ${o.customer.last_name || ''}`.trim() : null,
-                    phone: o.customer?.phone || o.shipping_address?.phone || null,
+                    customer: isCustomerFacing ? null : (o.customer ? `${o.customer.first_name || ''} ${o.customer.last_name || ''}`.trim() : null),
+                    phone: isCustomerFacing ? null : (o.customer?.phone || o.shipping_address?.phone || null),
                     items: (o.line_items || []).map(li => `${li.title} x${li.quantity}`)
                 };
             });
@@ -924,7 +927,7 @@ const tools = [
             }
         },
         requiresConfirmation: false,
-        async execute({ requestId, orderId, phone }) {
+        async execute({ requestId, orderId, phone }, ctx) {
             const reqId = String(requestId || '').trim().toUpperCase();
             const name = String(orderId || '').replace(/^#/, '').trim();
             const digits = String(phone || '').replace(/\D/g, '');
@@ -1050,16 +1053,16 @@ const tools = [
                     exchanges,
                     supportTickets: supportTickets.map(t => ({
                         ticketNumber: t.ticket_number,
-                        phone: t.customer_phone,
-                        name: t.customer_name,
+                        phone: ctx?.isCustomerFacing ? undefined : t.customer_phone,
+                        name: ctx?.isCustomerFacing ? undefined : t.customer_name,
                         message: t.message,
                         status: t.status,
                         createdAt: t.created_at
                     })),
                     shopperRecords: shopperRecords.map(s => ({
                         orderId: s.order_id,
-                        phone: s.phone,
-                        name: s.name,
+                        phone: ctx?.isCustomerFacing ? undefined : s.phone,
+                        name: ctx?.isCustomerFacing ? undefined : s.name,
                         status: s.status,
                         customerMessage: s.customer_message,
                         updatedAt: s.updated_at
