@@ -169,7 +169,7 @@ router.post('/track-order', async (req, res) => {
         if (!cleanOrderId && !cleanAwb && phone) {
             const digits = String(phone).replace(/\D/g, '');
             if (digits.length >= 10) {
-                const phonePattern = `%${digits.slice(-10)}`;
+                const phonePattern = `%${digits.slice(-10)}%`;
                 try {
                     const { dbAdapter } = require('../database/db');
                     const shopperRows = await dbAdapter.query(
@@ -532,16 +532,16 @@ router.post('/search-by-phone', async (req, res) => {
             return res.status(400).json({ error: 'Please provide a valid 10-digit mobile number' });
         }
         const last10 = digits.slice(-10);
-        const phonePattern = `%${last10}`;
+        const phonePattern = `%${last10}%`;
 
         const { dbAdapter } = require('../database/db');
         const orders = [];
         const seen = new Set();
 
-        // 1. Query store_shoppers
+        // 1. Query store_shoppers (primary table for customer orders)
         try {
             const shopperRows = await dbAdapter.query(
-                `SELECT order_id, status, product_name, total, created_at
+                `SELECT order_id, status, items_json, order_total, created_at
                  FROM store_shoppers
                  WHERE phone LIKE ?
                  ORDER BY created_at DESC LIMIT 5`,
@@ -552,11 +552,23 @@ router.post('/search-by-phone', async (req, res) => {
                     const cleanId = String(r.order_id || '').replace(/^#/, '').trim();
                     if (cleanId && !seen.has(cleanId)) {
                         seen.add(cleanId);
+                        let itemName = null;
+                        if (r.items_json) {
+                            try {
+                                const parsed = typeof r.items_json === 'string' ? JSON.parse(r.items_json) : r.items_json;
+                                if (Array.isArray(parsed) && parsed.length > 0) {
+                                    itemName = parsed[0].name || parsed[0].title || null;
+                                    if (parsed.length > 1) {
+                                        itemName += ` +${parsed.length - 1} more`;
+                                    }
+                                }
+                            } catch (e) { /* ignore parse error */ }
+                        }
                         orders.push({
                             orderId: cleanId,
                             status: r.status || 'Confirmed',
-                            item: r.product_name || null,
-                            total: r.total || null,
+                            item: itemName,
+                            total: r.order_total || null,
                             createdAt: r.created_at || null
                         });
                     }
@@ -566,7 +578,7 @@ router.post('/search-by-phone', async (req, res) => {
             console.warn('[widget] search-by-phone shoppers query error:', err.message);
         }
 
-        // 2. Query orders table
+        // 2. Query orders table (fulfillment / tracking table)
         try {
             const orderRows = await dbAdapter.query(
                 `SELECT order_id, status, product_name, total, created_at
