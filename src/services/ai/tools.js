@@ -221,19 +221,49 @@ const tools = [
                 headers: { 'X-Shopify-Access-Token': token },
                 timeout: 15000
             });
-            const orders = (response.data?.orders || []).map(o => ({
-                id: o.id,
-                name: o.name,
-                createdAt: o.created_at,
-                total: o.total_price,
-                currency: o.currency,
-                financialStatus: o.financial_status,
-                fulfillmentStatus: o.fulfillment_status || 'unfulfilled',
-                note: o.fulfillment_status ? null : 'Please confirm your order via the template message sent to you.',
-                customer: o.customer ? `${o.customer.first_name || ''} ${o.customer.last_name || ''}`.trim() : null,
-                phone: o.customer?.phone || o.shipping_address?.phone || null,
-                items: (o.line_items || []).map(li => `${li.title} x${li.quantity}`)
-            }));
+            const rawOrders = response.data?.orders || [];
+
+            // Batch-lookup Shoppers Hub statuses for accurate pending vs confirmed messaging
+            let shopperStatusMap = {};
+            if (rawOrders.length > 0) {
+                try {
+                    const orderNames = rawOrders.map(o => o.name);
+                    const placeholders = orderNames.map((_, i) => `$${i + 1}`).join(',');
+                    const rows = await dbAdapter.query(
+                        `SELECT order_id, status FROM store_shoppers WHERE order_id IN (${placeholders})`,
+                        orderNames
+                    );
+                    for (const r of rows) {
+                        shopperStatusMap[r.order_id] = (r.status || '').toLowerCase();
+                    }
+                } catch (e) { /* Shoppers Hub lookup is best-effort */ }
+            }
+
+            const orders = rawOrders.map(o => {
+                const hubStatus = shopperStatusMap[o.name] || null;
+                let note = null;
+                if (!o.fulfillment_status) {
+                    if (hubStatus === 'confirmed') {
+                        note = 'Your order is confirmed and will be shipped within 24 to 48 hours.';
+                    } else {
+                        note = 'Please confirm your order via the template message sent to you.';
+                    }
+                }
+                return {
+                    id: o.id,
+                    name: o.name,
+                    createdAt: o.created_at,
+                    total: o.total_price,
+                    currency: o.currency,
+                    financialStatus: o.financial_status,
+                    fulfillmentStatus: o.fulfillment_status || 'unfulfilled',
+                    shopperStatus: hubStatus,
+                    note,
+                    customer: o.customer ? `${o.customer.first_name || ''} ${o.customer.last_name || ''}`.trim() : null,
+                    phone: o.customer?.phone || o.shipping_address?.phone || null,
+                    items: (o.line_items || []).map(li => `${li.title} x${li.quantity}`)
+                };
+            });
             return { count: orders.length, orders };
         }
     },
@@ -355,7 +385,9 @@ const tools = [
 
             if (shipment || shopper || orderRow) {
                 const shopperStatus = (shopper?.status || '').toLowerCase();
-                const isConfirmed = shopperStatus === 'confirmed';
+                // If shopper record exists, use its status. If shopper is null but shipment/orderRow
+                // exists, the order was processed enough to be in the system — treat as confirmed.
+                const isConfirmed = shopper ? shopperStatus === 'confirmed' : true;
                 return {
                     orderId: name,
                     awb: null,
@@ -391,11 +423,25 @@ const tools = [
                                 note: 'Your order has been shipped. Live tracking updates are in progress.'
                             };
                         }
+                        // No AWB from Shopify — re-check Shoppers Hub before deciding the message
+                        let shopifyNote = null;
+                        try {
+                            const hubRows = await dbAdapter.query(
+                                `SELECT status FROM store_shoppers WHERE order_id = ? ORDER BY created_at DESC LIMIT 1`,
+                                [order.name]
+                            );
+                            if (hubRows && hubRows.length > 0) {
+                                const hs = (hubRows[0].status || '').toLowerCase();
+                                shopifyNote = hs === 'confirmed'
+                                    ? 'Your order will be shipped within 24 to 48 hours. Live tracking will be available once handed over to the courier partner.'
+                                    : 'Please confirm your order via the template message sent to you.';
+                            }
+                        } catch (e) { /* best-effort */ }
                         return {
                             orderId: order.name,
                             fulfillmentStatus: order.fulfillment_status || 'unfulfilled',
                             financialStatus: order.financial_status,
-                            note: 'Please confirm your order via the template message sent to you.'
+                            note: shopifyNote || 'Please confirm your order via the template message sent to you.'
                         };
                     }
                 }

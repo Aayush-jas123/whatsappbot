@@ -303,14 +303,33 @@ router.post('/track-order', async (req, res) => {
                         } else {
                             // No AWB yet — return order status
                             const isUnfulfilled = !order.fulfillment_status || order.fulfillment_status === 'unfulfilled';
+                            let note;
+                            if (!isUnfulfilled) {
+                                note = 'Your order will be shipped within 24 to 48 hours.';
+                            } else {
+                                // Re-check Shoppers Hub for accurate pending vs confirmed messaging
+                                let hubNote = null;
+                                try {
+                                    const { dbAdapter } = require('../database/db');
+                                    const hubRows = await dbAdapter.query(
+                                        'SELECT status FROM store_shoppers WHERE order_id = ? ORDER BY created_at DESC LIMIT 1',
+                                        [order.name]
+                                    );
+                                    if (hubRows && hubRows.length > 0) {
+                                        const hs = (hubRows[0].status || '').toLowerCase();
+                                        hubNote = hs === 'confirmed'
+                                            ? 'Your order will be shipped within 24 to 48 hours.'
+                                            : 'Please confirm your order via the template message sent to you.';
+                                    }
+                                } catch (e) { /* best-effort */ }
+                                note = hubNote || 'Please confirm your order via the template message sent to you.';
+                            }
                             trackingResult = {
                                 orderId: order.name,
                                 fulfillmentStatus: order.fulfillment_status,
                                 financialStatus: order.financial_status,
                                 createdAt: order.created_at,
-                                note: isUnfulfilled
-                                    ? 'Please confirm your order via the template message sent to you.'
-                                    : 'Your order will be shipped within 24 to 48 hours.'
+                                note: note
                             };
                             carrierUsed = 'shopify';
                         }
