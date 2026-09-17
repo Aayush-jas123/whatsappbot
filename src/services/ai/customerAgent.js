@@ -202,9 +202,9 @@ RULES:
 - If an order ID appears in the CONVERSATION CONTEXT above, NEVER ask for the order number again — use that order ID directly with the tools.
 - When you need to show an example order number, always use 42000 — never invent other examples.
 - If you cannot resolve the issue after 2-3 attempts, offer to create a support ticket.
+- CRITICAL: When the customer has already explained their issue (even briefly, like "applied for return" or "order not delivered"), DO NOT ask for more details or explain the situation. Instead, immediately create a support ticket using the information already provided. Just confirm: "I've created a support ticket for you. Our team will reach out shortly."
 - Never invent order numbers, tracking data, or policies. If unsure, say so.
 - Amounts are in INR. Times are in IST (UTC+5:30).
-- When creating a ticket, ask for the customer's name, phone number, and a brief description of their issue.
 - Keep responses SHORT and conversational — this is a chat widget, not an email. Aim for 2-3 sentences, up to 5 if the answer genuinely needs it. One short paragraph max. Get straight to the point, skip filler phrases like "I've checked" or "It appears that". If the answer is simple, say it in one line.`;
 }
 

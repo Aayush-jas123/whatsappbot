@@ -13,6 +13,34 @@ const router = express.Router();
 const { runCustomerAgent, createWidgetTicket, noteSessionContext, appendSessionExchange } = require('../services/ai/customerAgent');
 const { getAdapter, getConfiguredCarriers } = require('../services/carriers');
 
+function normalizeExternalRequest(request) {
+    return {
+        request_id: request.request_id || request.requestId || request.id || null,
+        order_number: request.order_number || request.orderNumber || request.order_id || null,
+        type: request.type || 'return',
+        status: request.status || 'Pending',
+        reason: request.reason || null,
+        items: Array.isArray(request.items) ? request.items : [],
+        created_at: request.created_at || request.createdAt || null
+    };
+}
+
+async function findExternalReturnRequests(query) {
+    const baseUrl = process.env.RETURNS_SERVER_URL;
+    if (!baseUrl) return [];
+
+    const axios = require('axios');
+    const response = await axios.get(`${baseUrl.replace(/\/$/, '')}/api/internal/ai-data`, {
+        params: { resource: 'requests', query, limit: 20 },
+        headers: { 'x-internal-token': process.env.WHATSAPP_INTERNAL_TOKEN || '' },
+        timeout: 15000
+    });
+
+    return Array.isArray(response.data?.requests)
+        ? response.data.requests.map(normalizeExternalRequest)
+        : [];
+}
+
 // ---------- Rate limiter for widget endpoints ----------
 
 const widgetLimiter = require('express-rate-limit')({
@@ -545,26 +573,16 @@ router.post('/track-request', async (req, res) => {
                 created_at: r.created_at
             }));
 
-            // Also check external returns server by request_id
+            // Search the returns system directly. The inventory-open-requests feed is
+            // intentionally limited and can omit active exchanges or older requests.
             let externalRequests = [];
-            const baseUrl = process.env.RETURNS_SERVER_URL;
-            const token = process.env.WHATSAPP_INTERNAL_TOKEN;
-            if (baseUrl) {
-                try {
-                    const axios = require('axios');
-                    const response = await axios.get(
-                        `${baseUrl.replace(/\/$/, '')}/api/internal/inventory-open-requests?window=90`,
-                        { headers: { 'x-internal-token': token || '' }, timeout: 15000 }
-                    );
-                    if (response.data?.success && Array.isArray(response.data.requests)) {
-                        externalRequests = response.data.requests.filter(r =>
-                            String(r.request_id).toUpperCase() === reqId ||
-                            String(r.request_id).toUpperCase() === bareId
-                        );
-                    }
-                } catch (err) {
-                    console.warn('[widget] returns server fetch failed:', err.message);
-                }
+            try {
+                externalRequests = (await findExternalReturnRequests(reqId)).filter(r => {
+                    const externalId = String(r.request_id || '').toUpperCase();
+                    return externalId === reqId || externalId === bareId;
+                });
+            } catch (err) {
+                console.warn('[widget] returns server request search failed:', err.message);
             }
 
             const allRequests = [
@@ -605,25 +623,15 @@ router.post('/track-request', async (req, res) => {
             || rawOrder.match(/(\d{4,6})/);
         const cleanOrderId = orderMatch ? orderMatch[1] : rawOrder.replace(/^#/, '').trim();
 
-        // Fetch from external returns server
+        // Search by order number rather than using the limited inventory feed.
+        // This includes active, completed, and historical portal requests.
         let requests = [];
-        const baseUrl = process.env.RETURNS_SERVER_URL;
-        const token = process.env.WHATSAPP_INTERNAL_TOKEN;
-        if (baseUrl) {
-            try {
-                const axios = require('axios');
-                const response = await axios.get(
-                    `${baseUrl.replace(/\/$/, '')}/api/internal/inventory-open-requests?window=90`,
-                    { headers: { 'x-internal-token': token || '' }, timeout: 15000 }
-                );
-                if (response.data?.success && Array.isArray(response.data.requests)) {
-                    requests = response.data.requests.filter(r =>
-                        String(r.order_number).replace(/^#/, '').trim() === cleanOrderId
-                    );
-                }
-            } catch (err) {
-                console.warn('[widget] returns server fetch failed:', err.message);
-            }
+        try {
+            requests = (await findExternalReturnRequests(cleanOrderId)).filter(r =>
+                String(r.order_number || '').replace(/^#/, '').trim() === cleanOrderId
+            );
+        } catch (err) {
+            console.warn('[widget] returns server request search failed:', err.message);
         }
 
         // Check local tables — match with and without # prefix
