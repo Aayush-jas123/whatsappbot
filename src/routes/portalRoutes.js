@@ -454,6 +454,15 @@ router.post('/:slug/chat/send', verifyPortalToken, async (req, res) => {
             } else {
                 result = await whatsappService.sendMessage(formattedPhone, message, 'manual_reply');
             }
+
+            // Update the WhatsApp shopper record using normalized phone variants.
+            await dbAdapter.run(
+                `UPDATE store_shoppers
+                 SET last_response_at = ?,
+                     response_count = COALESCE(response_count, 0) + 1
+                 WHERE phone = ? OR phone = ? OR phone = ? OR phone = ?`,
+                [new Date().toISOString(), formattedPhone, `+${cleanPhone}`, `91${cleanPhone}`, cleanPhone]
+            );
         }
 
         // AI learning: pair this human reply with the customer's latest question
@@ -463,15 +472,6 @@ router.post('/:slug/chat/send', verifyPortalToken, async (req, res) => {
             const aiLearning = require('../services/ai/learning');
             aiLearning.learnFromAgentReply({ phone, replyText: message, suggestedText }).catch(() => {});
         }
-
-        // Update shopper record if exists - try multiple phone formats
-        await dbAdapter.run(
-            `UPDATE store_shoppers 
-             SET last_response_at = ?,
-                 response_count = COALESCE(response_count, 0) + 1
-             WHERE phone = ? OR phone = ? OR phone = ? OR phone = ?`,
-            [new Date().toISOString(), formattedPhone, `+${cleanPhone}`, `91${cleanPhone}`, cleanPhone]
-        );
 
         res.json({
             success: true,
