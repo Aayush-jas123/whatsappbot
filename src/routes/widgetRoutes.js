@@ -223,12 +223,19 @@ router.post('/track-order', async (req, res) => {
                         [orderName]
                     );
                     if (shopperRows && shopperRows.length > 0) {
+                        const shopperStatus = (shopperRows[0].status || '').toLowerCase();
+                        let note;
+                        if (shopperStatus === 'delivered') {
+                            note = 'Your order has been delivered.';
+                        } else if (shopperStatus === 'confirmed') {
+                            note = 'Your order will be shipped within 24 to 48 hours.';
+                        } else {
+                            note = 'Please confirm your order via the template message sent to you.';
+                        }
                         trackingResult = {
                             orderId: orderName,
                             fulfillmentStatus: shopperRows[0].status,
-                            note: shopperRows[0].status === 'delivered'
-                                ? 'Your order has been delivered.'
-                                : 'Your order is confirmed and will be shipped in 24 to 48 hours.'
+                            note: note
                         };
                         carrierUsed = 'shopify';
                     }
@@ -289,20 +296,21 @@ router.post('/track-order', async (req, res) => {
                                     fulfillmentStatus: order.fulfillment_status,
                                     financialStatus: order.financial_status,
                                     createdAt: order.created_at,
-                                    note: 'Your order will be shipped in 24 to 48 hours. Live tracking will be available once handed over to the courier partner.'
+                                    note: 'Your order will be shipped within 24 to 48 hours.'
                                 };
                                 carrierUsed = 'shopify';
                             }
                         } else {
                             // No AWB yet — return order status
+                            const isUnfulfilled = !order.fulfillment_status || order.fulfillment_status === 'unfulfilled';
                             trackingResult = {
                                 orderId: order.name,
                                 fulfillmentStatus: order.fulfillment_status,
                                 financialStatus: order.financial_status,
                                 createdAt: order.created_at,
-                                note: (!order.fulfillment_status || order.fulfillment_status === 'unfulfilled')
-                                    ? 'Your order is confirmed and will be shipped in 24 to 48 hours.'
-                                    : 'Your order will be shipped in 24 to 48 hours. Live tracking will be available once handed over to the courier partner.'
+                                note: isUnfulfilled
+                                    ? 'Please confirm your order via the template message sent to you.'
+                                    : 'Your order will be shipped within 24 to 48 hours.'
                             };
                             carrierUsed = 'shopify';
                         }

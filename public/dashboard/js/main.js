@@ -333,7 +333,7 @@ function renderTickets(tickets, append) {
             <div class="ticket-col">
                 <div class="ticket-portal-name">${esc(t.portal_name || 'Unassigned')}</div>
                 <div class="ticket-actions">
-                    <button class="ticket-action-btn" onclick="openChat(${t.id},'${esc(t.customer_phone)}','${esc(t.customer_name || '')}','${channel}')" title="Open Chat">
+                    <button class="ticket-action-btn" onclick="openChat(${t.id},'${esc(t.customer_phone || '')}','${esc(t.customer_name || '')}','${channel}')" title="Open Chat">
                         <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></svg>
                     </button>
                     <button class="ticket-action-btn" onclick="openAssignModal(${t.id})" title="Assign Portal">
@@ -418,6 +418,7 @@ let currentChatPhone = null;
 let currentChatChannel = 'whatsapp';
 
 async function openChat(ticketId, phone, name, channel) {
+    if (!phone) { alert('No customer phone available for this ticket.'); return; }
     currentChatPhone = phone;
     currentChatChannel = channel || 'whatsapp';
     document.getElementById('chatModalTitle').textContent = name || phone;
@@ -960,7 +961,7 @@ function renderAiConversations(tickets) {
             const ch = (t.channel || 'whatsapp').toLowerCase();
             const icon = ch === 'instagram' ? 'IG' : ch === 'website' ? 'Web' : 'WA';
             return `
-                <div class="ai-convo-item" onclick="openChat(${t.id},'${esc(t.customer_phone)}','${esc(t.customer_name || '')}','${ch}')">
+                <div class="ai-convo-item" onclick="openChat(${t.id},'${esc(t.customer_phone || '')}','${esc(t.customer_name || '')}','${ch}')">
                     <div class="ai-convo-channel ${ch}">${icon}</div>
                     <div class="ai-convo-info">
                         <div class="ai-convo-name">${esc(t.customer_name || t.customer_phone || 'Unknown')}</div>

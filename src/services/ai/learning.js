@@ -33,7 +33,7 @@ const SOP_GOLDEN_EXAMPLES = [
     },
     {
         q: "Till when will my order be delivered? / When will it be shipped?",
-        a: "Your order #{{order_id}} is being processed and will be shipped in 24 to 48 hours. Live courier tracking updates will be available once dispatched."
+        a: "If your order is pending confirmation: 'Please confirm your order via the template message sent to you.' If your order is confirmed: 'Your order #{{order_id}} is confirmed and will be shipped within 24 to 48 hours. Live courier tracking updates will be available once dispatched.'"
     },
     {
         q: "Tracking says delivered but I have not received my order / item missing",

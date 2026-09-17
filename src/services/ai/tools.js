@@ -228,8 +228,8 @@ const tools = [
                 total: o.total_price,
                 currency: o.currency,
                 financialStatus: o.financial_status,
-                fulfillmentStatus: o.fulfillment_status || 'unfulfilled (will be shipped in 24 to 48 hours)',
-                note: o.fulfillment_status ? null : 'This order is confirmed and will be shipped in 24 to 48 hours. Live tracking will be available once handed over to the courier.',
+                fulfillmentStatus: o.fulfillment_status || 'unfulfilled',
+                note: o.fulfillment_status ? null : 'Please confirm your order via the template message sent to you.',
                 customer: o.customer ? `${o.customer.first_name || ''} ${o.customer.last_name || ''}`.trim() : null,
                 phone: o.customer?.phone || o.shipping_address?.phone || null,
                 items: (o.line_items || []).map(li => `${li.title} x${li.quantity}`)
@@ -354,13 +354,17 @@ const tools = [
             } catch (e) { /* ignore */ }
 
             if (shipment || shopper || orderRow) {
+                const shopperStatus = (shopper?.status || '').toLowerCase();
+                const isConfirmed = shopperStatus === 'confirmed';
                 return {
                     orderId: name,
                     awb: null,
                     shipmentStatus: shipment?.status || null,
                     shopperStatus: shopper?.status || null,
                     orderStatus: orderRow?.status || null,
-                    note: 'This order is confirmed and will be shipped in 24 to 48 hours. Live tracking will be available once handed over to the courier partner.'
+                    note: isConfirmed
+                        ? 'Your order will be shipped within 24 to 48 hours. Live tracking will be available once handed over to the courier partner.'
+                        : 'Please confirm your order via the template message sent to you.'
                 };
             }
 
@@ -389,9 +393,9 @@ const tools = [
                         }
                         return {
                             orderId: order.name,
-                            fulfillmentStatus: order.fulfillment_status || 'unfulfilled (will be shipped in 24 to 48 hours)',
+                            fulfillmentStatus: order.fulfillment_status || 'unfulfilled',
                             financialStatus: order.financial_status,
-                            note: 'This order is confirmed and will be shipped in 24 to 48 hours. Live tracking will be available once handed over to the courier partner.'
+                            note: 'Please confirm your order via the template message sent to you.'
                         };
                     }
                 }

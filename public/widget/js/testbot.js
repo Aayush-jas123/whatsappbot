@@ -176,6 +176,7 @@
             '#offcomfrt-tb .oftb-tracking-status{font-size:10px;font-weight:700;padding:4px 10px;border-radius:100px;text-transform:uppercase;letter-spacing:0.8px}',
             '#offcomfrt-tb .oftb-status-delivered{background:#1a1a1a;color:#fff}',
             '#offcomfrt-tb .oftb-status-transit{background:#e5e5e5;color:#1a1a1a}',
+            '#offcomfrt-tb .oftb-status-pending{background:#fff3cd;color:#856404}',
             '#offcomfrt-tb .oftb-status-unknown{background:#f3f4f6;color:#999}',
             '#offcomfrt-tb .oftb-tracking-row{display:flex;justify-content:space-between;align-items:center;padding:8px 0;border-bottom:1px solid #f5f5f5}',
             '#offcomfrt-tb .oftb-tracking-row:last-child{border-bottom:none}',
@@ -816,6 +817,7 @@
         var statusClass = 'oftb-status-unknown';
         if (/delivered/i.test(statusText)) statusClass = 'oftb-status-delivered';
         else if (/transit|shipped|dispatched|in.?transit|out.?for.?delivery/i.test(statusText)) statusClass = 'oftb-status-transit';
+        else if (/pending|unfulfilled|confirm/i.test(statusText)) statusClass = 'oftb-status-pending';
 
         var carrierName = data.carrierName || 'Carrier';
         var html = '<div class="oftb-tracking-card-header">';
