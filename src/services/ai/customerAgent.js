@@ -354,7 +354,7 @@ async function runCustomerAgent({ sessionId, message, visitorId }) {
             messages.push({ role: 'tool', tool_call_id: call.id, content: json });
 
             // Surface the newest return/exchange request as a rich status card
-            if (name === 'check_return_exchange_status' && result && result.found) {
+            if (name === 'check_return_exchange_status' && result && result.found && (result.returns?.length || result.exchanges?.length)) {
                 returnCard = buildReturnCard(result);
             }
         }
@@ -425,6 +425,9 @@ function buildReturnCard(result) {
     const latestReturn = (result.returns || [])[0];
     const latestExchange = (result.exchanges || [])[0];
 
+    // Guard: if both are missing there is nothing to render
+    if (!latestReturn && !latestExchange) return null;
+
     const newest = (() => {
         if (latestReturn && latestExchange) {
             return new Date(latestExchange.created_at) > new Date(latestReturn.created_at)
@@ -435,6 +438,7 @@ function buildReturnCard(result) {
     })();
 
     const { kind, row } = newest;
+    if (!row) return null;
     const card = {
         type: kind === 'return' ? 'Return' : 'Exchange',
         status: humanizeReturnStatus(row.status),
