@@ -217,9 +217,12 @@ function buildSystemPrompt(context, language) {
     let contextStr = '';
     if (context.orderId) contextStr += `\n- Customer's order ID (from earlier in conversation): #${context.orderId}`;
     if (context.requestId) contextStr += `\n- Return/exchange request ID (from earlier): ${context.requestId}`;
+    if (context.phone) contextStr += `\n- Customer's registered mobile number: ${context.phone}`;
+    if (context.customerName) contextStr += `\n- Customer's name: ${context.customerName}`;
     if (context.awb) contextStr += `\n- AWB tracking number (from earlier): ${context.awb}`;
     if (context.pincode) contextStr += `\n- Pincode mentioned: ${context.pincode}`;
     if (context.lastScenario) contextStr += `\n- Active Detected Scenario: ${context.lastScenario} (adhere strictly to Scenario ${context.lastScenario} SOP rules below)`;
+    if (context.supportTopic) contextStr += `\n- Current Support Topic: ${context.supportTopic}`;
 
     return `You are the OFFCOMFRT customer support assistant — a helpful, empathetic, and SOP-compliant AI that assists shoppers with orders, tracking, returns, exchanges, and inquiries.
 
@@ -304,6 +307,7 @@ RULES:
 - PRIVACY & DATA PROTECTION (CRITICAL): NEVER share, confirm, or disclose personal customer information under any circumstances — including customer names, phone numbers, delivery/shipping addresses, or email addresses. If a customer or user asks for personal details, phone number, address, or name for an order, politely decline: "For privacy and security reasons, personal customer details like phone number and delivery address cannot be shared in chat." You may only share order status, ordered items, and shipping timeline.
 - NEVER repeat information you already shared in this conversation.
 - If the customer previously shared an order number, use it for follow-up questions without asking again.
+- PERSISTENT CONTEXT RETENTION: If the customer's Order ID, phone number, or return request ID is already known in CONVERSATION CONTEXT above, NEVER ask them to provide their order number, phone number, or repeat their issue again. Immediately proceed using the known order ID or phone number with lookup tools or in your explanation.
 - To track, you only need the order number (a 4-5 digit number, "#" prefix optional). ONLY call track_order_by_id or other lookup tools when the customer explicitly asks to track, check status, or find their order.
 - A standalone 10-digit number is a MOBILE PHONE NUMBER. Never treat it as an order ID or AWB. If the customer shares their phone number, use search_orders_by_phone to look up their recent orders.
 - NEVER ask the customer for an AWB / courier tracking number — the system resolves tracking internally from the order ID.
@@ -471,7 +475,7 @@ function applyRefundGuardrails(reply, userMessage, context) {
  * @param {string} opts.message    - Customer's message
  * @returns {{ reply: string, suggestedAction: string|null }}
  */
-async function runCustomerAgent({ sessionId, message, visitorId }) {
+async function runCustomerAgent({ sessionId, message, visitorId, entities }) {
     if (!isConfigured()) {
         return {
             reply: 'Our support assistant is currently unavailable. Please reach out to us on WhatsApp for help.',
@@ -482,9 +486,13 @@ async function runCustomerAgent({ sessionId, message, visitorId }) {
     const session = await getSessionAsync(sessionId);
     const toolSchemas = getCustomerToolSchemas();
 
-    // Extract entities from this message and merge into session context
+    // Extract entities from this message and merge with client-supplied entities and session context
     const newEntities = extractEntities(message);
-    const context = { ...session.context, ...newEntities };
+    const context = { ...session.context, ...(entities || {}), ...newEntities };
+    saveSession(sessionId, session.history, context);
+    if (Object.keys(context).length > 0) {
+        persistContextToDb(sessionId, context).catch(err => console.warn('[widget] context persist error:', err.message));
+    }
 
     // Detect language
     const language = detectLanguage(message);
@@ -640,6 +648,7 @@ async function runCustomerAgent({ sessionId, message, visitorId }) {
         suggestedAction,
         cardType: returnCard ? 'return' : null,
         cardData: returnCard,
+        entities: context,
         usage: { prompt_tokens: totalPromptTokens, completion_tokens: totalCompletionTokens, cost_usd: totalCost }
     };
 }
@@ -858,5 +867,6 @@ module.exports = {
     noteSessionContext,
     appendSessionExchange,
     applyRefundGuardrails,
-    detectSopScenario
+    detectSopScenario,
+    getSessionAsync
 };

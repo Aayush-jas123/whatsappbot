@@ -10,7 +10,7 @@
 
 const express = require('express');
 const router = express.Router();
-const { runCustomerAgent, createWidgetTicket, noteSessionContext, appendSessionExchange } = require('../services/ai/customerAgent');
+const { runCustomerAgent, createWidgetTicket, noteSessionContext, appendSessionExchange, getSessionAsync } = require('../services/ai/customerAgent');
 const { getAdapter, getConfiguredCarriers } = require('../services/carriers');
 
 function normalizeExternalRequest(request) {
@@ -76,7 +76,7 @@ router.get('/session', (req, res) => {
 
 router.post('/chat', async (req, res) => {
     try {
-        const { sessionId, message, visitorId } = req.body;
+        const { sessionId, message, visitorId, entities } = req.body;
 
         if (!sessionId || !message) {
             return res.status(400).json({ error: 'sessionId and message are required' });
@@ -86,13 +86,14 @@ router.post('/chat', async (req, res) => {
             return res.status(400).json({ error: 'Message too long (max 1000 characters)' });
         }
 
-        const result = await runCustomerAgent({ sessionId, message, visitorId });
+        const result = await runCustomerAgent({ sessionId, message, visitorId, entities });
 
         res.json({
             reply: result.reply,
             suggestedAction: result.suggestedAction,
             cardType: result.cardType || null,
-            cardData: result.cardData || null
+            cardData: result.cardData || null,
+            entities: result.entities || null
         });
     } catch (error) {
         console.error('[widget] chat error:', error.message);
@@ -109,6 +110,26 @@ router.post('/chat', async (req, res) => {
             reply: 'Sorry, something went wrong. Please try again or contact us on WhatsApp.',
             suggestedAction: null
         });
+    }
+});
+
+// ---------- GET /api/widget/session-context ----------
+// Retrieves active entities (e.g. orderId, phone, lastScenario) for the session so client restores state on reload
+router.get('/session-context', async (req, res) => {
+    try {
+        const sessionId = req.query.sessionId;
+        if (!sessionId) {
+            return res.status(400).json({ error: 'sessionId is required' });
+        }
+        const session = await getSessionAsync(sessionId);
+        res.json({
+            ok: true,
+            sessionId,
+            entities: session.context || {}
+        });
+    } catch (error) {
+        console.error('[widget] session-context error:', error.message);
+        res.status(500).json({ error: 'Server error' });
     }
 });
 

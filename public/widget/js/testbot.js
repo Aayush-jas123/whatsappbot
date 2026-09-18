@@ -35,10 +35,60 @@
         sessionStorage.setItem('offcomfrt_tb_session', sessionId);
     }
 
+    // ---------- Persistent Session Context (Change 12) ----------
+    function getStoredEntities() {
+        try {
+            var raw = sessionStorage.getItem('offcomfrt_tb_entities');
+            return raw ? JSON.parse(raw) : {};
+        } catch (e) {
+            return {};
+        }
+    }
+
+    function saveStoredEntities(patch) {
+        if (!patch || typeof patch !== 'object') return getStoredEntities();
+        try {
+            var current = getStoredEntities();
+            var updated = Object.assign({}, current);
+            for (var k in patch) {
+                if (patch[k] !== undefined && patch[k] !== null && patch[k] !== '') {
+                    updated[k] = patch[k];
+                }
+            }
+            sessionStorage.setItem('offcomfrt_tb_entities', JSON.stringify(updated));
+            flowContext = Object.assign({}, flowContext, updated);
+
+            // Notify backend session context asynchronously
+            if (patch.orderId || patch.phone || patch.requestId || patch.customerName) {
+                fetch(API_URL + '/api/widget/context', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ sessionId: sessionId, entities: updated })
+                }).catch(function () {});
+            }
+            return updated;
+        } catch (e) {
+            return patch;
+        }
+    }
+
+    function syncSessionContextFromServer() {
+        if (!sessionId) return;
+        fetch(API_URL + '/api/widget/session-context?sessionId=' + encodeURIComponent(sessionId))
+            .then(function (r) { return r.json(); })
+            .then(function (data) {
+                if (data && data.entities && Object.keys(data.entities).length) {
+                    saveStoredEntities(data.entities);
+                }
+            })
+            .catch(function () {});
+    }
+
     var isOpen = false;
     var isTyping = false;
     var flowState = 'idle';
-    var flowContext = {};
+    var flowContext = Object.assign({}, getStoredEntities());
+    syncSessionContextFromServer();
 
     // ---------- Admin override polling ----------
     var lastMessageId = 0;
@@ -527,6 +577,40 @@
             doTrackOrder(directTrId);
             return;
         }
+        if (action.indexOf('check_return_direct_') === 0) {
+            var directRetId = action.replace('check_return_direct_', '');
+            addUserMessage('Check Order #' + directRetId);
+            doCheckReturnEligibility(directRetId);
+            return;
+        }
+        if (action.indexOf('edit_order_direct_') === 0) {
+            var directEditId = action.replace('edit_order_direct_', '');
+            addUserMessage('Edit Order #' + directEditId);
+            doCheckEditOrder(directEditId);
+            return;
+        }
+        if (action.indexOf('track_request_direct_') === 0) {
+            var directReqId = action.replace('track_request_direct_', '');
+            addUserMessage('Track ' + directReqId);
+            doTrackRequest(directReqId);
+            return;
+        }
+        if (action === 'track_new_order') {
+            promptForNewTrackOrder();
+            return;
+        }
+        if (action === 'return_new_order') {
+            promptForNewReturnOrder();
+            return;
+        }
+        if (action === 'edit_new_order') {
+            promptForNewEditOrder();
+            return;
+        }
+        if (action === 'track_request_new') {
+            promptForNewTrackRequest();
+            return;
+        }
         if (action === 'search_phone_for_return') {
             flowState = 'awaiting_return_order_id';
             setInputMode('tel');
@@ -749,7 +833,7 @@
 
     function showMainMenuAgain() {
         flowState = 'idle';
-        flowContext = {};
+        flowContext = Object.assign({}, getStoredEntities());
         setInputMode('text');
         addBotMessage('How else can we help you?', [
             { label: 'Track Order', action: 'track_order' },
@@ -760,14 +844,27 @@
         ]);
     }
 
-    // ========== FLOW 1: TRACK ORDER ==========
-    function startTrackOrder() {
+    function promptForNewTrackOrder() {
         flowState = 'awaiting_order_id';
-        flowContext = {};
         setInputMode('order');
         addBotMessage('Please enter your *order number* or registered *mobile number*.\n\nYou can find your order number in your confirmation email or SMS.', [
             { label: 'Back to Menu', action: 'main_menu' }
         ]);
+    }
+
+    // ========== FLOW 1: TRACK ORDER ==========
+    function startTrackOrder() {
+        var stored = getStoredEntities();
+        if (stored.orderId) {
+            flowState = 'awaiting_known_order_track';
+            addBotMessage('We found your active Order *#' + escapeHtml(stored.orderId) + '*. Would you like to track this order or check a different one?', [
+                { label: 'Track #' + stored.orderId, action: 'track_order_direct_' + stored.orderId, primary: true },
+                { label: 'Track Another Order', action: 'track_new_order' },
+                { label: 'Menu', action: 'main_menu' }
+            ]);
+        } else {
+            promptForNewTrackOrder();
+        }
     }
 
     // ---------- Entity Extraction Helper ----------
@@ -777,26 +874,46 @@
 
         // 1. Return/exchange request ID: REQ-1234 to REQ-123456
         var reqMatch = str.match(/\b(REQ-\d{4,6})\b/i);
-        if (reqMatch) return { type: 'request', id: reqMatch[1].toUpperCase() };
+        if (reqMatch) {
+            var reqObj = { type: 'request', id: reqMatch[1].toUpperCase() };
+            if (typeof saveStoredEntities === 'function') saveStoredEntities({ requestId: reqObj.id });
+            return reqObj;
+        }
 
         // 2. Explicitly labeled AWB (AWB:, tracking:, courier:)
         var awbLabeled = str.match(/\b(?:AWB|tracking|courier)[-_ :]*(\d{10,16})\b/i);
-        if (awbLabeled) return { type: 'awb', id: awbLabeled[1] };
+        if (awbLabeled) {
+            var awbObj = { type: 'awb', id: awbLabeled[1] };
+            if (typeof saveStoredEntities === 'function') saveStoredEntities({ awb: awbObj.id });
+            return awbObj;
+        }
 
         // 3. Mobile phone number: 10 digits starting with 6-9 (optional +91 or 0 prefix)
         var phoneMatch = str.match(/(?:\+?91[\s-]?)?\b([6-9]\d{9})\b/);
-        if (phoneMatch) return { type: 'phone', id: phoneMatch[1] };
+        if (phoneMatch) {
+            var phoneObj = { type: 'phone', id: phoneMatch[1] };
+            if (typeof saveStoredEntities === 'function') saveStoredEntities({ phone: phoneObj.id });
+            return phoneObj;
+        }
 
         // 4. Long courier tracking code: 12-16 digits
         var awbLong = str.match(/\b(\d{12,16})\b/);
-        if (awbLong) return { type: 'awb', id: awbLong[1] };
+        if (awbLong) {
+            var awbLObj = { type: 'awb', id: awbLong[1] };
+            if (typeof saveStoredEntities === 'function') saveStoredEntities({ awb: awbLObj.id });
+            return awbLObj;
+        }
 
-        // 4. Order ID: matches #53388, Order #53388, 53388 order status, or standalone 4-6 digits
+        // 5. Order ID: matches #53388, Order #53388, 53388 order status, or standalone 4-6 digits
         var orderMatch = str.match(/#(\d{4,6})/i)
             || str.match(/\b(?:ORD|ORDER)[-_ #]?(\d{4,6})\b/i)
             || str.match(/\b(\d{4,6})\b/)
             || str.match(/(\d{4,6})/);
-        if (orderMatch) return { type: 'order', id: orderMatch[1] };
+        if (orderMatch) {
+            var ordObj = { type: 'order', id: orderMatch[1] };
+            if (typeof saveStoredEntities === 'function') saveStoredEntities({ orderId: ordObj.id });
+            return ordObj;
+        }
 
         return null;
     }
@@ -840,6 +957,7 @@
             } else {
                 addTrackingCard(data);
                 flowContext.orderId = data.orderId || flowContext.orderId;
+                saveStoredEntities({ orderId: flowContext.orderId });
 
                 var stage = data.stage;
                 var st = (data.status || '').toLowerCase();
@@ -1035,14 +1153,8 @@
         });
     }
 
-    // ========== FLOW 2: RETURN / EXCHANGE (Eligibility Validator & Portal) ==========
-    function startFileReturn() {
-        if (flowContext && flowContext.orderId) {
-            doCheckReturnEligibility(flowContext.orderId);
-            return;
-        }
+    function promptForNewReturnOrder() {
         flowState = 'awaiting_return_order_id';
-        flowContext = flowContext || {};
         setInputMode('order');
         addBotMessage(
             'Please enter your *order number* or registered *10-digit mobile number* to check if your order is eligible for Return or Exchange.\n\n' +
@@ -1054,11 +1166,31 @@
         );
     }
 
+    // ========== FLOW 2: RETURN / EXCHANGE (Eligibility Validator & Portal) ==========
+    function startFileReturn() {
+        var stored = getStoredEntities();
+        if (stored.orderId) {
+            flowState = 'awaiting_known_order_return';
+            addBotMessage(
+                'Would you like to check Return / Exchange eligibility for Order *#' + escapeHtml(stored.orderId) + '* or check a different order?',
+                [
+                    { label: 'Check #' + stored.orderId, action: 'check_return_direct_' + stored.orderId, primary: true },
+                    { label: 'Check Another Order', action: 'return_new_order' },
+                    { label: 'Direct to Return Portal', action: 'open_return_url' },
+                    { label: 'Menu', action: 'main_menu' }
+                ]
+            );
+        } else {
+            promptForNewReturnOrder();
+        }
+    }
+
     function doCheckReturnEligibility(orderId) {
         flowState = 'checking_return_eligibility';
         showTyping();
         var cleanId = String(orderId).replace(/^#/, '').trim();
         flowContext.orderId = cleanId;
+        saveStoredEntities({ orderId: cleanId });
 
         fetch(API_URL + '/api/widget/check-return-eligibility', {
             method: 'POST',
@@ -1153,14 +1285,34 @@
         });
     }
 
-    // ========== FLOW 3: TRACK YOUR REQUEST ==========
-    function startTrackRequest() {
+    function promptForNewTrackRequest() {
         flowState = 'awaiting_request_track_id';
-        flowContext = {};
         setInputMode('text');
         addBotMessage('Enter your *order number* or *request ID* (e.g. REQ-12345) to check your return or exchange request status.', [
             { label: 'Back to Menu', action: 'main_menu' }
         ]);
+    }
+
+    // ========== FLOW 3: TRACK YOUR REQUEST ==========
+    function startTrackRequest() {
+        var stored = getStoredEntities();
+        if (stored.requestId) {
+            flowState = 'awaiting_known_request_track';
+            addBotMessage('Would you like to check status for Request *' + escapeHtml(stored.requestId) + '* or enter a different one?', [
+                { label: 'Track ' + stored.requestId, action: 'track_request_direct_' + stored.requestId, primary: true },
+                { label: 'Enter Another', action: 'track_request_new' },
+                { label: 'Menu', action: 'main_menu' }
+            ]);
+        } else if (stored.orderId) {
+            flowState = 'awaiting_known_request_track';
+            addBotMessage('Would you like to check return/exchange requests for Order *#' + escapeHtml(stored.orderId) + '* or enter another number?', [
+                { label: 'Track for #' + stored.orderId, action: 'track_request_direct_' + stored.orderId, primary: true },
+                { label: 'Enter Another', action: 'track_request_new' },
+                { label: 'Menu', action: 'main_menu' }
+            ]);
+        } else {
+            promptForNewTrackRequest();
+        }
     }
     
     function doTrackRequest(input) {
@@ -1172,10 +1324,14 @@
         var payload = {};
         if (parsed && parsed.type === 'request') {
             payload.requestId = parsed.id;
+            saveStoredEntities({ requestId: parsed.id });
         } else if (parsed && parsed.type === 'order') {
             payload.orderId = parsed.id;
+            saveStoredEntities({ orderId: parsed.id });
         } else {
-            payload.orderId = String(input).replace(/^#/, '').replace(/\s/g, '').trim();
+            var rawVal = String(input).replace(/^#/, '').replace(/\s/g, '').trim();
+            payload.orderId = rawVal;
+            saveStoredEntities({ orderId: rawVal });
         }
 
         fetch(API_URL + '/api/widget/track-request', {
@@ -1226,10 +1382,8 @@
         });
     }
 
-    // ========== FLOW 5: EDIT REQUEST (Pre-dispatch size, address, cancellation) ==========
-    function startEditRequest() {
+    function promptForNewEditOrder() {
         flowState = 'awaiting_edit_order_id';
-        flowContext = {};
         setInputMode('order');
         addBotMessage(
             'Need to change your size, address, or details before dispatch?\n\n' +
@@ -1240,10 +1394,29 @@
         );
     }
 
+    // ========== FLOW 5: EDIT REQUEST (Pre-dispatch size, address, cancellation) ==========
+    function startEditRequest() {
+        var stored = getStoredEntities();
+        if (stored.orderId) {
+            flowState = 'awaiting_known_edit_order';
+            addBotMessage(
+                'Would you like to edit Order *#' + escapeHtml(stored.orderId) + '* (change size, update address, or cancel) or enter a different order?',
+                [
+                    { label: 'Edit #' + stored.orderId, action: 'edit_order_direct_' + stored.orderId, primary: true },
+                    { label: 'Edit Another Order', action: 'edit_new_order' },
+                    { label: 'Menu', action: 'main_menu' }
+                ]
+            );
+        } else {
+            promptForNewEditOrder();
+        }
+    }
+
     function doCheckEditOrder(orderInput) {
         var parsed = parseOrderOrTracking(orderInput);
         var cleanId = parsed ? parsed.id : String(orderInput || '').replace(/^#/, '').replace(/\s/g, '');
         flowContext.orderId = cleanId;
+        saveStoredEntities({ orderId: cleanId });
         flowState = 'checking_edit_status';
         showTyping();
 
@@ -1308,6 +1481,7 @@
             hideTyping();
             if (data.success) {
                 flowContext.customerName = data.name || '';
+                saveStoredEntities({ customerName: data.name || '', orderId: cleanId });
                 addBotMessage(
                     'Order *#' + cleanId + '* is currently being prepared.\n\nWhat would you like to update?',
                     [
@@ -1477,32 +1651,48 @@
     var MAX_AI_ATTEMPTS = 3; // Keep conversing for 3 replies before showing Create Ticket
 
     function startContactSupport() {
-        flowState = 'awaiting_ticket_order_id';
-        flowContext = {};
+        var stored = getStoredEntities();
+        flowContext = Object.assign({}, stored);
         flowContext.aiAttempts = 0;
-        setInputMode('order');
-        addBotMessage('Please enter your *order number* or registered *mobile number* so we can pull up your details.\n\nOr select an urgent topic below:', [
-            { label: 'Paid Online but Asking COD', action: 'support_cod_confusion', primary: true },
-            { label: 'Delivered but Not Received (POD)', action: 'support_delayed_pod' },
-            { label: 'Damaged or Wrong Item', action: 'support_damaged_wrong' },
-            { label: 'Order Issue', action: 'support_order_issue' },
-            { label: 'Back to Menu', action: 'main_menu' }
-        ]);
+        if (stored.orderId) {
+            flowState = 'awaiting_support_topic';
+            setInputMode('text');
+            addBotMessage('I have your Order *#' + escapeHtml(stored.orderId) + '* active. How can we help you?', [
+                { label: 'Paid Online but Asking COD', action: 'support_cod_confusion', primary: true },
+                { label: 'Delivered but Not Received (POD)', action: 'support_delayed_pod' },
+                { label: 'Damaged or Wrong Item', action: 'support_damaged_wrong' },
+                { label: 'Order Issue', action: 'support_order_issue' },
+                { label: 'Other Question', action: 'support_other' },
+                { label: 'Back to Menu', action: 'main_menu' }
+            ]);
+        } else {
+            flowState = 'awaiting_ticket_order_id';
+            setInputMode('order');
+            addBotMessage('Please enter your *order number* or registered *mobile number* so we can pull up your details.\n\nOr select an urgent topic below:', [
+                { label: 'Paid Online but Asking COD', action: 'support_cod_confusion', primary: true },
+                { label: 'Delivered but Not Received (POD)', action: 'support_delayed_pod' },
+                { label: 'Damaged or Wrong Item', action: 'support_damaged_wrong' },
+                { label: 'Order Issue', action: 'support_order_issue' },
+                { label: 'Back to Menu', action: 'main_menu' }
+            ]);
+        }
     }
 
     // After AI tries to resolve and user wants to escalate directly
     function startCreateTicket() {
+        var stored = getStoredEntities();
+        flowContext = Object.assign({}, flowContext, stored);
         if (flowContext.orderId) {
             // Already have order ID from this session — go straight to issue description
             flowState = 'awaiting_ticket_message';
-            addBotMessage('Please describe your issue briefly and we will create a support ticket for you.', [
+            addBotMessage('Creating support ticket for Order *#' + escapeHtml(flowContext.orderId) + '*. Please describe your issue briefly:', [
                 { label: 'Back to Menu', action: 'main_menu' }
             ]);
             setInputPlaceholder('Describe your issue...');
         } else {
             flowState = 'awaiting_ticket_order_id';
             setInputMode('order');
-            addBotMessage('Let me pull up your order first. Please enter your *order number*.', [
+            addBotMessage('Let me pull up your order first. Please enter your *order number*:', [
                 { label: 'Back to Menu', action: 'main_menu' }
             ]);
         }
@@ -1520,18 +1710,23 @@
         flowContext.aiAttempts = (flowContext.aiAttempts || 0) + 1;
         showTyping();
 
+        var stored = getStoredEntities();
         fetch(API_URL + '/api/widget/chat', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({
                 sessionId: sessionId,
                 visitorId: visitorId,
+                entities: stored,
                 message: (flowContext.orderId ? '[Order #' + flowContext.orderId + '] ' : '') + '[' + (flowContext.supportTopic || 'General') + '] ' + message
             })
         })
         .then(function (r) { return r.json(); })
         .then(function (data) {
             hideTyping();
+            if (data && data.entities) {
+                saveStoredEntities(data.entities);
+            }
             var aiReply = data.reply || 'I was unable to process your request.';
             var aiSaysCreateTicket = data.suggestedAction === 'create_ticket';
             var attempts = flowContext.aiAttempts || 0;
