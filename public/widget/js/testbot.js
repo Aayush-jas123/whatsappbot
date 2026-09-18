@@ -533,6 +533,59 @@
             }
             return;
         }
+        if (action === 'support_damaged_wrong') {
+            addUserMessage('Damaged or Wrong Item Received');
+            flowContext.supportTopic = 'Damaged / Wrong Item';
+            var ordStr = flowContext.orderId ? ' for Order *#' + flowContext.orderId + '*' : '';
+            addBotMessage(
+                "We sincerely apologize for the trouble" + ordStr + "!\n\n" +
+                "If you received a defective, damaged, or incorrect item, you qualify for a **free replacement or full refund to your original payment method** upon verification.\n\n" +
+                "**Mandatory SOP Proof Requirements:**\n" +
+                "• **Wrong Item Delivered:** An **unboxing video is mandatory** showing the outer package and shipping label being opened.\n" +
+                "• **Damaged / Defective Product:** Clear photos showing the damaged/defective area with original product tags attached.\n" +
+                "• **Timeframe:** Must be submitted within **2 days of delivery**.\n\n" +
+                "How would you like to proceed?",
+                [
+                    { label: 'Submit on Return Portal', action: 'open_return_url', primary: true },
+                    { label: 'Report Damaged Item', action: 'raise_damaged_ticket' },
+                    { label: 'Report Wrong Item', action: 'raise_wrong_item_ticket' },
+                    { label: 'Menu', action: 'main_menu' }
+                ]
+            );
+            return;
+        }
+        if (action === 'raise_damaged_ticket') {
+            addUserMessage('Report Damaged Item');
+            flowContext.supportTopic = 'Damaged Item Claim';
+            if (flowContext.orderId) {
+                doCreateSupportTicket(
+                    '[DAMAGED_ITEM_CLAIM] Order #' + flowContext.orderId + ': Customer reports damaged/defective product. Advised to provide photos of damaged area with tags attached. Eligible for refund to original payment method or free replacement within 2-day delivery window.'
+                );
+            } else {
+                flowState = 'awaiting_damaged_order_id';
+                setInputMode('order');
+                addBotMessage('Please enter your *order number* or registered *mobile number* so we can create your damaged item ticket:', [
+                    { label: 'Back to Menu', action: 'main_menu' }
+                ]);
+            }
+            return;
+        }
+        if (action === 'raise_wrong_item_ticket') {
+            addUserMessage('Report Wrong Item');
+            flowContext.supportTopic = 'Wrong Item Claim';
+            if (flowContext.orderId) {
+                doCreateSupportTicket(
+                    '[WRONG_ITEM_CLAIM] Order #' + flowContext.orderId + ': Customer reports wrong product delivered. Advised that an unboxing video is mandatory showing parcel being opened. Eligible for refund to original payment method or free replacement within 2-day delivery window.'
+                );
+            } else {
+                flowState = 'awaiting_wrong_item_order_id';
+                setInputMode('order');
+                addBotMessage('Please enter your *order number* or registered *mobile number* so we can create your wrong item ticket:', [
+                    { label: 'Back to Menu', action: 'main_menu' }
+                ]);
+            }
+            return;
+        }
         if (action && action.indexOf('support_') === 0) {
             var topic = action.replace('support_', '').replace(/_/g, ' ');
             flowContext.supportTopic = topic;
@@ -556,6 +609,7 @@
                 addBotMessage('Got it — Order *#' + selectedOrderId + '*. What do you need help with?', [
                     { label: 'Paid Online but Asking COD', action: 'support_cod_confusion', primary: true },
                     { label: 'Delivered but Not Received (POD)', action: 'support_delayed_pod' },
+                    { label: 'Damaged or Wrong Item', action: 'support_damaged_wrong' },
                     { label: 'Order Issue', action: 'support_order_issue' },
                     { label: 'Product Question', action: 'support_product' },
                     { label: 'Delivery Problem', action: 'support_delivery' },
@@ -572,6 +626,18 @@
                 flowContext.supportTopic = 'Delayed Delivery / POD';
                 doCreateSupportTicket(
                     '[POD_INVESTIGATION] Order #' + selectedOrderId + ': Customer reports package marked as delivered was not received. Checked security/neighbours without success. Requesting official Proof of Delivery (POD) from courier partner. 24-hour update SLA promised per SOP.'
+                );
+            } else if (selectedIntent === 'damaged_claim') {
+                flowContext.orderId = selectedOrderId;
+                flowContext.supportTopic = 'Damaged Item Claim';
+                doCreateSupportTicket(
+                    '[DAMAGED_ITEM_CLAIM] Order #' + selectedOrderId + ': Customer reports damaged/defective product. Advised to provide photos of damaged area with tags attached. Eligible for refund to original payment method or free replacement within 2-day delivery window.'
+                );
+            } else if (selectedIntent === 'wrong_item_claim') {
+                flowContext.orderId = selectedOrderId;
+                flowContext.supportTopic = 'Wrong Item Claim';
+                doCreateSupportTicket(
+                    '[WRONG_ITEM_CLAIM] Order #' + selectedOrderId + ': Customer reports wrong product delivered. Advised that an unboxing video is mandatory showing parcel being opened. Eligible for refund to original payment method or free replacement within 2-day delivery window.'
                 );
             } else {
                 doTrackOrder(selectedOrderId);
@@ -825,7 +891,7 @@
                     'No recent orders found for mobile number ending in *' + last4 + '*.\n\n' +
                     'Please verify your number or enter your 4-6 digit *order number* directly.',
                     [
-                        { label: 'Try Again', action: intent === 'edit' ? 'edit_request' : (intent === 'cod_refund' ? 'raise_cod_refund_ticket' : (intent === 'pod_inquiry' ? 'raise_pod_ticket' : 'track_order')), primary: true },
+                        { label: 'Try Again', action: intent === 'edit' ? 'edit_request' : (intent === 'cod_refund' ? 'raise_cod_refund_ticket' : (intent === 'pod_inquiry' ? 'raise_pod_ticket' : (intent === 'damaged_claim' ? 'raise_damaged_ticket' : (intent === 'wrong_item_claim' ? 'raise_wrong_item_ticket' : 'track_order')))), primary: true },
                         { label: 'Contact Support', action: 'contact_support' },
                         { label: 'Menu', action: 'main_menu' }
                     ]
@@ -848,6 +914,7 @@
                     addBotMessage('Found Order *#' + singleId + '*. What do you need help with?', [
                         { label: 'Paid Online but Asking COD', action: 'support_cod_confusion', primary: true },
                         { label: 'Delivered but Not Received (POD)', action: 'support_delayed_pod' },
+                        { label: 'Damaged or Wrong Item', action: 'support_damaged_wrong' },
                         { label: 'Order Issue', action: 'support_order_issue' },
                         { label: 'Product Question', action: 'support_product' },
                         { label: 'Delivery Problem', action: 'support_delivery' },
@@ -864,6 +931,18 @@
                     flowContext.supportTopic = 'Delayed Delivery / POD';
                     doCreateSupportTicket(
                         '[POD_INVESTIGATION] Order #' + singleId + ': Customer reports package marked as delivered was not received. Checked security/neighbours without success. Requesting official Proof of Delivery (POD) from courier partner. 24-hour update SLA promised per SOP.'
+                    );
+                } else if (intent === 'damaged_claim') {
+                    flowContext.orderId = singleId;
+                    flowContext.supportTopic = 'Damaged Item Claim';
+                    doCreateSupportTicket(
+                        '[DAMAGED_ITEM_CLAIM] Order #' + singleId + ': Customer reports damaged/defective product. Advised to provide photos of damaged area with tags attached. Eligible for refund to original payment method or free replacement within 2-day delivery window.'
+                    );
+                } else if (intent === 'wrong_item_claim') {
+                    flowContext.orderId = singleId;
+                    flowContext.supportTopic = 'Wrong Item Claim';
+                    doCreateSupportTicket(
+                        '[WRONG_ITEM_CLAIM] Order #' + singleId + ': Customer reports wrong product delivered. Advised that an unboxing video is mandatory showing parcel being opened. Eligible for refund to original payment method or free replacement within 2-day delivery window.'
                     );
                 } else {
                     addBotMessage('Found Order *#' + singleId + '* (' + escapeHtml(single.status) + '). Fetching tracking details...');
@@ -885,6 +964,8 @@
             if (intent === 'edit') intentLabel = 'modify';
             else if (intent === 'cod_refund') intentLabel = 'request COD refund for';
             else if (intent === 'pod_inquiry') intentLabel = 'request POD investigation for';
+            else if (intent === 'damaged_claim') intentLabel = 'report damaged item for';
+            else if (intent === 'wrong_item_claim') intentLabel = 'report wrong item for';
             else if (intent === 'ticket') intentLabel = 'get support for';
 
             addBotMessage(
@@ -896,7 +977,7 @@
         .catch(function () {
             hideTyping();
             addBotMessage('Unable to look up orders by phone right now. Please enter your *order number* directly.', [
-                { label: 'Try Order Number', action: intent === 'edit' ? 'edit_request' : (intent === 'cod_refund' ? 'raise_cod_refund_ticket' : (intent === 'pod_inquiry' ? 'raise_pod_ticket' : 'track_order')), primary: true },
+                { label: 'Try Order Number', action: intent === 'edit' ? 'edit_request' : (intent === 'cod_refund' ? 'raise_cod_refund_ticket' : (intent === 'pod_inquiry' ? 'raise_pod_ticket' : (intent === 'damaged_claim' ? 'raise_damaged_ticket' : (intent === 'wrong_item_claim' ? 'raise_wrong_item_ticket' : 'track_order')))), primary: true },
                 { label: 'Menu', action: 'main_menu' }
             ]);
             flowState = 'idle';
@@ -1259,6 +1340,7 @@
         addBotMessage('Please enter your *order number* or registered *mobile number* so we can pull up your details.\n\nOr select an urgent topic below:', [
             { label: 'Paid Online but Asking COD', action: 'support_cod_confusion', primary: true },
             { label: 'Delivered but Not Received (POD)', action: 'support_delayed_pod' },
+            { label: 'Damaged or Wrong Item', action: 'support_damaged_wrong' },
             { label: 'Order Issue', action: 'support_order_issue' },
             { label: 'Back to Menu', action: 'main_menu' }
         ]);
@@ -1571,6 +1653,7 @@
                     addBotMessage(greeting + 'Order *#' + cleaned + '*. What do you need help with?', [
                         { label: 'Paid Online but Asking COD', action: 'support_cod_confusion', primary: true },
                         { label: 'Delivered but Not Received (POD)', action: 'support_delayed_pod' },
+                        { label: 'Damaged or Wrong Item', action: 'support_damaged_wrong' },
                         { label: 'Order Issue', action: 'support_order_issue' },
                         { label: 'Product Question', action: 'support_product' },
                         { label: 'Delivery Problem', action: 'support_delivery' },
@@ -1585,6 +1668,7 @@
                     addBotMessage('Got it — Order *#' + cleaned + '*. What do you need help with?', [
                         { label: 'Paid Online but Asking COD', action: 'support_cod_confusion', primary: true },
                         { label: 'Delivered but Not Received (POD)', action: 'support_delayed_pod' },
+                        { label: 'Damaged or Wrong Item', action: 'support_damaged_wrong' },
                         { label: 'Order Issue', action: 'support_order_issue' },
                         { label: 'Product Question', action: 'support_product' },
                         { label: 'Delivery Problem', action: 'support_delivery' },
@@ -1676,6 +1760,28 @@
                 doCreateSupportTicket(
                     '[POD_INVESTIGATION] Order #' + podOrderId + ': Customer reports package marked as delivered was not received. Checked security/neighbours without success. Requesting official Proof of Delivery (POD) from courier partner. 24-hour update SLA promised per SOP.'
                 );
+            }
+        } else if (flowState === 'awaiting_damaged_order_id') {
+            addUserMessage(text);
+            var parsedDamaged = parseOrderOrTracking(text);
+            if (parsedDamaged && parsedDamaged.type === 'phone') {
+                doSearchOrdersByPhone(parsedDamaged.id, 'damaged_claim');
+            } else {
+                var damId = parsedDamaged ? parsedDamaged.id : text.trim().replace(/^#/, '');
+                flowContext.orderId = damId;
+                flowContext.supportTopic = 'Damaged Item Claim';
+                doCreateSupportTicket('[DAMAGED_ITEM_CLAIM] Order #' + damId + ': Customer reports damaged/defective product. Advised to provide photos of damaged area with tags attached. Eligible for refund to original payment method or free replacement within 2-day delivery window.');
+            }
+        } else if (flowState === 'awaiting_wrong_item_order_id') {
+            addUserMessage(text);
+            var parsedWrong = parseOrderOrTracking(text);
+            if (parsedWrong && parsedWrong.type === 'phone') {
+                doSearchOrdersByPhone(parsedWrong.id, 'wrong_item_claim');
+            } else {
+                var wrId = parsedWrong ? parsedWrong.id : text.trim().replace(/^#/, '');
+                flowContext.orderId = wrId;
+                flowContext.supportTopic = 'Wrong Item Claim';
+                doCreateSupportTicket('[WRONG_ITEM_CLAIM] Order #' + wrId + ': Customer reports wrong product delivered. Advised that an unboxing video is mandatory showing parcel being opened. Eligible for refund to original payment method or free replacement within 2-day delivery window.');
             }
         } else {
             if (/^(edit\s*request|edit\s*order|change\s*(my\s*)?(size|address|details?)|modify\s*order)\b/i.test(text.trim())) {

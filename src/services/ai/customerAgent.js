@@ -119,7 +119,7 @@ function detectSopScenario(text) {
     }
 
     // 2. Damaged / Wrong item
-    if (/damaged|broken|torn|defective|wrong\s*(item|product|size|order|piece)|received\s*wrong|unboxing\s*video/i.test(str)) {
+    if (/damaged|broken|torn|defective|faulty|stain|hole\s*in|wrong\s*(item|product|size|order|piece|dress|shirt)|received\s*wrong|different\s*(item|product)|unboxing\s*video|proof\s*of\s*damage|missing\s*(item|product|piece)/i.test(str)) {
         return 'damaged_wrong_item';
     }
 
@@ -268,10 +268,11 @@ OFFCOMFRT 9 STANDARD OPERATING PROCEDURE (SOP) SCENARIOS:
 
 5. **damaged_wrong_item** (Received damaged / defective / wrong product):
    - Proof is MANDATORY before replacement or refund:
-     - Wrong product: Unboxing video is MANDATORY showing the parcel being opened.
-     - Damaged product: Clear photos of the damaged area and product tags are required.
+     - Wrong product delivered: Unboxing video is MANDATORY showing the outer courier package and shipping label being opened to reveal the item.
+     - Damaged / defective product: Clear photos of the damaged/defective area with original product tags attached are required.
    - Must be submitted within 2 days of delivery at offcomfrt.in/pages/return.
-   - Once verified by our team, this qualifies for a refund to original payment method or free replacement.
+   - Once verified by our team, this qualifies for a full refund to original payment method or free replacement.
+   - Offer to create an expedited support ticket tagged [DAMAGED_ITEM_CLAIM] or [WRONG_ITEM_CLAIM] if the customer needs immediate assistance.
 
 6. **address_change** (Change / Update delivery address):
    - Pre-dispatch: Can be updated before shipping. Ask for complete updated delivery address with 6-digit pin code.
@@ -428,7 +429,7 @@ function applyRefundGuardrails(reply, userMessage, context) {
         || (context && (context.lastScenario === 'size_exchange' || context.lastScenario === 'return_exchange'));
 
     // Check if query is explicitly about damaged product or wrong item delivered
-    const isDamagedOrWrong = /damage|broken|torn|defective|wrong\s*(product|item|piece)|received\s*wrong/i.test(msg)
+    const isDamagedOrWrong = /damage|broken|torn|defective|faulty|stain|hole|wrong\s*(product|item|piece|order|size)|received\s*wrong|different\s*(item|product)|unboxing\s*video/i.test(msg)
         || (context && context.lastScenario === 'damaged_wrong_item');
 
     // Check if query is a pre-dispatch cancellation
@@ -602,6 +603,7 @@ async function runCustomerAgent({ sessionId, message, visitorId }) {
     // Update context with detected scenario from reply
     if (reply) {
         if (/delivered.*(not\s*(received|delivered|got)|missing|haven'?t)|fake\s*delivery|pod\b|proof\s*of\s*delivery/i.test(message)) context.lastScenario = 'delayed_pod';
+        else if (/damage|broken|torn|defective|faulty|wrong\s*(item|product|piece)|received\s*wrong|unboxing/i.test(message)) context.lastScenario = 'damaged_wrong_item';
         else if (/track|order|status|deliver|ship/i.test(message)) context.lastScenario = 'tracking';
         else if (/return|exchange|size/i.test(message)) context.lastScenario = 'return_exchange';
         else if (/cancel/i.test(message)) context.lastScenario = 'cancellation';
