@@ -839,13 +839,65 @@ async function persistWidgetChat(sessionId, customerMsg, botReply, opts) {
     );
 }
 
-// ---------- Ticket creation ----------
+// ---------- Ticket creation & Escalation Summary (Change 14) ----------
 
 /**
- * Create a support ticket from the widget.
- * @returns {{ ticketNumber: string, whatsappLink: string, ticketId: number }}
+ * Generate a concise 1-sentence issue summary for tickets and WhatsApp escalation.
  */
-async function createWidgetTicket({ name, phone, email, message, orderId, source, sessionId, visitorId }) {
+function generateEscalationSummary(message, context = {}) {
+    if (!message) return 'General customer support inquiry';
+    const str = String(message).trim();
+
+    // 1. Tag-based specific summaries
+    if (str.includes('[COD_DOUBLE_PAYMENT_REFUND]')) {
+        return 'COD Double Payment: Customer paid online but courier collected cash at delivery; refund required.';
+    }
+    if (str.includes('[POD_INVESTIGATION]')) {
+        return 'Delayed Delivery: Courier marked Delivered but parcel not received (24-hour POD inquiry requested).';
+    }
+    if (str.includes('[DAMAGED_ITEM_CLAIM]')) {
+        return 'Damaged Product: Customer received damaged/defective product; replacement/refund claim initiated.';
+    }
+    if (str.includes('[WRONG_ITEM_CLAIM]')) {
+        return 'Wrong Product Delivered: Customer received incorrect item; unboxing video verification required.';
+    }
+    if (str.includes('[PRE-DISPATCH SIZE CHANGE]')) {
+        return 'Pre-Dispatch Size Change: Customer requested size modification before courier dispatch.';
+    }
+    if (str.includes('[PRE-DISPATCH ADDRESS CHANGE]')) {
+        return 'Pre-Dispatch Address Update: Customer requested delivery address update before dispatch.';
+    }
+    if (str.includes('[PRE-DISPATCH CANCEL]')) {
+        return 'Pre-Dispatch Cancellation: Customer requested order cancellation before courier dispatch.';
+    }
+
+    // 2. Scenario-based summaries
+    if (context.lastScenario === 'delayed_pod') {
+        return 'Delayed Delivery: Package marked delivered but customer has not received it.';
+    }
+    if (context.lastScenario === 'damaged_wrong_item') {
+        return 'Damaged/Wrong Item: Customer received defective or incorrect merchandise.';
+    }
+    if (context.lastScenario === 'cod_confusion') {
+        return 'COD Confusion: Customer paid online but courier asked for cash at delivery.';
+    }
+
+    // 3. Fallback: clean message text (stripping wrapper tags like [Website], [General])
+    const clean = str
+        .replace(/\[Website\]\s*/gi, '')
+        .replace(/\[(General|Order Issue|Product Question|Delivery Problem|Other)\]\s*/gi, '')
+        .replace(/\[Order\s*#\d+\]\s*/gi, '')
+        .trim();
+
+    if (!clean) return 'Customer requested human support assistance';
+    return clean.length > 140 ? clean.substring(0, 137) + '...' : clean;
+}
+
+/**
+ * Create a support ticket from the widget with enriched context and AI summary.
+ * @returns {{ ticketNumber: string, whatsappLink: string, ticketId: number, summary: string }}
+ */
+async function createWidgetTicket({ name, phone, email, message, orderId, source, sessionId, visitorId, context = {} }) {
     const ticketNumber = 'WDG-' + Date.now().toString(36).toUpperCase();
 
     // Assign portal via round-robin so every portal gets its fair share of widget tickets
@@ -853,18 +905,19 @@ async function createWidgetTicket({ name, phone, email, message, orderId, source
 
     // Source defaults to 'widget' for backward compatibility; testbot sends 'website'
     const ticketSource = source || 'widget';
+    const cleanOrderId = orderId ? String(orderId).replace(/^#/, '').trim() : null;
+    const summary = generateEscalationSummary(message, context);
 
     // If phone or email were omitted from client (for security), populate from order record
     let ticketName = name;
     let ticketPhone = phone;
     let ticketEmail = email;
 
-    if ((!ticketPhone || !ticketEmail) && orderId) {
+    if ((!ticketPhone || !ticketEmail) && cleanOrderId) {
         try {
-            const cleanId = String(orderId).replace(/^#/, '').trim();
             const shopperRows = await dbAdapter.query(
                 `SELECT name, phone, email FROM store_shoppers WHERE order_id = ? ORDER BY created_at DESC LIMIT 1`,
-                [cleanId]
+                [cleanOrderId]
             );
             if (shopperRows && shopperRows.length > 0) {
                 if (!ticketName || ticketName === 'Customer' || ticketName === 'Widget Customer') {
@@ -876,13 +929,16 @@ async function createWidgetTicket({ name, phone, email, message, orderId, source
         } catch (e) { /* best-effort lookup */ }
     }
 
+    // Enriched ticket message with summary and structured metadata
+    const formattedTicketMessage = `${message || ''}\n\n[Issue Summary: ${summary}]${cleanOrderId ? '\n[Order ID: #' + cleanOrderId + ']' : ''}`;
+
     const inserted = await dbAdapter.insert('support_tickets', {
         ticket_number: ticketNumber,
         customer_name: ticketName || 'Widget Customer',
         customer_phone: ticketPhone || '',
         customer_email: ticketEmail || '',
-        message: message || '',
-        order_id: orderId || null,
+        message: formattedTicketMessage,
+        order_id: cleanOrderId || null,
         portal_id: portalId,
         status: 'open',
         source: ticketSource,
@@ -915,17 +971,18 @@ async function createWidgetTicket({ name, phone, email, message, orderId, source
         ).catch(err => console.warn('[widget] visitor_id stamp error:', err.message));
     }
 
-    // Build WhatsApp deep link
+    // Build context-rich WhatsApp deep link
     const businessNumber = (process.env.WHATSAPP_BUSINESS_NUMBER || '').replace(/\D/g, '');
-    const prefilledText = `Hi, I need help with my order.\nTicket: ${ticketNumber}\n${orderId ? 'Order: ' + orderId + '\n' : ''}${message ? 'Issue: ' + message.substring(0, 200) : ''}`;
+    const prefilledText = `Hi OFFCOMFRT Support,\nTicket: ${ticketNumber}\n${cleanOrderId ? 'Order: #' + cleanOrderId + '\n' : ''}Issue: ${summary}\nPlease connect me with a support specialist.`;
     const whatsappLink = `https://wa.me/${businessNumber}?text=${encodeURIComponent(prefilledText)}`;
 
-    return { ticketNumber, whatsappLink, ticketId };
+    return { ticketNumber, whatsappLink, ticketId, summary };
 }
 
 module.exports = {
     runCustomerAgent,
     createWidgetTicket,
+    generateEscalationSummary,
     noteSessionContext,
     appendSessionExchange,
     applyRefundGuardrails,

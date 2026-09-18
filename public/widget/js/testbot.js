@@ -1813,7 +1813,8 @@
                 orderId: flowContext.orderId || null,
                 source: 'website',
                 sessionId: sessionId,
-                visitorId: visitorId
+                visitorId: visitorId,
+                context: flowContext
             })
         })
         .then(function (r) { return r.json(); })
@@ -1975,8 +1976,14 @@
         var html =
             '<div class="oftb-ticket-confirm-icon"><svg viewBox="0 0 24 24"><polyline points="20 6 9 17 4 12"/></svg></div>' +
             '<h4>Ticket Created</h4>' +
-            '<p>Please continue on WhatsApp.</p>' +
+            '<p>Our team has logged your request with complete context.</p>' +
             '<div class="oftb-ticket-number">' + escapeHtml(data.ticketNumber) + '</div>';
+
+        if (data.summary) {
+            html += '<div style="margin: 8px 0; font-size: 11px; color: #555; background: #f9f9f9; padding: 6px 10px; border-radius: 6px; border: 1px solid #eee; text-align: left;">' +
+                '<strong style="color: #111;">Issue Summary:</strong> ' + escapeHtml(data.summary) +
+            '</div>';
+        }
 
         if (data.whatsappLink) {
             html += '<a href="' + escapeHtml(data.whatsappLink) + '" target="_blank" class="oftb-whatsapp-btn">' +

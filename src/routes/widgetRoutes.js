@@ -985,17 +985,19 @@ router.post('/edit-request', async (req, res) => {
 
 router.post('/ticket', async (req, res) => {
     try {
-        const { name, phone, email, message, orderId, source, sessionId, visitorId } = req.body;
+        const { name, phone, email, message, orderId, source, sessionId, visitorId, context } = req.body;
 
         if (!message) {
             return res.status(400).json({ error: 'Message is required' });
         }
 
-        const result = await createWidgetTicket({ name, phone, email, message, orderId, source, sessionId, visitorId });
+        const result = await createWidgetTicket({ name, phone, email, message, orderId, source, sessionId, visitorId, context });
 
         res.json({
             success: true,
             ticketNumber: result.ticketNumber,
+            ticketId: result.ticketId,
+            summary: result.summary,
             whatsappLink: result.whatsappLink
         });
     } catch (error) {
