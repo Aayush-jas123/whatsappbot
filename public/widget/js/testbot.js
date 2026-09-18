@@ -449,7 +449,6 @@
             [
                 { label: 'Track Order', action: 'track_order' },
                 { label: 'Return / Exchange', action: 'file_return' },
-                { label: 'Edit Request', action: 'edit_request' },
                 { label: 'Track Your Request', action: 'track_request' },
                 { label: 'Contact Support', action: 'contact_support' }
             ]
@@ -848,7 +847,6 @@
         addBotMessage('How else can we help you?', [
             { label: 'Track Order', action: 'track_order' },
             { label: 'Return / Exchange', action: 'file_return' },
-            { label: 'Edit Request', action: 'edit_request' },
             { label: 'Track Your Request', action: 'track_request' },
             { label: 'Contact Support', action: 'contact_support' }
         ]);
@@ -2207,7 +2205,7 @@
                 }
                 return;
             }
-            if (/^(edit\s*request|edit\s*order|change\s*(my\s*)?(size|address|details?)|modify\s*order)\b/i.test(text.trim())) {
+            if (/^(edit\s*(request|order|details?)|change\s*(my\s*)?(size|address|details?)|size\s*change|address\s*change|update\s*(my\s*)?(address|size|order|details?)|modify\s*(my\s*)?(order|details?))\b/i.test(text.trim())) {
                 addUserMessage(text);
                 var parsedEditDirect = parseOrderOrTracking(text);
                 if (parsedEditDirect) {

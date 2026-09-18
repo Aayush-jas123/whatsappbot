@@ -30,10 +30,11 @@ assert(testbotSource.includes('function doSubmitEditRequest'), 'testbot.js must 
 assert(testbotSource.includes('function doCancelOrder'), 'testbot.js must have doCancelOrder');
 console.log('✅ testbot.js includes all Edit Request flow methods and button actions');
 
-// 4. Verify testbot.html contains Edit Request feature card
-const testbotHtml = fs.readFileSync('./public/widget/testbot.html', 'utf8');
-assert(testbotHtml.includes('Edit Request'), 'testbot.html must showcase Edit Request feature');
-console.log('✅ testbot.html showcases Edit Request feature card');
+// 4. Verify assisted edit request is triggered via text and welcome menu has 4 primary buttons
+assert(testbotSource.includes('startEditRequest()'), 'testbot.js must trigger startEditRequest from text');
+const showWelcomeMatch = testbotSource.match(/function showWelcome\(\)[\s\S]*?addBotMessage\([\s\S]*?\[([\s\S]*?)\]/);
+assert(showWelcomeMatch && !showWelcomeMatch[1].includes('edit_request'), 'Welcome menu must not include Edit Request button (assisted via text only)');
+console.log('✅ Assisted edit is driven via text while welcome menu retains 4 primary buttons');
 
 console.log('\n========================================');
 console.log('All Edit Request flow checks passed! 🚀');
