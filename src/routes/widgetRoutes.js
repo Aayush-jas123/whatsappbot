@@ -112,6 +112,42 @@ router.post('/chat', async (req, res) => {
     }
 });
 
+// ---------- POST /api/widget/event ----------
+// Persists client-rendered widget events (menu messages and rich cards) that
+// do not run through the AI agent, so the admin can replay the full chat.
+router.post('/event', async (req, res) => {
+    try {
+        const { sessionId, visitorId, sender, content, richContent } = req.body || {};
+        if (!sessionId || !['customer', 'bot'].includes(sender) || !String(content || '').trim()) {
+            return res.status(400).json({ error: 'sessionId, sender, and content are required' });
+        }
+        if (String(content).length > 5000 || (richContent && JSON.stringify(richContent).length > 30000)) {
+            return res.status(400).json({ error: 'Widget event is too large' });
+        }
+
+        const now = new Date().toISOString();
+        const { dbAdapter } = require('../database/db');
+        await dbAdapter.run(
+            `INSERT INTO widget_chats (session_id, sender, content, rich_content, created_at)
+             VALUES ($1, $2, $3, $4, $5)`,
+            [sessionId, sender, String(content), richContent ? JSON.stringify(richContent) : null, now]
+        );
+        await dbAdapter.run(
+            `INSERT INTO widget_chat_sessions (session_id, message_count, last_message_at, visitor_id, created_at)
+             VALUES ($1, 1, $2, $3, $2)
+             ON CONFLICT (session_id) DO UPDATE SET
+               message_count = widget_chat_sessions.message_count + 1,
+               last_message_at = $2,
+               visitor_id = COALESCE($3, widget_chat_sessions.visitor_id)`,
+            [sessionId, now, visitorId || null]
+        );
+        res.json({ ok: true });
+    } catch (error) {
+        console.error('[widget] event persist error:', error.message);
+        res.status(500).json({ error: 'Unable to save widget event' });
+    }
+});
+
 // ---------- POST /api/widget/context ----------
 // Silently records an exchange handled outside the AI chat (e.g. the direct
 // tracking card) into the AI session, so follow-up AI turns keep context.

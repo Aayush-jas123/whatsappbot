@@ -1463,6 +1463,44 @@ async function loadRelatedSessions(visitorId, currentSessionId) {
     }
 }
 
+function dashboardSafeUrl(value) {
+    try {
+        const url = new URL(String(value || ''));
+        return ['http:', 'https:'].includes(url.protocol) ? url.href : null;
+    } catch { return null; }
+}
+
+function renderWidgetRichContent(value) {
+    if (!value) return '';
+    let rich = value;
+    if (typeof rich === 'string') {
+        try { rich = JSON.parse(rich); } catch { return ''; }
+    }
+    const data = rich?.data || {};
+    if (rich?.type === 'tracking') {
+        const rows = [
+            ['Order', data.orderId ? '#' + data.orderId : null], ['AWB', data.awb], ['Location', data.location],
+            ['Expected', data.expectedDelivery], ['Delivered', data.deliveredDate], ['Note', data.note]
+        ].filter(([, value]) => value).map(([label, value]) => `<div class="wc-card-row"><span>${esc(label)}</span><span>${esc(value)}</span></div>`).join('');
+        const timeline = Array.isArray(data.timeline) && data.timeline.length
+            ? `<div class="wc-card-timeline">${data.timeline.slice(0, 6).map(item => `<div><strong>${esc(item.activity || item.status || 'Update')}</strong><span>${esc([item.date, item.location].filter(Boolean).join(' · '))}</span></div>`).join('')}</div>` : '';
+        const url = dashboardSafeUrl(data.trackingUrl);
+        return `<section class="wc-rich-card wc-tracking-card"><header><strong>${esc(data.carrierName || 'Tracking')}</strong><b>${esc(data.status || 'Unknown')}</b></header>${rows}${timeline}${url ? `<a href="${esc(url)}" target="_blank" rel="noopener noreferrer">Track Live ↗</a>` : ''}</section>`;
+    }
+    if (rich?.type === 'return_request' || rich?.type === 'return_status') {
+        const requestId = data.request_id || data.returnId;
+        const order = data.order_number || data.orderId;
+        const rows = [['Request ID', requestId], ['Order', order ? '#' + order : null], ['Reason', data.reason], ['Pickup', data.eta], ['Refund', data.refundAmount], ['Note', data.note]]
+            .filter(([, value]) => value).map(([label, value]) => `<div class="wc-card-row"><span>${esc(label)}</span><span>${esc(value)}</span></div>`).join('');
+        return `<section class="wc-rich-card wc-return-card"><header><strong>${esc(data.type || 'Return')}</strong><b>${esc(data.status || 'Pending')}</b></header>${rows}</section>`;
+    }
+    if (rich?.type === 'ticket') {
+        const url = dashboardSafeUrl(data.whatsappLink);
+        return `<section class="wc-rich-card wc-ticket-card"><strong>Ticket created</strong><span>${esc(data.ticketNumber || '')}</span>${url ? `<a href="${esc(url)}" target="_blank" rel="noopener noreferrer">Open WhatsApp ↗</a>` : ''}</section>`;
+    }
+    return '';
+}
+
 function renderWidgetConversation(messages) {
     const container = document.getElementById('wcConvoMessages');
     container.innerHTML = '';
@@ -1480,7 +1518,7 @@ function renderWidgetConversation(messages) {
                 const tok = (m.prompt_tokens || 0) + (m.completion_tokens || 0);
                 metaHtml = `<div class="wc-msg-meta">${formatTokens(tok)} tok · $${parseFloat(m.cost_usd || 0).toFixed(4)}${m.model ? ' · ' + esc(m.model) : ''}${m.suggested_action ? ' · ' + esc(m.suggested_action) : ''}</div>`;
             }
-            div.innerHTML = `<div>${esc(m.content || '')}${metaHtml}</div><div class="chat-msg-time">${formatTime(m.created_at)}</div>`;
+            div.innerHTML = `<div>${esc(m.content || '')}${renderWidgetRichContent(m.rich_content)}${metaHtml}</div><div class="chat-msg-time">${formatTime(m.created_at)}</div>`;
         }
         container.appendChild(div);
     });

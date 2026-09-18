@@ -39,6 +39,7 @@
     var isTyping = false;
     var flowState = 'idle';
     var flowContext = {};
+    var widgetEventQueue = Promise.resolve();
 
     // ---------- Admin override polling ----------
     var lastMessageId = 0;
@@ -398,7 +399,23 @@
     }
 
     // ---------- Message Helpers ----------
-    function addBotMessage(text, buttons) {
+    // Widget-only interactions do not pass through the AI route, so save them
+    // separately for the admin conversation replay. AI replies opt out because
+    // the server persists their text, token usage, and any card payload itself.
+    function recordWidgetEvent(sender, content, richContent) {
+        if (!sessionId || !content) return;
+        widgetEventQueue = widgetEventQueue
+            .catch(function () { /* keep the event queue usable after a failed request */ })
+            .then(function () {
+                return fetch(API_URL + '/api/widget/event', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ sessionId: sessionId, visitorId: visitorId, sender: sender, content: content, richContent: richContent || null })
+                });
+            });
+    }
+
+    function addBotMessage(text, buttons, persist) {
         var chat = document.getElementById('oftb-chat');
         var wrapper = document.createElement('div');
         wrapper.className = 'oftb-msg-wrap oftb-align-left';
@@ -430,6 +447,7 @@
 
         chat.appendChild(wrapper);
         scrollToBottom();
+        if (persist !== false) recordWidgetEvent('bot', text);
     }
 
     function addUserMessage(text) {
@@ -477,6 +495,12 @@
 
     // ---------- Button Action Router ----------
     function handleButtonAction(action) {
+        var actionLabels = {
+            track_order: 'Track Order', file_return: 'Return / Exchange', track_request: 'Track Your Request',
+            contact_support: 'Contact Support', create_support_ticket: 'Create Ticket', retry_support: 'Try Another Question',
+            main_menu: 'Menu', return_home: 'Menu', open_return_url: 'Open Return Portal', open_exchange_url: 'Open Exchange Page'
+        };
+        recordWidgetEvent('customer', actionLabels[action] || String(action || '').replace(/^support_/, '').replace(/_/g, ' '));
         if (action === 'open_return_url') {
             addUserMessage('Open Return Portal');
             window.open('https://www.offcomfrt.in/pages/return', '_blank');
@@ -557,7 +581,8 @@
         return null;
     }
 
-    function doTrackOrder(orderInput) {
+    function doTrackOrder(orderInput, persist) {
+        if (persist !== false) recordWidgetEvent('customer', String(orderInput));
         flowState = 'tracking';
         showTyping();
 
@@ -631,7 +656,8 @@
         ]);
     }
     
-    function doTrackRequest(input) {
+    function doTrackRequest(input, persist) {
+        if (persist !== false) recordWidgetEvent('customer', String(input));
         flowState = 'tracking_request';
         showTyping();
 
@@ -762,12 +788,12 @@
                     { label: 'Create Ticket', action: 'create_support_ticket', primary: true },
                     { label: 'Try Another Question', action: 'retry_support' },
                     { label: 'Menu', action: 'main_menu' }
-                ]);
+                ], false);
             } else {
                 addBotMessage(aiReply, [
                     { label: 'Try Another Question', action: 'retry_support', primary: true },
                     { label: 'Menu', action: 'main_menu' }
-                ]);
+                ], false);
             }
             setInputMode('text');
             flowState = 'idle';
@@ -792,6 +818,7 @@
     }
 
     function doCreateSupportTicket(message) {
+        recordWidgetEvent('customer', String(message));
         flowState = 'creating_ticket';
         showTyping();
 
@@ -885,6 +912,7 @@
         wrapper.appendChild(card);
         chat.appendChild(wrapper);
         scrollToBottom();
+        recordWidgetEvent('bot', 'Order tracking update', { type: 'tracking', data: data });
     }
 
     function addRequestCard(req) {
@@ -934,6 +962,7 @@
         wrapper.appendChild(card);
         chat.appendChild(wrapper);
         scrollToBottom();
+        recordWidgetEvent('bot', (typeText || 'Return') + ' request update', { type: 'return_request', data: req });
     }
 
     function addTicketConfirmation(data) {
@@ -959,6 +988,7 @@
         wrapper.appendChild(el);
         chat.appendChild(wrapper);
         scrollToBottom();
+        recordWidgetEvent('bot', 'Support ticket created: ' + (data.ticketNumber || ''), { type: 'ticket', data: data });
 
         setTimeout(function () {
             addBotMessage('Anything else we can help with?', [
@@ -980,6 +1010,7 @@
             addUserMessage(text);
             var parsedTicket = parseOrderOrTracking(text);
             if (parsedTicket && parsedTicket.type === 'order') {
+                recordWidgetEvent('customer', text);
                 var cleaned = parsedTicket.id;
                 flowContext.orderId = cleaned;
                 
@@ -1031,10 +1062,11 @@
             addUserMessage(text);
             var parsedOrder = parseOrderOrTracking(text);
             if (parsedOrder) {
+                recordWidgetEvent('customer', text);
                 if (parsedOrder.type === 'request') {
-                    doTrackRequest(parsedOrder.id);
+                    doTrackRequest(parsedOrder.id, false);
                 } else {
-                    doTrackOrder(parsedOrder.id);
+                    doTrackOrder(parsedOrder.id, false);
                 }
             } else {
                 // Free-text/question in order tracking — let AI handle it instead of hard rejecting
@@ -1047,8 +1079,10 @@
             addUserMessage(text);
             var parsedReq = parseOrderOrTracking(text);
             if (parsedReq) {
-                doTrackRequest(parsedReq.id);
+                recordWidgetEvent('customer', text);
+                doTrackRequest(parsedReq.id, false);
             } else {
+                recordWidgetEvent('customer', text);
                 addBotMessage('Please enter a valid *order number* or *request ID* (e.g. REQ-12345).', [
                     { label: 'Back to Menu', action: 'main_menu' }
                 ]);
@@ -1063,10 +1097,11 @@
             addUserMessage(text);
             var parsedIdle = parseOrderOrTracking(text);
             if (parsedIdle) {
+                recordWidgetEvent('customer', text);
                 if (parsedIdle.type === 'request') {
-                    doTrackRequest(parsedIdle.id);
+                    doTrackRequest(parsedIdle.id, false);
                 } else {
-                    doTrackOrder(parsedIdle.id);
+                    doTrackOrder(parsedIdle.id, false);
                 }
             } else {
                 // Free-text in idle state — continue the AI conversation instead of showing the menu

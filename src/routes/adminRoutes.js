@@ -7752,7 +7752,7 @@ router.get('/widget-chats/session/:sessionId', verifyToken, async (req, res) => 
         const [session, messages] = await Promise.all([
             dbAdapter.query('SELECT * FROM widget_chat_sessions WHERE session_id = $1', [sessionId]),
             dbAdapter.query(
-                'SELECT id, sender, content, model, prompt_tokens, completion_tokens, cost_usd, tool_calls, suggested_action, entities, created_at FROM widget_chats WHERE session_id = $1 ORDER BY created_at ASC',
+                'SELECT id, sender, content, model, prompt_tokens, completion_tokens, cost_usd, tool_calls, suggested_action, entities, rich_content, created_at FROM widget_chats WHERE session_id = $1 ORDER BY created_at ASC, id ASC',
                 [sessionId]
             )
         ]);

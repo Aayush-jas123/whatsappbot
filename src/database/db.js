@@ -788,6 +788,7 @@ async function initializeWidgetChatTables() {
         suggested_action VARCHAR(30),
         ticket_id INTEGER,
         entities JSONB,
+        rich_content JSONB,
         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
       )
     `);
@@ -812,6 +813,9 @@ async function initializeWidgetChatTables() {
     `);
     await pool.query('CREATE INDEX IF NOT EXISTS idx_wcs_created ON widget_chat_sessions(created_at DESC)');
     await pool.query('CREATE INDEX IF NOT EXISTS idx_wcs_has_ticket ON widget_chat_sessions(has_ticket)');
+
+    // Support richer historical messages when the table already existed before this column.
+    await pool.query('ALTER TABLE widget_chats ADD COLUMN IF NOT EXISTS rich_content JSONB');
 
     // Add context column for persisting customer entities (orderId, awb, etc.)
     await pool.query('ALTER TABLE widget_chat_sessions ADD COLUMN IF NOT EXISTS context JSONB');

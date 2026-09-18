@@ -467,6 +467,7 @@ async function runCustomerAgent({ sessionId, message, visitorId }) {
         toolCalls: totalToolCalls,
         suggestedAction,
         entities: Object.keys(context).length ? context : null,
+        richContent: returnCard ? { type: 'return_status', data: returnCard } : null,
         visitorId
     }).catch(err => console.warn('[widget] persist error:', err.message));
 
@@ -578,12 +579,13 @@ async function persistWidgetChat(sessionId, customerMsg, botReply, opts) {
         [sessionId, 'customer', customerMsg, now]
     );
     await dbAdapter.run(
-        `INSERT INTO widget_chats (session_id, sender, content, model, prompt_tokens, completion_tokens, cost_usd, tool_calls, suggested_action, entities, created_at)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)`,
+        `INSERT INTO widget_chats (session_id, sender, content, model, prompt_tokens, completion_tokens, cost_usd, tool_calls, suggested_action, entities, rich_content, created_at)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)`,
         [sessionId, 'bot', botReply, opts.model || null,
          opts.promptTokens || 0, opts.completionTokens || 0,
          opts.costUsd || 0, opts.toolCalls || 0,
-         opts.suggestedAction || null, entitiesJSON, now]
+         opts.suggestedAction || null, entitiesJSON,
+         opts.richContent ? JSON.stringify(opts.richContent) : null, now]
     );
 
     // 2. Upsert session summary (single atomic statement) — also persist context + visitor_id
