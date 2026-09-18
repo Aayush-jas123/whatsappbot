@@ -858,6 +858,105 @@ router.post('/check-return-eligibility', async (req, res) => {
     }
 });
 
+// ---------- POST /api/widget/edit-request ----------
+// Structured handler for Pre-Dispatch Order Modification (Size, Address, Cancellation)
+router.post('/edit-request', async (req, res) => {
+    try {
+        const { orderId, type, details, newSize, updatedAddress, pincode, name, phone, email, source, sessionId, visitorId } = req.body;
+
+        if (!orderId) {
+            return res.status(400).json({ error: 'Order ID is required' });
+        }
+
+        const { dbAdapter } = require('../database/db');
+        const cleanOrderId = String(orderId).replace(/^#/, '').trim();
+
+        // Check if order has already been booked with an AWB / dispatched
+        let shipmentRow = null;
+        try {
+            const shipRows = await dbAdapter.query(
+                `SELECT carrier, awb, status FROM shipments
+                 WHERE (order_id = ? OR order_id = ?) AND status NOT IN ('cancelled', 'failed') AND awb IS NOT NULL
+                 ORDER BY id DESC LIMIT 1`,
+                [cleanOrderId, '#' + cleanOrderId]
+            );
+            if (shipRows && shipRows.length > 0) shipmentRow = shipRows[0];
+        } catch (e) {}
+
+        let orderRow = null;
+        try {
+            const ordRows = await dbAdapter.query(
+                `SELECT status, customer_name, customer_phone FROM orders
+                 WHERE order_id = ? OR order_id = ? LIMIT 1`,
+                [cleanOrderId, '#' + cleanOrderId]
+            );
+            if (ordRows && ordRows.length > 0) orderRow = ordRows[0];
+        } catch (e) {}
+
+        const currentStatus = (shipmentRow && shipmentRow.status) || (orderRow && orderRow.status) || '';
+        const isDispatched = !!(shipmentRow && shipmentRow.awb) || /shipped|in[-_ ]?transit|out[-_ ]?for[-_ ]?delivery|delivered|dispatched/i.test(currentStatus);
+
+        if (isDispatched) {
+            return res.json({
+                success: false,
+                dispatched: true,
+                orderId: cleanOrderId,
+                carrier: shipmentRow ? shipmentRow.carrier : null,
+                awb: shipmentRow ? shipmentRow.awb : null,
+                message: 'Order #' + cleanOrderId + ' has already been dispatched and cannot be modified in transit per SOP rules.'
+            });
+        }
+
+        // Build descriptive tag and message
+        const normType = String(type || 'EDIT').toUpperCase();
+        let tag = '[PRE-DISPATCH EDIT]';
+        if (normType.includes('SIZE')) tag = '[PRE-DISPATCH SIZE CHANGE]';
+        else if (normType.includes('ADDRESS')) tag = '[PRE-DISPATCH ADDRESS CHANGE]';
+        else if (normType.includes('CANCEL')) tag = '[PRE-DISPATCH CANCEL]';
+
+        let editSummary = details || '';
+        if (newSize) editSummary = 'Requested New Size: ' + newSize + (details ? ' (' + details + ')' : '');
+        if (updatedAddress) editSummary = 'Updated Delivery Address: ' + updatedAddress + (pincode ? ' [PIN: ' + pincode + ']' : '');
+
+        const ticketMessage = tag + ' Order #' + cleanOrderId + ': ' + editSummary;
+
+        const customerName = name || (orderRow && orderRow.customer_name) || 'Customer';
+        const customerPhone = phone || (orderRow && orderRow.customer_phone) || '';
+
+        const result = await createWidgetTicket({
+            name: customerName,
+            phone: customerPhone,
+            email: email || '',
+            message: ticketMessage,
+            orderId: cleanOrderId,
+            source: source || 'website',
+            sessionId,
+            visitorId
+        });
+
+        // Best effort: update notes or mark store_shoppers record if exists
+        try {
+            await dbAdapter.query(
+                `UPDATE store_shoppers SET notes = COALESCE(notes || ' | ', '') || ? WHERE order_id = ? OR order_id = ?`,
+                [ticketMessage, cleanOrderId, '#' + cleanOrderId]
+            );
+        } catch (e) {}
+
+        res.json({
+            success: true,
+            dispatched: false,
+            ticketNumber: result.ticketNumber,
+            whatsappLink: result.whatsappLink,
+            orderId: cleanOrderId,
+            type: normType,
+            message: 'Your ' + normType + ' request has been recorded. Our fulfillment team will apply this change before shipping.'
+        });
+    } catch (error) {
+        console.error('[widget] edit-request error:', error.message);
+        res.status(500).json({ error: 'Failed to process edit request' });
+    }
+});
+
 // ---------- POST /api/widget/ticket ----------
 // Create a support ticket from the widget (escalation)
 

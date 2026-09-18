@@ -529,6 +529,12 @@
             ]);
             return;
         }
+        if (action.indexOf('select_edit_size_') === 0) {
+            var selectedSize = action.replace('select_edit_size_', '');
+            addUserMessage('Size ' + selectedSize);
+            doSubmitEditRequest('SIZE CHANGE', 'Requested size change to: ' + selectedSize, { newSize: selectedSize });
+            return;
+        }
         if (action === 'support_cod_confusion') {
             addUserMessage('Paid Online but Asking COD');
             flowContext.supportTopic = 'COD Confusion';
@@ -1338,32 +1344,45 @@
         flowState = 'awaiting_edit_size_details';
         setInputMode('text');
         addBotMessage(
-            'Please enter the *item name* and the *new size* you need (e.g., "Oversized Tee from M to L").\n\nOur team will update your order before dispatch.',
+            'Select the *new size* you need for Order *#' + (flowContext.orderId || '') + '*:\n\n' +
+            'Or type the specific item name and size below.',
             [
+                { label: 'Size XS', action: 'select_edit_size_XS' },
+                { label: 'Size S', action: 'select_edit_size_S' },
+                { label: 'Size M', action: 'select_edit_size_M' },
+                { label: 'Size L', action: 'select_edit_size_L' },
+                { label: 'Size XL', action: 'select_edit_size_XL' },
+                { label: 'Size XXL', action: 'select_edit_size_XXL' },
                 { label: 'Cancel', action: 'main_menu' }
             ]
         );
-        setInputPlaceholder('Enter item and desired size...');
+        setInputPlaceholder('Or type: e.g. Hoodie from M to L...');
     }
 
     function startEditAddress() {
         flowState = 'awaiting_edit_address_details';
         setInputMode('text');
         addBotMessage(
-            'Please provide your *complete updated address* along with the *6-digit pin code* and city.\n\nWe will update the shipping label before courier booking.',
+            'Please provide your *complete updated delivery address* including:\n\n' +
+            '• House/Flat No. & Building\n' +
+            '• Street / Area & Landmark\n' +
+            '• City & State\n' +
+            '• **6-digit PIN code**\n\n' +
+            '*(Pre-dispatch address changes are updated before courier booking.)*',
             [
                 { label: 'Cancel', action: 'main_menu' }
             ]
         );
-        setInputPlaceholder('Enter updated address & pin code...');
+        setInputPlaceholder('Enter full address with 6-digit PIN code...');
     }
 
     function startEditCancel() {
         flowState = 'awaiting_cancel_confirmation';
         addBotMessage(
-            'Are you sure you want to cancel order *#' + (flowContext.orderId || '') + '*?\n\n' +
-            '• **Prepaid orders:** Full refund processed to your original payment method (5-7 business days).\n' +
-            '• **COD orders:** Order will be cancelled before dispatch.',
+            'Are you sure you want to cancel Order *#' + (flowContext.orderId || '') + '*?\n\n' +
+            '**OFFCOMFRT Cancellation Policy (SOP Scenario 8):**\n' +
+            '• **Prepaid orders:** 100% refund credited back to your original payment method in **5 to 7 business days**.\n' +
+            '• **COD orders:** Order will be cancelled immediately before dispatch without any fee.',
             [
                 { label: 'Yes, Cancel Order', action: 'confirm_edit_cancel', primary: true },
                 { label: 'No, Keep Order', action: 'main_menu' }
@@ -1371,34 +1390,53 @@
         );
     }
 
-    function doSubmitEditRequest(type, details) {
+    function doSubmitEditRequest(type, details, extraData) {
         flowState = 'submitting_edit_request';
         showTyping();
 
-        var message = '[PRE-DISPATCH EDIT] [' + type + '] Order #' + (flowContext.orderId || '') + ': ' + details;
+        var payload = {
+            orderId: flowContext.orderId,
+            type: type,
+            details: details,
+            name: flowContext.customerName || 'Customer',
+            phone: flowContext.customerPhone || '',
+            source: 'website',
+            sessionId: sessionId,
+            visitorId: visitorId
+        };
+        if (extraData) {
+            if (extraData.newSize) payload.newSize = extraData.newSize;
+            if (extraData.updatedAddress) payload.updatedAddress = extraData.updatedAddress;
+            if (extraData.pincode) payload.pincode = extraData.pincode;
+        }
 
-        fetch(API_URL + '/api/widget/ticket', {
+        fetch(API_URL + '/api/widget/edit-request', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({
-                orderId: flowContext.orderId,
-                name: flowContext.customerName || 'Customer',
-                message: message,
-                source: 'website',
-                sessionId: sessionId,
-                visitorId: visitorId
-            })
+            body: JSON.stringify(payload)
         })
         .then(function (r) { return r.json(); })
         .then(function (data) {
             hideTyping();
-            if (data.ticketNumber) {
+            if (data.dispatched) {
+                addBotMessage(
+                    'Order *#' + (flowContext.orderId || '') + '* has already been dispatched' + (data.carrier ? ' with *' + escapeHtml(data.carrier) + '*' : '') + (data.awb ? ' (AWB: `' + escapeHtml(data.awb) + '`)' : '') + '.\n\n' +
+                    '*Active shipments cannot be modified in transit per SOP rules.*\n\n' +
+                    '• **Address Change:** If courier cannot deliver, the package will return (RTO) and we can reship to your updated address.\n' +
+                    '• **Size Change:** Once delivered, you can submit an exchange request within 2 days at offcomfrt.in/pages/exchange.',
+                    [
+                        { label: 'Track Order', action: 'track_order_direct_' + (flowContext.orderId || ''), primary: true },
+                        { label: 'Contact Support', action: 'contact_support' },
+                        { label: 'Menu', action: 'main_menu' }
+                    ]
+                );
+            } else if (data.ticketNumber) {
                 addTicketConfirmation({
                     ticketNumber: data.ticketNumber,
                     whatsappLink: data.whatsappLink
                 });
                 addBotMessage(
-                    'Your *' + escapeHtml(type) + '* request for Order *#' + (flowContext.orderId || '') + '* has been recorded.\n\nOur fulfillment team will apply this change before shipping.',
+                    'Your *' + escapeHtml(type) + '* request for Order *#' + (flowContext.orderId || '') + '* has been recorded.\n\nOur fulfillment team has placed this change on priority hold before dispatch.',
                     [
                         { label: 'Track Order', action: 'track_order' },
                         { label: 'Menu', action: 'main_menu' }
@@ -1414,7 +1452,8 @@
         })
         .catch(function () {
             hideTyping();
-            addBotMessage('Could not submit request right now. Please reach out to us on WhatsApp for urgent changes.', [
+            addBotMessage('Could not submit request right now. Please reach out to us on WhatsApp for urgent pre-dispatch changes.', [
+                { label: 'Contact Support', action: 'contact_support', primary: true },
                 { label: 'Menu', action: 'main_menu' }
             ]);
             setInputMode('text');
@@ -1425,51 +1464,7 @@
     function doCancelOrder() {
         flowState = 'submitting_cancellation';
         showTyping();
-
-        var message = '[PRE-DISPATCH CANCELLATION] Customer requested cancellation for Order #' + (flowContext.orderId || '');
-
-        fetch(API_URL + '/api/widget/ticket', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({
-                orderId: flowContext.orderId,
-                name: flowContext.customerName || 'Customer',
-                message: message,
-                source: 'website',
-                sessionId: sessionId,
-                visitorId: visitorId
-            })
-        })
-        .then(function (r) { return r.json(); })
-        .then(function (data) {
-            hideTyping();
-            if (data.ticketNumber) {
-                addTicketConfirmation({
-                    ticketNumber: data.ticketNumber,
-                    whatsappLink: data.whatsappLink
-                });
-                addBotMessage(
-                    'Cancellation request recorded for Order *#' + (flowContext.orderId || '') + '*.\n\nOur fulfillment team has been notified to cancel dispatch. If prepaid, your refund will be processed within 5 to 7 business days.',
-                    [
-                        { label: 'Menu', action: 'main_menu' }
-                    ]
-                );
-            } else {
-                addBotMessage('Cancellation request received. Our team will assist you shortly.', [
-                    { label: 'Menu', action: 'main_menu' }
-                ]);
-            }
-            setInputMode('text');
-            flowState = 'idle';
-        })
-        .catch(function () {
-            hideTyping();
-            addBotMessage('Unable to process cancellation right now. Please reach out to our team on WhatsApp.', [
-                { label: 'Menu', action: 'main_menu' }
-            ]);
-            setInputMode('text');
-            flowState = 'idle';
-        });
+        doSubmitEditRequest('CANCEL', 'Customer confirmed pre-dispatch cancellation for Order #' + (flowContext.orderId || ''));
     }
 
     // ========== FLOW 4: CONTACT SUPPORT ==========
@@ -1868,10 +1863,20 @@
             }
         } else if (flowState === 'awaiting_edit_size_details') {
             addUserMessage(text);
-            doSubmitEditRequest('SIZE CHANGE', text);
+            doSubmitEditRequest('SIZE CHANGE', text, { newSize: text });
         } else if (flowState === 'awaiting_edit_address_details') {
             addUserMessage(text);
-            doSubmitEditRequest('ADDRESS CHANGE', text);
+            var pinMatch = text.match(/\b\d{6}\b/);
+            if (!pinMatch) {
+                addBotMessage(
+                    '⚠️ Please include your valid **6-digit PIN code** with your address so our fulfillment team can verify courier serviceability.',
+                    [
+                        { label: 'Cancel', action: 'main_menu' }
+                    ]
+                );
+                return;
+            }
+            doSubmitEditRequest('ADDRESS CHANGE', text, { updatedAddress: text, pincode: pinMatch[0] });
         } else if (flowState === 'awaiting_support_message') {
             addUserMessage(text);
             doResolveWithAI(text);
