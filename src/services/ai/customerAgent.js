@@ -405,6 +405,57 @@ function sanitizeCustomerToolResult(data) {
     return cleaned;
 }
 
+// ---------- SOP Refund vs. Store Credit Guardrails ----------
+
+/**
+ * Enforce strict OFFCOMFRT SOP rules on refunds:
+ * - Original payment method refunds (5-7 business days) ONLY for:
+ *   (a) Damaged on arrival
+ *   (b) Wrong item delivered
+ *   (c) Prepaid order cancelled before dispatch
+ *   (d) RTO without receipt
+ * - ALL other returns (size exchange, fit, style preference, change of mind) receive STORE CREDIT ONLY.
+ * - This post-generation validator intercepts and corrects any hallucinated promise of a cash/bank refund.
+ */
+function applyRefundGuardrails(reply, userMessage, context) {
+    if (!reply) return reply;
+    const msg = String(userMessage || '').toLowerCase();
+    const rep = String(reply).toLowerCase();
+
+    // Check if customer query or context is about size, fit, or preference/change of mind
+    const isSizeOrPreference = /size|fit|tight|loose|small|large|medium|exchange|don'?t\s*like|didn'?t\s*like|preference|changed?\s*my\s*mind|wrong\s*fit/i.test(msg)
+        || (context && (context.lastScenario === 'size_exchange' || context.lastScenario === 'return_exchange'));
+
+    // Check if query is explicitly about damaged product or wrong item delivered
+    const isDamagedOrWrong = /damage|broken|torn|defective|wrong\s*(product|item|piece)|received\s*wrong/i.test(msg)
+        || (context && context.lastScenario === 'damaged_wrong_item');
+
+    // Check if query is a pre-dispatch cancellation
+    const isCancellation = /cancel/i.test(msg) || (context && context.lastScenario === 'cancellation');
+
+    // Check if reply promises original payment / bank / cash / card refund
+    const promisesCashRefund = /refund(ed)?\s*(to|into|in)?\s*(your|the)?\s*(bank|account|original\s*payment|source|upi|card|mode)/i.test(rep)
+        || /credited\s*(back)?\s*to\s*(your|the)?\s*(bank|account|source|card|upi)/i.test(rep)
+        || /money\s*back\s*(to|into|in)\s*(your)?\s*(bank|account)/i.test(rep);
+
+    // Case 1: Size/fit/preference returns MUST NOT receive bank/original payment refunds
+    if (isSizeOrPreference && !isDamagedOrWrong && !isCancellation) {
+        if (promisesCashRefund || !/store\s*credit/i.test(rep)) {
+            return "As per our return policy, returns for size, fit, or preference are provided as **store credit** only. Original payment method refunds (within 5 to 7 business days) are issued strictly for damaged products, wrong items delivered, or cancellations before dispatch. You can submit your exchange or return request within 2 days of delivery at offcomfrt.in/pages/return.";
+        }
+    }
+
+    // Case 2: Customer specifically asks for bank/cash refund for general returns (without damage/wrong item)
+    const asksBankRefund = /bank|cash|original\s*payment|source|account|upi|google\s*pay|phonepe/i.test(msg) && /refund|money/i.test(msg);
+    if (asksBankRefund && !isDamagedOrWrong && !isCancellation) {
+        if (!/store\s*credit/i.test(rep) || promisesCashRefund) {
+            return "Refunds to the original payment method (within 5 to 7 business days) are provided strictly for damaged products, wrong items delivered, or cancellations before dispatch. All other returns (such as size, fit, or preference) receive **store credit only**. Requests can be submitted within 2 days of delivery at offcomfrt.in/pages/return.";
+        }
+    }
+
+    return reply;
+}
+
 // ---------- Main chat function ----------
 
 /**
@@ -523,6 +574,9 @@ async function runCustomerAgent({ sessionId, message, visitorId }) {
     }
 
     if (reply === null) reply = 'Sorry, I could not process your request. Please try again or contact support.';
+
+    // ── SOP Refund vs. Store Credit Guardrails ──
+    reply = applyRefundGuardrails(reply, message, context);
 
     // ── Privacy & PII Leak Guard ──
     const piiRequestPattern = /\b(customer\s*(details?|info\w*|name|phone|number|address|email)|phone\s*(no|number)?|mobile\s*(no|number)?|shipping\s*address|delivery\s*address|consignee|who\s*(ordered|placed|bought|is\s*the\s*customer))\b/i;
@@ -789,4 +843,11 @@ async function createWidgetTicket({ name, phone, email, message, orderId, source
     return { ticketNumber, whatsappLink, ticketId };
 }
 
-module.exports = { runCustomerAgent, createWidgetTicket, noteSessionContext, appendSessionExchange };
+module.exports = {
+    runCustomerAgent,
+    createWidgetTicket,
+    noteSessionContext,
+    appendSessionExchange,
+    applyRefundGuardrails,
+    detectSopScenario
+};
