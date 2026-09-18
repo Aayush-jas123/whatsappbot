@@ -114,7 +114,7 @@ function detectSopScenario(text) {
     const str = String(text).toLowerCase();
 
     // 1. Delayed / POD (delivered but not received)
-    if (/delivered.*(not\s*received|haven'?t\s*received|missing|where|not\s*got)|not\s*received.*delivered|fake\s*delivery|marked\s*delivered|pod\b|proof\s*of\s*delivery/i.test(str)) {
+    if (/delivered.*(not\s*(received|delivered|got|arrive)|haven'?t\s*received|missing|where|not\s*here|didn'?t\s*(get|receive)|nothing\s*arrived)|(not\s*(received|delivered)|haven'?t\s*received|didn'?t\s*receive).*delivered|fake\s*delivery|marked\s*delivered|pod\b|proof\s*of\s*delivery|delivery\s*(boy|partner|guy).*marked.*delivered/i.test(str)) {
         return 'delayed_pod';
     }
 
@@ -246,10 +246,10 @@ OFFCOMFRT 9 STANDARD OPERATING PROCEDURE (SOP) SCENARIOS:
 
 2. **delayed_pod** (Tracking says Delivered but customer has NOT received package / Missing):
    - If tracking status is "Delivered":
-     1. Ask customer to check with household members, building security guard, reception desk, or neighbours.
-     2. Explain that we have notified our delivery partner and requested official Proof of Delivery (POD).
-     3. State that an update with the POD will be provided within 24 hours.
-   - If the customer confirms they already checked security/neighbours, create a support ticket immediately for courier investigation.
+     1. Reassure the customer empathetically. Explain that couriers occasionally mark packages as delivered right before arrival or leave them at building security, reception, or with neighbours.
+     2. Ask customer to check with household members, building security guard, reception desk, or neighbours.
+     3. State that we have requested official Proof of Delivery (POD) from our courier partner and will provide an update within 24 hours.
+   - If the customer confirms they already checked security/neighbours, or requests an inquiry, create a support ticket tagged [POD_INVESTIGATION] immediately with the order details and 24-hour update SLA.
 
 3. **refund_policy** (Refund / Money back / Return to bank account):
    - Original payment method refunds (takes 5-7 business days) are issued ONLY for:
@@ -601,7 +601,8 @@ async function runCustomerAgent({ sessionId, message, visitorId }) {
 
     // Update context with detected scenario from reply
     if (reply) {
-        if (/track|order|status|deliver|ship/i.test(message)) context.lastScenario = 'tracking';
+        if (/delivered.*(not\s*(received|delivered|got)|missing|haven'?t)|fake\s*delivery|pod\b|proof\s*of\s*delivery/i.test(message)) context.lastScenario = 'delayed_pod';
+        else if (/track|order|status|deliver|ship/i.test(message)) context.lastScenario = 'tracking';
         else if (/return|exchange|size/i.test(message)) context.lastScenario = 'return_exchange';
         else if (/cancel/i.test(message)) context.lastScenario = 'cancellation';
         else if (/already\s*paid.*(cash|cod)|paid\s*online.*(cod|cash)|courier.*asking.*(cash|money)|delivery.*asking.*(cash|money)/i.test(message)) context.lastScenario = 'cod_confusion';

@@ -555,6 +555,7 @@
                 setInputMode('text');
                 addBotMessage('Got it — Order *#' + selectedOrderId + '*. What do you need help with?', [
                     { label: 'Paid Online but Asking COD', action: 'support_cod_confusion', primary: true },
+                    { label: 'Delivered but Not Received (POD)', action: 'support_delayed_pod' },
                     { label: 'Order Issue', action: 'support_order_issue' },
                     { label: 'Product Question', action: 'support_product' },
                     { label: 'Delivery Problem', action: 'support_delivery' },
@@ -565,6 +566,12 @@
                 flowContext.supportTopic = 'COD Double Payment Refund';
                 doCreateSupportTicket(
                     '[COD_DOUBLE_PAYMENT_REFUND] Customer paid online but courier demanded cash at delivery. Advised to pay to prevent RTO. Please verify payment proof and refund collected cash amount to original payment method/bank account for Order #' + selectedOrderId + '.'
+                );
+            } else if (selectedIntent === 'pod_inquiry') {
+                flowContext.orderId = selectedOrderId;
+                flowContext.supportTopic = 'Delayed Delivery / POD';
+                doCreateSupportTicket(
+                    '[POD_INVESTIGATION] Order #' + selectedOrderId + ': Customer reports package marked as delivered was not received. Checked security/neighbours without success. Requesting official Proof of Delivery (POD) from courier partner. 24-hour update SLA promised per SOP.'
                 );
             } else {
                 doTrackOrder(selectedOrderId);
@@ -580,13 +587,17 @@
                 { label: 'Back to Menu', action: 'main_menu' }
             ]);
         }
-        else if (action === 'delayed_pod_check') {
-            addUserMessage("I haven't received my delivered order");
+        else if (action === 'delayed_pod_check' || action === 'support_delayed_pod') {
+            addUserMessage("Delivered but Not Received (POD)");
+            flowContext.supportTopic = 'Delayed Delivery / POD';
+            var ordStr = flowContext.orderId ? ' for Order *#' + flowContext.orderId + '*' : '';
             addBotMessage(
-                "We understand your concern! Couriers sometimes mark parcels as delivered right before arrival, or leave them with security or neighbours.\n\n" +
+                "We understand your concern" + ordStr + "! Couriers sometimes mark parcels as delivered right before arrival, or leave them with a building security guard, reception desk, or neighbour.\n\n" +
+                "**SOP Check Steps:**\n" +
                 "1. Please check with your household members, security guard, or reception desk.\n" +
-                "2. If still not found, we will request official Proof of Delivery (POD) from the courier partner.\n\n" +
-                "Would you like us to raise a POD inquiry for Order *#" + (flowContext.orderId || '') + "*?",
+                "2. If still not found, we will immediately raise an official Proof of Delivery (POD) dispute with our courier partner.\n\n" +
+                "Per our SOP, an update with the official courier POD will be provided within **24 hours**.\n\n" +
+                "Would you like us to raise a POD investigation ticket?",
                 [
                     { label: 'Request POD Investigation', action: 'raise_pod_ticket', primary: true },
                     { label: 'I Found It', action: 'main_menu' },
@@ -597,7 +608,17 @@
         else if (action === 'raise_pod_ticket') {
             addUserMessage("Please request POD investigation");
             flowContext.supportTopic = 'Delayed Delivery / POD';
-            doCreateSupportTicket('Customer reports package marked as delivered was not received. Requesting Proof of Delivery (POD) from courier partner. Update promised within 24 hours per SOP.');
+            if (flowContext.orderId) {
+                doCreateSupportTicket(
+                    '[POD_INVESTIGATION] Order #' + flowContext.orderId + ': Customer reports package marked as delivered was not received. Checked security/neighbours without success. Requesting official Proof of Delivery (POD) from courier partner. 24-hour update SLA promised per SOP.'
+                );
+            } else {
+                flowState = 'awaiting_pod_order_id';
+                setInputMode('order');
+                addBotMessage('Please enter your *order number* or registered *mobile number* so we can raise a POD inquiry with the courier:', [
+                    { label: 'Back to Menu', action: 'main_menu' }
+                ]);
+            }
         }
         else if (action === 'file_return') startFileReturn();
         else if (action === 'edit_request') startEditRequest();
@@ -804,7 +825,7 @@
                     'No recent orders found for mobile number ending in *' + last4 + '*.\n\n' +
                     'Please verify your number or enter your 4-6 digit *order number* directly.',
                     [
-                        { label: 'Try Again', action: intent === 'edit' ? 'edit_request' : (intent === 'cod_refund' ? 'raise_cod_refund_ticket' : 'track_order'), primary: true },
+                        { label: 'Try Again', action: intent === 'edit' ? 'edit_request' : (intent === 'cod_refund' ? 'raise_cod_refund_ticket' : (intent === 'pod_inquiry' ? 'raise_pod_ticket' : 'track_order')), primary: true },
                         { label: 'Contact Support', action: 'contact_support' },
                         { label: 'Menu', action: 'main_menu' }
                     ]
@@ -826,6 +847,7 @@
                     setInputMode('text');
                     addBotMessage('Found Order *#' + singleId + '*. What do you need help with?', [
                         { label: 'Paid Online but Asking COD', action: 'support_cod_confusion', primary: true },
+                        { label: 'Delivered but Not Received (POD)', action: 'support_delayed_pod' },
                         { label: 'Order Issue', action: 'support_order_issue' },
                         { label: 'Product Question', action: 'support_product' },
                         { label: 'Delivery Problem', action: 'support_delivery' },
@@ -836,6 +858,12 @@
                     flowContext.supportTopic = 'COD Double Payment Refund';
                     doCreateSupportTicket(
                         '[COD_DOUBLE_PAYMENT_REFUND] Customer paid online but courier demanded cash at delivery. Advised to pay to prevent RTO. Please verify payment proof and refund collected cash amount to original payment method/bank account for Order #' + singleId + '.'
+                    );
+                } else if (intent === 'pod_inquiry') {
+                    flowContext.orderId = singleId;
+                    flowContext.supportTopic = 'Delayed Delivery / POD';
+                    doCreateSupportTicket(
+                        '[POD_INVESTIGATION] Order #' + singleId + ': Customer reports package marked as delivered was not received. Checked security/neighbours without success. Requesting official Proof of Delivery (POD) from courier partner. 24-hour update SLA promised per SOP.'
                     );
                 } else {
                     addBotMessage('Found Order *#' + singleId + '* (' + escapeHtml(single.status) + '). Fetching tracking details...');
@@ -856,6 +884,7 @@
             var intentLabel = 'track';
             if (intent === 'edit') intentLabel = 'modify';
             else if (intent === 'cod_refund') intentLabel = 'request COD refund for';
+            else if (intent === 'pod_inquiry') intentLabel = 'request POD investigation for';
             else if (intent === 'ticket') intentLabel = 'get support for';
 
             addBotMessage(
@@ -867,7 +896,7 @@
         .catch(function () {
             hideTyping();
             addBotMessage('Unable to look up orders by phone right now. Please enter your *order number* directly.', [
-                { label: 'Try Order Number', action: intent === 'edit' ? 'edit_request' : (intent === 'cod_refund' ? 'raise_cod_refund_ticket' : 'track_order'), primary: true },
+                { label: 'Try Order Number', action: intent === 'edit' ? 'edit_request' : (intent === 'cod_refund' ? 'raise_cod_refund_ticket' : (intent === 'pod_inquiry' ? 'raise_pod_ticket' : 'track_order')), primary: true },
                 { label: 'Menu', action: 'main_menu' }
             ]);
             flowState = 'idle';
@@ -1229,6 +1258,7 @@
         setInputMode('order');
         addBotMessage('Please enter your *order number* or registered *mobile number* so we can pull up your details.\n\nOr select an urgent topic below:', [
             { label: 'Paid Online but Asking COD', action: 'support_cod_confusion', primary: true },
+            { label: 'Delivered but Not Received (POD)', action: 'support_delayed_pod' },
             { label: 'Order Issue', action: 'support_order_issue' },
             { label: 'Back to Menu', action: 'main_menu' }
         ]);
@@ -1540,6 +1570,7 @@
                     var greeting = flowContext.customerName ? 'Thanks, ' + flowContext.customerName + '. ' : 'Got it. ';
                     addBotMessage(greeting + 'Order *#' + cleaned + '*. What do you need help with?', [
                         { label: 'Paid Online but Asking COD', action: 'support_cod_confusion', primary: true },
+                        { label: 'Delivered but Not Received (POD)', action: 'support_delayed_pod' },
                         { label: 'Order Issue', action: 'support_order_issue' },
                         { label: 'Product Question', action: 'support_product' },
                         { label: 'Delivery Problem', action: 'support_delivery' },
@@ -1553,6 +1584,7 @@
                     setInputMode('text');
                     addBotMessage('Got it — Order *#' + cleaned + '*. What do you need help with?', [
                         { label: 'Paid Online but Asking COD', action: 'support_cod_confusion', primary: true },
+                        { label: 'Delivered but Not Received (POD)', action: 'support_delayed_pod' },
                         { label: 'Order Issue', action: 'support_order_issue' },
                         { label: 'Product Question', action: 'support_product' },
                         { label: 'Delivery Problem', action: 'support_delivery' },
@@ -1630,6 +1662,19 @@
                 flowContext.supportTopic = 'COD Double Payment Refund';
                 doCreateSupportTicket(
                     '[COD_DOUBLE_PAYMENT_REFUND] Customer paid online but courier demanded cash at delivery. Advised to pay to prevent RTO. Please verify payment proof and refund collected cash amount to original payment method/bank account for Order #' + codOrderId + '.'
+                );
+            }
+        } else if (flowState === 'awaiting_pod_order_id') {
+            addUserMessage(text);
+            var parsedPod = parseOrderOrTracking(text);
+            if (parsedPod && parsedPod.type === 'phone') {
+                doSearchOrdersByPhone(parsedPod.id, 'pod_inquiry');
+            } else {
+                var podOrderId = parsedPod ? parsedPod.id : text.trim().replace(/^#/, '');
+                flowContext.orderId = podOrderId;
+                flowContext.supportTopic = 'Delayed Delivery / POD';
+                doCreateSupportTicket(
+                    '[POD_INVESTIGATION] Order #' + podOrderId + ': Customer reports package marked as delivered was not received. Checked security/neighbours without success. Requesting official Proof of Delivery (POD) from courier partner. 24-hour update SLA promised per SOP.'
                 );
             }
         } else {
