@@ -161,6 +161,46 @@ function detectSopScenario(text) {
     return null;
 }
 
+// ---------- Customer Sentiment & Frustration Detection (Change 13) ----------
+
+function detectCustomerSentiment(text) {
+    if (!text) return { isFrustrated: false, isUrgent: false, needsImmediateEscalation: false, triggers: [] };
+    const str = String(text).toLowerCase();
+    const triggers = [];
+
+    // Severe anger, scam accusations, or legal threats
+    const severeAngerPattern = /\b(cheat|cheated|cheating|fraud|scam|scammer|thief|chor|loot|bakwas|ganda|third\s*class|pathetic|disgusting|horrible|terrible|worst|worst\s*experience|useless|waste\s*of\s*money|nonsense|ridiculous|harassment|legal\s*(action|notice)?|police|consumer\s*(court|forum)|sue\s*you|complaint\s*against|fake\s*brand|fake\s*site)\b/i;
+    const severeMatch = str.match(severeAngerPattern);
+    if (severeMatch) {
+        triggers.push(severeMatch[0]);
+    }
+
+    // Delay & delivery frustration
+    const delayFrustrationPattern = /\b(still\s*not\s*delivered|taking\s*so\s*long|why\s*(so\s*)?late|why\s*delay|so\s*much\s*delay|waiting\s*for\s*(days|weeks)|kitna\s*time\s*lagega|kab\s*aayega|kab\s*milega|ab\s*tak\s*nahi\s*aaya|no\s*update|no\s*response|nobody\s*replying|ignoring\s*me|frustrated|irritated|disappointed|fed\s*up)\b/i;
+    const delayMatch = str.match(delayFrustrationPattern);
+    if (delayMatch) {
+        triggers.push(delayMatch[0]);
+    }
+
+    // Urgent human or phone escalation demand
+    const escalationPattern = /\b(speak\s*to\s*(a\s*)?(human|manager|supervisor|person|agent|team)|human\s*support|real\s*person|connect\s*(me\s*)?to\s*(human|agent|manager)|call\s*me|phone\s*call|give\s*me\s*your\s*number|phone\s*number|contact\s*number|urgent|immediately|jaldi|right\s*now)\b/i;
+    const escMatch = str.match(escalationPattern);
+    if (escMatch) {
+        triggers.push(escMatch[0]);
+    }
+
+    const isFrustrated = triggers.length > 0;
+    const isUrgent = !!escMatch || /urgent|immediately|jaldi|right\s*now/i.test(str);
+    const needsImmediateEscalation = !!severeMatch || (isFrustrated && isUrgent);
+
+    return {
+        isFrustrated,
+        isUrgent,
+        needsImmediateEscalation,
+        triggers
+    };
+}
+
 // ---------- Entity extraction ----------
 
 function extractEntities(text) {
@@ -206,7 +246,7 @@ function extractEntities(text) {
 
 // ---------- System prompt ----------
 
-function buildSystemPrompt(context, language) {
+function buildSystemPrompt(context, language, sentiment) {
     const langInstruction =
         language === 'hindi'
             ? 'Respond in Hindi (Devanagari script).'
@@ -223,6 +263,9 @@ function buildSystemPrompt(context, language) {
     if (context.pincode) contextStr += `\n- Pincode mentioned: ${context.pincode}`;
     if (context.lastScenario) contextStr += `\n- Active Detected Scenario: ${context.lastScenario} (adhere strictly to Scenario ${context.lastScenario} SOP rules below)`;
     if (context.supportTopic) contextStr += `\n- Current Support Topic: ${context.supportTopic}`;
+    if (sentiment && sentiment.isFrustrated) {
+        contextStr += `\n- CUSTOMER SENTIMENT: High Frustration / Dissatisfaction detected (Triggers: ${sentiment.triggers.join(', ')}). You MUST begin your response by empathetically validating their frustration and apologizing for the inconvenience before giving any facts.`;
+    }
 
     return `You are the OFFCOMFRT customer support assistant — a helpful, empathetic, and SOP-compliant AI that assists shoppers with orders, tracking, returns, exchanges, and inquiries.
 
@@ -299,6 +342,15 @@ OFFCOMFRT 9 STANDARD OPERATING PROCEDURE (SOP) SCENARIOS:
    - Maintain a calm, empathetic, professional tone. Validate their feelings ("I completely understand your frustration...").
    - DO NOT offer or promise phone callbacks (we resolve all issues over chat and tickets).
    - Attempt to resolve over chat first. If the customer remains unsatisfied or requires manual team intervention, create a support ticket with full context.
+
+EMPATHY & ACTIVE LISTENING PRINCIPLES (CUSTOMER FEELS HEARD):
+1. **Validate feelings first**: When a customer is upset, complaining about delay, scam, bad experience, or demanding human escalation, ALWAYS acknowledge and validate their feelings BEFORE providing facts, tracking information, or policy rules.
+   - Example (English): "I completely understand your frustration regarding the delay, and I sincerely apologize for the inconvenience this has caused you."
+   - Example (Hinglish): "Main aapki pareshani bilkul samajh sakta hoon aur is delay ke liye dil se maafi chahta hoon."
+   - Example (Hindi): "मैं आपकी परेशानी पूरी तरह समझ सकता हूँ और इस देरी के लिए आपसे क्षमा चाहता हूँ।"
+2. **Never be defensive, robotic, or dismissive**: Never argue, blame the courier dismissively, or give cold, one-line policy denials.
+3. **No phone callbacks**: Do NOT offer or promise phone callbacks under any circumstance (our support is strictly documented over chat, WhatsApp, and tickets). If they ask for a phone call or number, explain politely: "We provide support directly over WhatsApp and support tickets so our entire team can track and resolve your issue with complete documentation."
+4. **Priority Escalation**: When legal threats, severe anger, or repeated complaints occur, apologize sincerely, de-escalate immediately, and offer our priority WhatsApp escalation or create an urgent support ticket.
 
 ${contextStr ? `CONVERSATION CONTEXT (from earlier messages):${contextStr}` : ''}
 
@@ -494,10 +546,11 @@ async function runCustomerAgent({ sessionId, message, visitorId, entities }) {
         persistContextToDb(sessionId, context).catch(err => console.warn('[widget] context persist error:', err.message));
     }
 
-    // Detect language
+    // Detect language & sentiment
     const language = detectLanguage(message);
+    const sentiment = detectCustomerSentiment(message);
 
-    const systemPrompt = buildSystemPrompt(context, language);
+    const systemPrompt = buildSystemPrompt(context, language, sentiment);
 
     // If the customer asks about an order/return without repeating the number,
     // remind the model of the IDs we already have so it never asks again.
@@ -619,11 +672,18 @@ async function runCustomerAgent({ sessionId, message, visitorId, entities }) {
         else if (/refund|money back/i.test(message)) context.lastScenario = 'refund';
     }
 
-    // Detect if the AI is suggesting escalation
+    // Detect if the AI or sentiment is suggesting escalation
     let suggestedAction = null;
-    if (/ticket|support agent|human agent|whatsapp|escalat/i.test(reply)) {
+    if (sentiment.needsImmediateEscalation) {
+        suggestedAction = 'whatsapp_escalation';
+    } else if (/ticket|support agent|human agent|whatsapp|escalat/i.test(reply)) {
         suggestedAction = 'create_ticket';
     }
+
+    // Build priority WhatsApp escalation link
+    const businessNumber = (process.env.WHATSAPP_BUSINESS_NUMBER || '').replace(/\D/g, '');
+    const prefilledText = `Hi OFFCOMFRT Support, I need urgent assistance.\n${context.orderId ? 'Order: #' + context.orderId + '\n' : ''}Issue: ${message.substring(0, 150)}`;
+    const whatsappLink = businessNumber ? `https://wa.me/${businessNumber}?text=${encodeURIComponent(prefilledText)}` : null;
 
     // Save session with updated context
     session.history.push({ role: 'user', content: message });
@@ -649,6 +709,8 @@ async function runCustomerAgent({ sessionId, message, visitorId, entities }) {
         cardType: returnCard ? 'return' : null,
         cardData: returnCard,
         entities: context,
+        sentiment: sentiment.isFrustrated ? 'frustrated' : 'neutral',
+        whatsappLink,
         usage: { prompt_tokens: totalPromptTokens, completion_tokens: totalCompletionTokens, cost_usd: totalCost }
     };
 }
@@ -868,5 +930,6 @@ module.exports = {
     appendSessionExchange,
     applyRefundGuardrails,
     detectSopScenario,
+    detectCustomerSentiment,
     getSessionAsync
 };

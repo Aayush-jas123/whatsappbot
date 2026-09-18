@@ -93,7 +93,9 @@ router.post('/chat', async (req, res) => {
             suggestedAction: result.suggestedAction,
             cardType: result.cardType || null,
             cardData: result.cardData || null,
-            entities: result.entities || null
+            entities: result.entities || null,
+            sentiment: result.sentiment || 'neutral',
+            whatsappLink: result.whatsappLink || null
         });
     } catch (error) {
         console.error('[widget] chat error:', error.message);

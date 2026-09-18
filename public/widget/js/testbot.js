@@ -545,6 +545,16 @@
             ]);
             flowState = 'idle'; return;
         }
+        if (action.indexOf('open_whatsapp_escalation_') === 0) {
+            var rawEscUrl = action.replace('open_whatsapp_escalation_', '');
+            var escUrl = decodeURIComponent(rawEscUrl);
+            addUserMessage('Chat on WhatsApp');
+            window.open(escUrl, '_blank');
+            addBotMessage('Connecting you with our priority support team on WhatsApp. Our team will assist you immediately!', [
+                { label: 'Back to Menu', action: 'main_menu' }
+            ]);
+            flowState = 'idle'; return;
+        }
         if (action.indexOf('open_return_portal_') === 0) {
             var retOrderId = action.replace('open_return_portal_', '');
             addUserMessage('Open Return Portal');
@@ -1729,18 +1739,32 @@
             }
             var aiReply = data.reply || 'I was unable to process your request.';
             var aiSaysCreateTicket = data.suggestedAction === 'create_ticket';
+            var aiSaysWhatsApp = data.suggestedAction === 'whatsapp_escalation';
+            var isFrustrated = data.sentiment === 'frustrated';
             var attempts = flowContext.aiAttempts || 0;
             var exhaustedAttempts = attempts >= MAX_AI_ATTEMPTS;
 
-            // Only offer Create Ticket after exhausting all AI attempts (ignore AI's create_ticket signal until then)
-            if (exhaustedAttempts) {
-                var escalationMsg = aiReply;
-                escalationMsg += '\n\nIt seems I am not able to fully resolve this. Would you like to create a support ticket so our team can assist you directly?';
-                addBotMessage(escalationMsg, [
-                    { label: 'Create Ticket', action: 'create_support_ticket', primary: true },
+            // If immediate WhatsApp escalation or customer is frustrated with WhatsApp link available
+            if (aiSaysWhatsApp || (isFrustrated && data.whatsappLink)) {
+                var buttons = [];
+                if (data.whatsappLink) {
+                    buttons.push({ label: 'Chat on WhatsApp', action: 'open_whatsapp_escalation_' + encodeURIComponent(data.whatsappLink), primary: true });
+                }
+                buttons.push({ label: 'Priority Support Ticket', action: 'create_support_ticket', primary: !data.whatsappLink });
+                buttons.push({ label: 'Try Another Question', action: 'retry_support' });
+                buttons.push({ label: 'Menu', action: 'main_menu' });
+                addBotMessage(aiReply, buttons);
+            } else if (isFrustrated || aiSaysCreateTicket || exhaustedAttempts) {
+                var buttons = [
+                    { label: 'Priority Support Ticket', action: 'create_support_ticket', primary: true },
                     { label: 'Try Another Question', action: 'retry_support' },
                     { label: 'Menu', action: 'main_menu' }
-                ]);
+                ];
+                var escalationMsg = aiReply;
+                if (exhaustedAttempts && !/ticket|support team|agent/i.test(aiReply)) {
+                    escalationMsg += '\n\nWould you like to create a priority support ticket so our team can assist you directly?';
+                }
+                addBotMessage(escalationMsg, buttons);
             } else {
                 addBotMessage(aiReply, [
                     { label: 'Try Another Question', action: 'retry_support', primary: true },
