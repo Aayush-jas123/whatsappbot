@@ -129,7 +129,7 @@ function detectSopScenario(text) {
     }
 
     // 4. Size change / exchange
-    if (/exchange|size\s*(change|swap|replace|too\s*(big|small|tight|loose))|different\s*size|smaller\s*size|larger\s*size/i.test(str)) {
+    if (/exchange|size\s*(change|swap|replace|too\s*(big|small|tight|loose))|change.*size|different\s*size|smaller\s*size|larger\s*size/i.test(str)) {
         return 'size_exchange';
     }
 
