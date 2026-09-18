@@ -981,6 +981,60 @@ router.post('/ticket', async (req, res) => {
     }
 });
 
+// Helper: Enrich return/exchange requests with rich SOP status explanations and next steps
+function enrichRequestStatus(r) {
+    const rawStatus = (r.status || 'pending').toLowerCase();
+    let stage = 'pending_approval';
+    let statusLabel = 'Under Review';
+    let statusClass = 'oftb-return-pending';
+    let explanation = 'Your request is currently being reviewed by our quality team (processed within 24 to 48 hours).';
+    let nextStep = 'Please keep the item unwashed, unused, and with original brand tags attached.';
+
+    if (rawStatus.includes('pickup_schedul') || rawStatus.includes('scheduled')) {
+        stage = 'pickup_scheduled';
+        statusLabel = 'Pickup Scheduled';
+        statusClass = 'oftb-return-scheduled';
+        const dateStr = r.pickup_scheduled_date ? new Date(r.pickup_scheduled_date).toLocaleDateString('en-IN', { day: 'numeric', month: 'short', year: 'numeric' }) : null;
+        explanation = 'Reverse pickup has been scheduled' + (dateStr ? ' for ' + dateStr : '') + '.';
+        nextStep = 'Please hand over the securely packed parcel with brand tags intact to the pickup executive.';
+    } else if (rawStatus.includes('approv')) {
+        stage = 'approved';
+        statusLabel = 'Approved';
+        statusClass = 'oftb-return-approved';
+        explanation = 'Your request has been approved! A courier pickup executive will be assigned within 2 to 3 business days.';
+        nextStep = 'Pack the garment with all brand tags intact. The agent will verify tags during pickup.';
+    } else if (rawStatus.includes('in_transit') || rawStatus.includes('picked') || rawStatus.includes('shipped')) {
+        stage = 'in_transit';
+        statusLabel = 'In Transit to Warehouse';
+        statusClass = 'oftb-return-transit';
+        explanation = 'The courier has collected your package. It is currently in transit to our fulfillment center for quality inspection.';
+        nextStep = 'Quality check takes 24 to 48 hours after parcel arrival at our warehouse.';
+    } else if (rawStatus.includes('complete') || rawStatus.includes('refund')) {
+        stage = 'completed';
+        statusLabel = r.type === 'exchange' ? 'Exchange Dispatched' : 'Refund Completed';
+        statusClass = 'oftb-return-completed';
+        explanation = r.type === 'exchange'
+            ? 'Your exchange order has been confirmed and dispatched!'
+            : ('Return processed! ' + (r.refund_amount ? 'Refund amount of ₹' + r.refund_amount + ' credited. ' : '') + 'Store credit code has been issued and sent to your registered contact.');
+        nextStep = 'Thank you for shopping with OFFCOMFRT.';
+    } else if (rawStatus.includes('reject') || rawStatus.includes('denied') || rawStatus.includes('cancel')) {
+        stage = 'rejected';
+        statusLabel = 'Request Rejected';
+        statusClass = 'oftb-return-rejected';
+        explanation = r.rejection_reason || 'This request could not be approved per policy (e.g. reported beyond the 2-day delivery window or missing mandatory proof).';
+        nextStep = 'If you believe this was an error, please contact our support team for a manual case review.';
+    }
+
+    return {
+        ...r,
+        stage,
+        status_label: statusLabel,
+        status_class: statusClass,
+        explanation,
+        next_step: nextStep
+    };
+}
+
 // ---------- POST /api/widget/track-request ----------
 // Track return/exchange requests from external returns server + local tables
 
@@ -1017,6 +1071,8 @@ router.post('/track-request', async (req, res) => {
                 type: 'return',
                 status: r.status,
                 reason: r.reason,
+                pickup_scheduled_date: r.pickup_scheduled_date,
+                refund_amount: r.refund_amount,
                 items: [],
                 created_at: r.created_at
             }));
@@ -1026,6 +1082,7 @@ router.post('/track-request', async (req, res) => {
                 type: 'exchange',
                 status: r.status,
                 reason: r.reason,
+                pickup_scheduled_date: r.pickup_scheduled_date,
                 items: [],
                 created_at: r.created_at
             }));
@@ -1065,10 +1122,12 @@ router.post('/track-request', async (req, res) => {
                 return true;
             });
 
+            const enriched = deduped.map(enrichRequestStatus);
+
             return res.json({
                 requestId: reqId,
-                requests: deduped,
-                count: deduped.length
+                requests: enriched,
+                count: enriched.length
             });
         }
 
@@ -1109,6 +1168,8 @@ router.post('/track-request', async (req, res) => {
             type: 'return',
             status: r.status,
             reason: r.reason,
+            pickup_scheduled_date: r.pickup_scheduled_date,
+            refund_amount: r.refund_amount,
             items: [],
             created_at: r.created_at
         }));
@@ -1118,6 +1179,7 @@ router.post('/track-request', async (req, res) => {
             type: 'exchange',
             status: r.status,
             reason: r.reason,
+            pickup_scheduled_date: r.pickup_scheduled_date,
             items: [],
             created_at: r.created_at
         }));
@@ -1145,10 +1207,12 @@ router.post('/track-request', async (req, res) => {
             return true;
         });
 
+        const enriched = deduped.map(enrichRequestStatus);
+
         res.json({
             orderId: cleanOrderId,
-            requests: deduped,
-            count: deduped.length
+            requests: enriched,
+            count: enriched.length
         });
     } catch (error) {
         console.error('[widget] track-request error:', error.message);

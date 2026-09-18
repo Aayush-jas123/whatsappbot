@@ -200,9 +200,15 @@
             '#offcomfrt-tb .oftb-return-card-header{display:flex;justify-content:space-between;align-items:center;margin-bottom:12px;padding-bottom:10px;border-bottom:1px solid #f0f0f0}',
             '#offcomfrt-tb .oftb-return-type{font-size:10px;font-weight:700;color:#999;text-transform:uppercase;letter-spacing:1px}',
             '#offcomfrt-tb .oftb-return-status{font-size:10px;font-weight:700;padding:4px 10px;border-radius:100px;text-transform:uppercase;letter-spacing:0.8px}',
-            '#offcomfrt-tb .oftb-return-approved{background:#1a1a1a;color:#fff}',
-            '#offcomfrt-tb .oftb-return-pending{background:#f0f0f0;color:#666}',
-            '#offcomfrt-tb .oftb-return-rejected{background:#e5e5e5;color:#333}',
+            '#offcomfrt-tb .oftb-return-approved{background:#e8f5e9;color:#2e7d32;border:1px solid #c8e6c9}',
+            '#offcomfrt-tb .oftb-return-pending{background:#fff8e1;color:#b78103;border:1px solid #ffe082}',
+            '#offcomfrt-tb .oftb-return-scheduled{background:#e0f2fe;color:#0369a1;border:1px solid #bae6fd}',
+            '#offcomfrt-tb .oftb-return-transit{background:#f3e8ff;color:#7e22ce;border:1px solid #e9d5ff}',
+            '#offcomfrt-tb .oftb-return-completed{background:#ecfdf5;color:#065f46;border:1px solid #a7f3d0}',
+            '#offcomfrt-tb .oftb-return-rejected{background:#fee2e2;color:#991b1b;border:1px solid #fecaca}',
+            '#offcomfrt-tb .oftb-return-highlight{background:#f8fafc;border-radius:10px;padding:10px 14px;margin:10px 0;border:1px solid #e2e8f0;display:flex;align-items:center;justify-content:space-between}',
+            '#offcomfrt-tb .oftb-return-explanation{background:#f9fafb;border-left:3px solid #1a1a1a;border-radius:0 8px 8px 0;padding:10px 12px;margin:12px 0 6px;font-size:12px;color:#374151;line-height:1.45}',
+            '#offcomfrt-tb .oftb-return-nextstep{font-size:11.5px;color:#4b5563;margin-top:6px;padding-top:6px;border-top:1px dashed #e5e7eb;font-weight:500}',
             '#offcomfrt-tb .oftb-return-row{display:flex;justify-content:space-between;padding:7px 0;border-bottom:1px solid #f5f5f5;font-size:13px}',
             '#offcomfrt-tb .oftb-return-row:last-child{border-bottom:none}',
             '#offcomfrt-tb .oftb-return-row .label{color:#bbb;font-size:10px;text-transform:uppercase;letter-spacing:0.8px;font-weight:600}',
@@ -1678,41 +1684,63 @@
         var card = document.createElement('div');
         card.className = 'oftb-return-card';
 
-        var statusText = req.status || 'Pending';
-        var statusClass = 'oftb-return-pending';
-        if (/approved|completed|picked.?up|in_transit/i.test(statusText)) statusClass = 'oftb-return-approved';
-        else if (/rejected|denied|cancelled/i.test(statusText)) statusClass = 'oftb-return-rejected';
+        var statusClass = req.status_class || 'oftb-return-pending';
+        var statusLabel = req.status_label || req.status || 'Under Review';
+        var typeText = (req.type === 'exchange' ? 'Exchange' : 'Return') + ' Request';
 
-        var typeText = req.type === 'exchange' ? 'Exchange' : 'Return';
         var html = '<div class="oftb-return-card-header">';
         html += '<span class="oftb-return-type">' + escapeHtml(typeText) + '</span>';
-        html += '<span class="oftb-return-status ' + statusClass + '">' + escapeHtml(statusText) + '</span>';
+        html += '<span class="oftb-return-status ' + statusClass + '">' + escapeHtml(statusLabel) + '</span>';
         html += '</div>';
 
-        if (req.request_id) html += '<div class="oftb-return-row"><span class="label">Request ID</span><span class="value">' + escapeHtml(req.request_id) + '</span></div>';
+        if (req.request_id) html += '<div class="oftb-return-row"><span class="label">Request ID</span><span class="value" style="font-family:monospace;font-weight:700;">' + escapeHtml(req.request_id) + '</span></div>';
         if (req.order_number) html += '<div class="oftb-return-row"><span class="label">Order</span><span class="value">#' + escapeHtml(req.order_number) + '</span></div>';
         if (req.reason) html += '<div class="oftb-return-row"><span class="label">Reason</span><span class="value">' + escapeHtml(req.reason) + '</span></div>';
         if (req.created_at) {
             var date = new Date(req.created_at);
-            var dateStr = date.toLocaleDateString('en-IN', { day: 'numeric', month: 'short', year: 'numeric' });
-            html += '<div class="oftb-return-row"><span class="label">Requested</span><span class="value">' + escapeHtml(dateStr) + '</span></div>';
+            var dateStr = !isNaN(date.getTime()) ? date.toLocaleDateString('en-IN', { day: 'numeric', month: 'short', year: 'numeric' }) : '';
+            if (dateStr) html += '<div class="oftb-return-row"><span class="label">Requested On</span><span class="value">' + escapeHtml(dateStr) + '</span></div>';
+        }
+
+        // Special highlight fields
+        if (req.pickup_scheduled_date) {
+            var pDate = new Date(req.pickup_scheduled_date);
+            var pDateStr = !isNaN(pDate.getTime()) ? pDate.toLocaleDateString('en-IN', { day: 'numeric', month: 'short', year: 'numeric' }) : req.pickup_scheduled_date;
+            html += '<div class="oftb-return-highlight">';
+            html += '<div><div style="font-size:10px;font-weight:700;color:#0369a1;text-transform:uppercase;letter-spacing:0.8px;">Scheduled Reverse Pickup</div><div style="font-size:13px;font-weight:600;color:#1a1a1a;margin-top:2px;">' + escapeHtml(pDateStr) + '</div></div>';
+            html += '<span style="font-size:20px;">📦</span>';
+            html += '</div>';
+        }
+
+        if (req.refund_amount) {
+            html += '<div class="oftb-return-highlight" style="background:#ecfdf5;border-color:#a7f3d0;">';
+            html += '<div><div style="font-size:10px;font-weight:700;color:#065f46;text-transform:uppercase;letter-spacing:0.8px;">Refund Amount</div><div style="font-size:14px;font-weight:700;color:#065f46;margin-top:2px;">₹' + escapeHtml(String(req.refund_amount)) + ' <span style="font-size:11px;font-weight:500;">(Store Credit)</span></div></div>';
+            html += '<span style="font-size:20px;">💳</span>';
+            html += '</div>';
         }
 
         if (req.items && req.items.length > 0) {
-            html += '<div style="margin-top:12px;padding-top:10px;border-top:1px solid #f0f0f0;">';
-            html += '<div style="font-size:10px;font-weight:700;color:#bbb;text-transform:uppercase;letter-spacing:0.8px;margin-bottom:6px;">Items</div>';
+            html += '<div style="margin-top:10px;padding-top:8px;border-top:1px solid #f0f0f0;">';
+            html += '<div style="font-size:10px;font-weight:700;color:#999;text-transform:uppercase;letter-spacing:0.8px;margin-bottom:6px;">Items Included</div>';
             req.items.forEach(function (item) {
                 var itemName = item.name || item.title || 'Item';
                 var itemVariant = item.variant || '';
                 var itemQty = item.quantity || 1;
-                html += '<div style="font-size:12px;color:#1a1a1a;padding:4px 0;">';
-                html += escapeHtml(itemName);
-                if (itemVariant) html += ' <span style="color:#999;font-size:11px;">(' + escapeHtml(itemVariant) + ')</span>';
-                html += ' <span style="color:#bbb;font-size:11px;">x' + itemQty + '</span>';
+                html += '<div style="font-size:12px;color:#1a1a1a;padding:3px 0;display:flex;justify-content:space-between;">';
+                html += '<span>' + escapeHtml(itemName) + (itemVariant ? ' <span style="color:#777;font-size:11px;">(' + escapeHtml(itemVariant) + ')</span>' : '') + '</span>';
+                html += '<span style="color:#999;font-size:11px;font-weight:600;">x' + itemQty + '</span>';
                 html += '</div>';
             });
             html += '</div>';
         }
+
+        // SOP Status Explanation & Next Step
+        var explanation = req.explanation || 'Your request is being processed by our team.';
+        var nextStep = req.next_step || 'Please keep the item with original brand tags attached.';
+        html += '<div class="oftb-return-explanation">';
+        html += '<div>' + escapeHtml(explanation) + '</div>';
+        html += '<div class="oftb-return-nextstep">👉 Next Step: ' + escapeHtml(nextStep) + '</div>';
+        html += '</div>';
 
         card.innerHTML = html;
         wrapper.appendChild(card);
