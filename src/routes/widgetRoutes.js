@@ -698,6 +698,166 @@ router.post('/search-by-phone', async (req, res) => {
     }
 });
 
+// ---------- POST /api/widget/check-return-eligibility ----------
+// Validates whether an order is eligible for Return / Exchange within the 2-day delivery window per SOP
+router.post('/check-return-eligibility', async (req, res) => {
+    try {
+        const { orderId, phone } = req.body;
+        if (!orderId && !phone) {
+            return res.status(400).json({ error: 'Order ID or phone number is required' });
+        }
+
+        const { dbAdapter } = require('../database/db');
+        let cleanOrderId = orderId ? String(orderId).replace(/^#/, '').trim() : null;
+
+        // If phone provided without orderId, lookup latest order
+        if (!cleanOrderId && phone) {
+            const digits = String(phone).replace(/\D/g, '');
+            if (digits.length >= 10) {
+                const phonePattern = `%${digits.slice(-10)}%`;
+                try {
+                    const shopperRows = await dbAdapter.query(
+                        'SELECT order_id FROM store_shoppers WHERE phone LIKE ? ORDER BY created_at DESC LIMIT 1',
+                        [phonePattern]
+                    );
+                    if (shopperRows && shopperRows.length > 0) {
+                        cleanOrderId = String(shopperRows[0].order_id || '').replace(/^#/, '').trim();
+                    } else {
+                        const orderRows = await dbAdapter.query(
+                            'SELECT order_id FROM orders WHERE customer_phone LIKE ? ORDER BY created_at DESC LIMIT 1',
+                            [phonePattern]
+                        );
+                        if (orderRows && orderRows.length > 0) {
+                            cleanOrderId = String(orderRows[0].order_id || '').replace(/^#/, '').trim();
+                        }
+                    }
+                } catch (e) { /* ignore */ }
+            }
+        }
+
+        if (!cleanOrderId) {
+            return res.status(404).json({ success: false, notFound: true, message: 'Order not found' });
+        }
+
+        // 1. Check orders table
+        let orderRow = null;
+        try {
+            const rows = await dbAdapter.query(
+                `SELECT order_id, status, created_at, updated_at, delivered_at
+                 FROM orders WHERE order_id = ? OR order_id = ? LIMIT 1`,
+                [cleanOrderId, '#' + cleanOrderId]
+            );
+            if (rows && rows.length > 0) orderRow = rows[0];
+        } catch (e) {
+            try {
+                const rows = await dbAdapter.query(
+                    `SELECT order_id, status, created_at, updated_at
+                     FROM orders WHERE order_id = ? OR order_id = ? LIMIT 1`,
+                    [cleanOrderId, '#' + cleanOrderId]
+                );
+                if (rows && rows.length > 0) orderRow = rows[0];
+            } catch (e2) {}
+        }
+
+        // 2. Fallback check store_shoppers table
+        let shopperRow = null;
+        if (!orderRow) {
+            try {
+                const sRows = await dbAdapter.query(
+                    `SELECT order_id, status, created_at, updated_at
+                     FROM store_shoppers WHERE order_id = ? OR order_id = ? LIMIT 1`,
+                    [cleanOrderId, '#' + cleanOrderId]
+                );
+                if (sRows && sRows.length > 0) shopperRow = sRows[0];
+            } catch (e) {}
+        }
+
+        // 3. Check shipments table for latest tracking & delivery timestamp
+        let shipmentRow = null;
+        try {
+            const shipRows = await dbAdapter.query(
+                `SELECT carrier, awb, status, delivered_at, updated_at, created_at
+                 FROM shipments WHERE order_id = ? OR order_id = ?
+                 ORDER BY id DESC LIMIT 1`,
+                [cleanOrderId, '#' + cleanOrderId]
+            );
+            if (shipRows && shipRows.length > 0) shipmentRow = shipRows[0];
+        } catch (e) {}
+
+        if (!orderRow && !shopperRow && !shipmentRow) {
+            return res.json({
+                success: false,
+                notFound: true,
+                orderId: cleanOrderId,
+                message: 'No order found with number #' + cleanOrderId
+            });
+        }
+
+        const rawStatus = (shipmentRow && shipmentRow.status) || (orderRow && orderRow.status) || (shopperRow && shopperRow.status) || 'confirmed';
+        const normStatus = rawStatus.toLowerCase();
+
+        // Determine if order is delivered
+        const isDelivered = normStatus.includes('deliver') || normStatus === 'dlv';
+
+        if (!isDelivered) {
+            let stageLabel = 'Processing';
+            if (normStatus.includes('transit') || normStatus.includes('shipped') || normStatus.includes('dispatched')) {
+                stageLabel = 'In Transit';
+            } else if (normStatus.includes('out_for_delivery') || normStatus.includes('out for delivery')) {
+                stageLabel = 'Out for Delivery';
+            } else if (normStatus.includes('confirm')) {
+                stageLabel = 'Confirmed (Awaiting Dispatch)';
+            } else if (normStatus.includes('cancel')) {
+                stageLabel = 'Cancelled';
+            } else if (normStatus.includes('rto')) {
+                stageLabel = 'Returned to Origin (RTO)';
+            }
+
+            return res.json({
+                success: true,
+                eligible: false,
+                orderId: cleanOrderId,
+                stage: 'not_delivered',
+                status: rawStatus,
+                statusLabel: stageLabel,
+                message: 'Order #' + cleanOrderId + ' has not been delivered yet. Return and exchange requests can only be initiated after delivery.'
+            });
+        }
+
+        // Delivered order — determine exact delivery timestamp
+        const deliveredDate = (shipmentRow && shipmentRow.delivered_at)
+            ? new Date(shipmentRow.delivered_at)
+            : ((orderRow && orderRow.delivered_at)
+                ? new Date(orderRow.delivered_at)
+                : new Date((shipmentRow && (shipmentRow.updated_at || shipmentRow.created_at)) || (orderRow && (orderRow.updated_at || orderRow.created_at)) || (shopperRow && (shopperRow.updated_at || shopperRow.created_at))));
+
+        const diffMs = Date.now() - deliveredDate.getTime();
+        const diffHours = diffMs / (1000 * 60 * 60);
+        const diffDays = Math.round((diffHours / 24) * 10) / 10;
+        const windowHours = 48; // 2 days per SOP
+        const isEligible = diffHours <= windowHours;
+        const hoursRemaining = Math.max(0, Math.round(windowHours - diffHours));
+
+        res.json({
+            success: true,
+            eligible: isEligible,
+            orderId: cleanOrderId,
+            stage: isEligible ? 'eligible' : 'expired',
+            deliveredAt: deliveredDate.toISOString(),
+            daysSinceDelivery: diffDays,
+            hoursRemaining: isEligible ? hoursRemaining : 0,
+            portalUrl: 'https://www.offcomfrt.in/pages/return?order=' + encodeURIComponent(cleanOrderId),
+            exchangeUrl: 'https://www.offcomfrt.in/pages/exchange?order=' + encodeURIComponent(cleanOrderId),
+            reason: isEligible
+                ? 'Within 2-day return window (' + hoursRemaining + ' hours remaining)'
+                : 'Return window expired (delivered ' + diffDays + ' days ago, SOP limit is 2 days)'
+        });
+    } catch (error) {
+        console.error('[widget] check-return-eligibility error:', error.message);
+        res.status(500).json({ error: 'Failed to check return eligibility' });
+    }
+});
+
 // ---------- POST /api/widget/ticket ----------
 // Create a support ticket from the widget (escalation)
 

@@ -489,6 +489,15 @@
             ]);
             flowState = 'idle'; return;
         }
+        if (action.indexOf('open_return_portal_') === 0) {
+            var retOrderId = action.replace('open_return_portal_', '');
+            addUserMessage('Open Return Portal');
+            window.open('https://www.offcomfrt.in/pages/return?order=' + encodeURIComponent(retOrderId), '_blank');
+            addBotMessage('Return portal opened for Order *#' + retOrderId + '*. Complete your return details there and our team will process it within 24 to 48 hours.', [
+                { label: 'Back to Menu', action: 'main_menu' }
+            ]);
+            flowState = 'idle'; return;
+        }
         if (action === 'open_exchange_url') {
             addUserMessage('Open Exchange Page');
             window.open('https://www.offcomfrt.in/pages/exchange', '_blank');
@@ -496,6 +505,29 @@
                 { label: 'Back to Menu', action: 'main_menu' }
             ]);
             flowState = 'idle'; return;
+        }
+        if (action.indexOf('open_exchange_portal_') === 0) {
+            var exOrderId = action.replace('open_exchange_portal_', '');
+            addUserMessage('Open Exchange Portal');
+            window.open('https://www.offcomfrt.in/pages/exchange?order=' + encodeURIComponent(exOrderId), '_blank');
+            addBotMessage('Exchange portal opened for Order *#' + exOrderId + '*. Complete your exchange request there.', [
+                { label: 'Back to Menu', action: 'main_menu' }
+            ]);
+            flowState = 'idle'; return;
+        }
+        if (action.indexOf('track_order_direct_') === 0) {
+            var directTrId = action.replace('track_order_direct_', '');
+            addUserMessage('Track Order #' + directTrId);
+            doTrackOrder(directTrId);
+            return;
+        }
+        if (action === 'search_phone_for_return') {
+            flowState = 'awaiting_return_order_id';
+            setInputMode('tel');
+            addBotMessage('Please enter your *10-digit registered mobile number* to search your orders for return/exchange:', [
+                { label: 'Back to Menu', action: 'main_menu' }
+            ]);
+            return;
         }
         if (action === 'support_cod_confusion') {
             addUserMessage('Paid Online but Asking COD');
@@ -639,6 +671,9 @@
                 doCreateSupportTicket(
                     '[WRONG_ITEM_CLAIM] Order #' + selectedOrderId + ': Customer reports wrong product delivered. Advised that an unboxing video is mandatory showing parcel being opened. Eligible for refund to original payment method or free replacement within 2-day delivery window.'
                 );
+            } else if (selectedIntent === 'return_eligibility') {
+                flowContext.orderId = selectedOrderId;
+                doCheckReturnEligibility(selectedOrderId);
             } else {
                 doTrackOrder(selectedOrderId);
             }
@@ -891,7 +926,7 @@
                     'No recent orders found for mobile number ending in *' + last4 + '*.\n\n' +
                     'Please verify your number or enter your 4-6 digit *order number* directly.',
                     [
-                        { label: 'Try Again', action: intent === 'edit' ? 'edit_request' : (intent === 'cod_refund' ? 'raise_cod_refund_ticket' : (intent === 'pod_inquiry' ? 'raise_pod_ticket' : (intent === 'damaged_claim' ? 'raise_damaged_ticket' : (intent === 'wrong_item_claim' ? 'raise_wrong_item_ticket' : 'track_order')))), primary: true },
+                        { label: 'Try Again', action: intent === 'edit' ? 'edit_request' : (intent === 'return_eligibility' ? 'file_return' : (intent === 'cod_refund' ? 'raise_cod_refund_ticket' : (intent === 'pod_inquiry' ? 'raise_pod_ticket' : (intent === 'damaged_claim' ? 'raise_damaged_ticket' : (intent === 'wrong_item_claim' ? 'raise_wrong_item_ticket' : 'track_order'))))), primary: true },
                         { label: 'Contact Support', action: 'contact_support' },
                         { label: 'Menu', action: 'main_menu' }
                     ]
@@ -907,6 +942,9 @@
                 if (intent === 'edit') {
                     addBotMessage('Found Order *#' + singleId + '* (' + escapeHtml(single.status) + '). Checking modification status...');
                     doCheckEditOrder(singleId);
+                } else if (intent === 'return_eligibility') {
+                    addBotMessage('Found Order *#' + singleId + '* (' + escapeHtml(single.status) + '). Checking return & exchange eligibility...');
+                    doCheckReturnEligibility(singleId);
                 } else if (intent === 'ticket') {
                     flowContext.orderId = singleId;
                     flowState = 'awaiting_support_topic';
@@ -962,6 +1000,7 @@
 
             var intentLabel = 'track';
             if (intent === 'edit') intentLabel = 'modify';
+            else if (intent === 'return_eligibility') intentLabel = 'check return/exchange eligibility for';
             else if (intent === 'cod_refund') intentLabel = 'request COD refund for';
             else if (intent === 'pod_inquiry') intentLabel = 'request POD investigation for';
             else if (intent === 'damaged_claim') intentLabel = 'report damaged item for';
@@ -977,25 +1016,129 @@
         .catch(function () {
             hideTyping();
             addBotMessage('Unable to look up orders by phone right now. Please enter your *order number* directly.', [
-                { label: 'Try Order Number', action: intent === 'edit' ? 'edit_request' : (intent === 'cod_refund' ? 'raise_cod_refund_ticket' : (intent === 'pod_inquiry' ? 'raise_pod_ticket' : (intent === 'damaged_claim' ? 'raise_damaged_ticket' : (intent === 'wrong_item_claim' ? 'raise_wrong_item_ticket' : 'track_order')))), primary: true },
+                { label: 'Try Order Number', action: intent === 'edit' ? 'edit_request' : (intent === 'return_eligibility' ? 'file_return' : (intent === 'cod_refund' ? 'raise_cod_refund_ticket' : (intent === 'pod_inquiry' ? 'raise_pod_ticket' : (intent === 'damaged_claim' ? 'raise_damaged_ticket' : (intent === 'wrong_item_claim' ? 'raise_wrong_item_ticket' : 'track_order'))))), primary: true },
                 { label: 'Menu', action: 'main_menu' }
             ]);
             flowState = 'idle';
         });
     }
 
-    // ========== FLOW 2: RETURN / EXCHANGE (Direct Page Redirects) ==========
+    // ========== FLOW 2: RETURN / EXCHANGE (Eligibility Validator & Portal) ==========
     function startFileReturn() {
-        flowState = 'idle';
+        if (flowContext && flowContext.orderId) {
+            doCheckReturnEligibility(flowContext.orderId);
+            return;
+        }
+        flowState = 'awaiting_return_order_id';
+        flowContext = flowContext || {};
+        setInputMode('order');
         addBotMessage(
-            'Visit our dedicated pages to submit your return or exchange request.\n\n' +
-            'Requests must be made within *2 days of delivery*.',
+            'Please enter your *order number* or registered *10-digit mobile number* to check if your order is eligible for Return or Exchange.\n\n' +
+            '*(Per OFFCOMFRT SOP, requests must be submitted within 2 days of delivery.)*',
             [
-                { label: 'Return Page', action: 'open_return_url', primary: true },
-                { label: 'Exchange Page', action: 'open_exchange_url' },
-                { label: 'Menu', action: 'main_menu' }
+                { label: 'Direct to Return Portal', action: 'open_return_url' },
+                { label: 'Back to Menu', action: 'main_menu' }
             ]
         );
+    }
+
+    function doCheckReturnEligibility(orderId) {
+        flowState = 'checking_return_eligibility';
+        showTyping();
+        var cleanId = String(orderId).replace(/^#/, '').trim();
+        flowContext.orderId = cleanId;
+
+        fetch(API_URL + '/api/widget/check-return-eligibility', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ orderId: cleanId, sessionId: sessionId })
+        })
+        .then(function (r) { return r.json(); })
+        .then(function (data) {
+            hideTyping();
+            if (data.notFound) {
+                addBotMessage(
+                    'No order found with number *#' + cleanId + '*.\n\n' +
+                    'Please verify your order number from your confirmation SMS/email, or search with your 10-digit registered mobile number.',
+                    [
+                        { label: 'Search by Mobile', action: 'search_phone_for_return', primary: true },
+                        { label: 'Direct to Return Portal', action: 'open_return_url' },
+                        { label: 'Menu', action: 'main_menu' }
+                    ]
+                );
+                flowState = 'idle';
+                return;
+            }
+
+            if (data.stage === 'not_delivered') {
+                var statusText = data.statusLabel || data.status || 'Processing';
+                addBotMessage(
+                    '📦 **Order #' + cleanId + ' is currently ' + escapeHtml(statusText) + '**\n\n' +
+                    'This order has not been delivered yet. Per OFFCOMFRT policy, return and exchange requests can only be initiated **after your package has been delivered**.\n\n' +
+                    '• If you need to change your size or delivery address before dispatch, submit an **Edit Request**!\n' +
+                    '• If your package was shipped, you can track live courier status.',
+                    [
+                        { label: 'Track Order', action: 'track_order_direct_' + cleanId, primary: true },
+                        { label: 'Edit Request', action: 'edit_request' },
+                        { label: 'Menu', action: 'main_menu' }
+                    ]
+                );
+                flowState = 'idle';
+                return;
+            }
+
+            if (data.eligible) {
+                var hrsText = data.hoursRemaining > 0 ? (data.hoursRemaining + ' hours') : 'under 2 days';
+                var delivDate = data.deliveredAt ? new Date(data.deliveredAt).toLocaleDateString('en-IN', { day: 'numeric', month: 'short', year: 'numeric' }) : 'recently';
+                addBotMessage(
+                    '✅ **Order #' + cleanId + ' is Eligible for Return / Exchange!**\n\n' +
+                    '• Delivered: *' + delivDate + '*\n' +
+                    '• Window: **' + hrsText + ' remaining** to file your request.\n\n' +
+                    '**OFFCOMFRT Return & Exchange Policy:**\n' +
+                    '• Items must be unused, unwashed, and in original packaging with tags intact.\n' +
+                    '• Returns for size or style preference are issued as **Store Credit only**.\n' +
+                    '• Damaged or wrong products qualify for refund to original payment method upon verification.\n\n' +
+                    'Click below to open the pre-filled portal:',
+                    [
+                        { label: 'Open Return Portal', action: 'open_return_portal_' + cleanId, primary: true },
+                        { label: 'Open Exchange Portal', action: 'open_exchange_portal_' + cleanId },
+                        { label: 'Damaged or Wrong Item', action: 'support_damaged_wrong' },
+                        { label: 'Menu', action: 'main_menu' }
+                    ]
+                );
+                flowState = 'idle';
+                return;
+            }
+
+            // If expired (> 2 days)
+            var daysAgoText = (data.daysSinceDelivery ? data.daysSinceDelivery + ' days ago' : 'more than 2 days ago');
+            var expiredDelivDate = data.deliveredAt ? new Date(data.deliveredAt).toLocaleDateString('en-IN', { day: 'numeric', month: 'short', year: 'numeric' }) : 'earlier';
+            addBotMessage(
+                '⚠️ **Return Window Expired for Order #' + cleanId + '**\n\n' +
+                'This order was delivered on *' + expiredDelivDate + '* (' + daysAgoText + ').\n\n' +
+                'Per OFFCOMFRT Standard Operating Procedure, return and exchange requests must be submitted within **2 days (48 hours) of delivery**. Automated requests beyond 2 days cannot be processed by the return portal.\n\n' +
+                'If you received a defective, damaged, or wrong item, or encountered an exceptional delivery issue, our support team will manually review your case.',
+                [
+                    { label: 'Contact Support', action: 'contact_support', primary: true },
+                    { label: 'Damaged or Wrong Item', action: 'support_damaged_wrong' },
+                    { label: 'Check Another Order', action: 'file_return' },
+                    { label: 'Menu', action: 'main_menu' }
+                ]
+            );
+            flowState = 'idle';
+        })
+        .catch(function () {
+            hideTyping();
+            addBotMessage(
+                'Unable to verify eligibility automatically. You can visit the return portal directly to submit your request.',
+                [
+                    { label: 'Open Return Portal', action: 'open_return_url', primary: true },
+                    { label: 'Exchange Page', action: 'open_exchange_url' },
+                    { label: 'Menu', action: 'main_menu' }
+                ]
+            );
+            flowState = 'idle';
+        });
     }
 
     // ========== FLOW 3: TRACK YOUR REQUEST ==========
@@ -1783,7 +1926,35 @@
                 flowContext.supportTopic = 'Wrong Item Claim';
                 doCreateSupportTicket('[WRONG_ITEM_CLAIM] Order #' + wrId + ': Customer reports wrong product delivered. Advised that an unboxing video is mandatory showing parcel being opened. Eligible for refund to original payment method or free replacement within 2-day delivery window.');
             }
+        } else if (flowState === 'awaiting_return_order_id') {
+            addUserMessage(text);
+            var parsedReturn = parseOrderOrTracking(text);
+            if (parsedReturn) {
+                if (parsedReturn.type === 'phone') {
+                    doSearchOrdersByPhone(parsedReturn.id, 'return_eligibility');
+                } else {
+                    doCheckReturnEligibility(parsedReturn.id);
+                }
+            } else {
+                doCheckReturnEligibility(text);
+            }
         } else {
+            if (/^(return|exchange|file\s*(a\s*)?return|want\s*to\s*return|how\s*to\s*return)\b/i.test(text.trim())) {
+                addUserMessage(text);
+                var parsedRetDirect = parseOrderOrTracking(text);
+                if (parsedRetDirect) {
+                    if (parsedRetDirect.type === 'phone') {
+                        doSearchOrdersByPhone(parsedRetDirect.id, 'return_eligibility');
+                    } else if (parsedRetDirect.type === 'order') {
+                        doCheckReturnEligibility(parsedRetDirect.id);
+                    } else {
+                        startFileReturn();
+                    }
+                } else {
+                    startFileReturn();
+                }
+                return;
+            }
             if (/^(edit\s*request|edit\s*order|change\s*(my\s*)?(size|address|details?)|modify\s*order)\b/i.test(text.trim())) {
                 addUserMessage(text);
                 var parsedEditDirect = parseOrderOrTracking(text);
