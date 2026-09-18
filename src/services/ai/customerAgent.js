@@ -124,7 +124,7 @@ function detectSopScenario(text) {
     }
 
     // 3. COD confusion (paid online, courier asking cash)
-    if (/already\s*paid.*(cash|cod|asking)|paid\s*online.*(cod|cash)|double\s*charge|asking.*cash.*paid/i.test(str)) {
+    if (/already\s*paid.*(cash|cod|asking|money|pay)|paid\s*online.*(cod|cash|money)|double\s*charge|asking.*(cash|money).*paid|(prepaid|paid).*(asking|demanding).*(cash|money|payment|cod)|(delivery\s*(boy|guy|man|person|partner)|courier).*(asking|demanding|wants?).*(money|cash|payment)|why.*(cod|cash).*(paid|prepaid)/i.test(str)) {
         return 'cod_confusion';
     }
 
@@ -260,6 +260,7 @@ OFFCOMFRT 9 STANDARD OPERATING PROCEDURE (SOP) SCENARIOS:
    - ALL other returns (e.g. size exchange, fit, style preference, change of mind) receive STORE CREDIT ONLY.
    - NEVER promise a cash or bank refund for size exchanges or change-of-mind returns.
 
+// Edit Requests (Size / Address / Cancellation before dispatch)
 4. **size_exchange** (Size change / Exchange request):
    - Pre-dispatch: Size changes can be made before shipping. Ask for order number, item name, and desired new size.
    - Post-delivery: Size exchanges are available within 2 days of delivery at offcomfrt.in/pages/return (or offcomfrt.in/pages/exchange).
@@ -280,7 +281,7 @@ OFFCOMFRT 9 STANDARD OPERATING PROCEDURE (SOP) SCENARIOS:
 
 7. **cod_confusion** (Already paid online but courier asking for COD cash):
    - Root cause: An "Edit Details" or address modification converted the order to COD without re-applying the prepaid discount.
-   - Resolution: Reassure the customer. Instruct them to pay the delivery executive at the door; OFFCOMFRT will refund that exact paid amount back to their account separately.
+   - Resolution: Reassure the customer empathetically. Instruct them to accept the package and pay the delivery executive at the door so the shipment is not rejected or returned to origin (RTO); OFFCOMFRT will refund that exact paid amount back (collected cash) to their original payment method or bank account separately upon verification. Offer to create a support ticket tagged [COD_DOUBLE_PAYMENT_REFUND].
 
 8. **cancellation** (Cancel order):
    - Pre-dispatch: Order can be cancelled before shipping.
@@ -433,21 +434,25 @@ function applyRefundGuardrails(reply, userMessage, context) {
     // Check if query is a pre-dispatch cancellation
     const isCancellation = /cancel/i.test(msg) || (context && context.lastScenario === 'cancellation');
 
+    // Check if query is COD confusion / double payment refund (SOP Scenario 7)
+    const isCodConfusion = /already\s*paid.*(cash|cod|asking|money)|paid\s*online.*(cod|cash|money)|double\s*charge|asking.*(cash|money).*paid|(prepaid|paid).*(asking|demanding).*(cash|money|payment|cod)|(delivery\s*(boy|guy|man|person|partner)|courier).*(asking|demanding|wants?).*(money|cash|payment)|cod\s*refund|paid\s*twice/i.test(msg)
+        || (context && context.lastScenario === 'cod_confusion');
+
     // Check if reply promises original payment / bank / cash / card refund
     const promisesCashRefund = /refund(ed)?\s*(to|into|in)?\s*(your|the)?\s*(bank|account|original\s*payment|source|upi|card|mode)/i.test(rep)
         || /credited\s*(back)?\s*to\s*(your|the)?\s*(bank|account|source|card|upi)/i.test(rep)
         || /money\s*back\s*(to|into|in)\s*(your)?\s*(bank|account)/i.test(rep);
 
     // Case 1: Size/fit/preference returns MUST NOT receive bank/original payment refunds
-    if (isSizeOrPreference && !isDamagedOrWrong && !isCancellation) {
+    if (isSizeOrPreference && !isDamagedOrWrong && !isCancellation && !isCodConfusion) {
         if (promisesCashRefund || !/store\s*credit/i.test(rep)) {
             return "As per our return policy, returns for size, fit, or preference are provided as **store credit** only. Original payment method refunds (within 5 to 7 business days) are issued strictly for damaged products, wrong items delivered, or cancellations before dispatch. You can submit your exchange or return request within 2 days of delivery at offcomfrt.in/pages/return.";
         }
     }
 
-    // Case 2: Customer specifically asks for bank/cash refund for general returns (without damage/wrong item)
+    // Case 2: Customer specifically asks for bank/cash refund for general returns (without damage/wrong item/COD issue)
     const asksBankRefund = /bank|cash|original\s*payment|source|account|upi|google\s*pay|phonepe/i.test(msg) && /refund|money/i.test(msg);
-    if (asksBankRefund && !isDamagedOrWrong && !isCancellation) {
+    if (asksBankRefund && !isDamagedOrWrong && !isCancellation && !isCodConfusion) {
         if (!/store\s*credit/i.test(rep) || promisesCashRefund) {
             return "Refunds to the original payment method (within 5 to 7 business days) are provided strictly for damaged products, wrong items delivered, or cancellations before dispatch. All other returns (such as size, fit, or preference) receive **store credit only**. Requests can be submitted within 2 days of delivery at offcomfrt.in/pages/return.";
         }
@@ -599,6 +604,7 @@ async function runCustomerAgent({ sessionId, message, visitorId }) {
         if (/track|order|status|deliver|ship/i.test(message)) context.lastScenario = 'tracking';
         else if (/return|exchange|size/i.test(message)) context.lastScenario = 'return_exchange';
         else if (/cancel/i.test(message)) context.lastScenario = 'cancellation';
+        else if (/already\s*paid.*(cash|cod)|paid\s*online.*(cod|cash)|courier.*asking.*(cash|money)|delivery.*asking.*(cash|money)/i.test(message)) context.lastScenario = 'cod_confusion';
         else if (/refund|money back/i.test(message)) context.lastScenario = 'refund';
     }
 

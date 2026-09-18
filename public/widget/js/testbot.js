@@ -497,6 +497,42 @@
             ]);
             flowState = 'idle'; return;
         }
+        if (action === 'support_cod_confusion') {
+            addUserMessage('Paid Online but Asking COD');
+            flowContext.supportTopic = 'COD Confusion';
+            var ordStr = flowContext.orderId ? ' for Order *#' + flowContext.orderId + '*' : '';
+            addBotMessage(
+                "We completely understand how frustrating this is" + ordStr + "!\n\n" +
+                "**Why this happened:**\n" +
+                "If order details (such as size or delivery address) were updated or recalculated in our system after placement, the courier partner may occasionally receive the parcel flagged as Cash on Delivery without the prepaid discount applied.\n\n" +
+                "**SOP Resolution & What to do:**\n" +
+                "1. **Please accept the package and pay the delivery executive at your doorstep.** This ensures the courier does not mark your shipment as rejected or initiate a Return to Origin (RTO).\n" +
+                "2. **We will refund the exact cash collected** directly back to your original payment method or bank account once verified.\n\n" +
+                "Would you like us to log a priority COD refund request for you?",
+                [
+                    { label: 'Request COD Refund', action: 'raise_cod_refund_ticket', primary: true },
+                    { label: 'Contact Support', action: 'contact_support' },
+                    { label: 'Menu', action: 'main_menu' }
+                ]
+            );
+            return;
+        }
+        if (action === 'raise_cod_refund_ticket') {
+            addUserMessage('Request COD Refund');
+            flowContext.supportTopic = 'COD Double Payment Refund';
+            if (flowContext.orderId) {
+                doCreateSupportTicket(
+                    '[COD_DOUBLE_PAYMENT_REFUND] Customer paid online but courier demanded cash at delivery. Advised to pay to prevent RTO. Please verify payment proof and refund collected cash amount to original payment method/bank account for Order #' + flowContext.orderId + '.'
+                );
+            } else {
+                flowState = 'awaiting_cod_order_id';
+                setInputMode('order');
+                addBotMessage('Please enter your *order number* or registered *mobile number* so we can create your COD refund ticket:', [
+                    { label: 'Back to Menu', action: 'main_menu' }
+                ]);
+            }
+            return;
+        }
         if (action && action.indexOf('support_') === 0) {
             var topic = action.replace('support_', '').replace(/_/g, ' ');
             flowContext.supportTopic = topic;
@@ -518,11 +554,18 @@
                 flowState = 'awaiting_support_topic';
                 setInputMode('text');
                 addBotMessage('Got it — Order *#' + selectedOrderId + '*. What do you need help with?', [
+                    { label: 'Paid Online but Asking COD', action: 'support_cod_confusion', primary: true },
                     { label: 'Order Issue', action: 'support_order_issue' },
                     { label: 'Product Question', action: 'support_product' },
                     { label: 'Delivery Problem', action: 'support_delivery' },
                     { label: 'Other', action: 'support_other' }
                 ]);
+            } else if (selectedIntent === 'cod_refund') {
+                flowContext.orderId = selectedOrderId;
+                flowContext.supportTopic = 'COD Double Payment Refund';
+                doCreateSupportTicket(
+                    '[COD_DOUBLE_PAYMENT_REFUND] Customer paid online but courier demanded cash at delivery. Advised to pay to prevent RTO. Please verify payment proof and refund collected cash amount to original payment method/bank account for Order #' + selectedOrderId + '.'
+                );
             } else {
                 doTrackOrder(selectedOrderId);
             }
@@ -761,7 +804,7 @@
                     'No recent orders found for mobile number ending in *' + last4 + '*.\n\n' +
                     'Please verify your number or enter your 4-6 digit *order number* directly.',
                     [
-                        { label: 'Try Again', action: intent === 'edit' ? 'edit_request' : 'track_order', primary: true },
+                        { label: 'Try Again', action: intent === 'edit' ? 'edit_request' : (intent === 'cod_refund' ? 'raise_cod_refund_ticket' : 'track_order'), primary: true },
                         { label: 'Contact Support', action: 'contact_support' },
                         { label: 'Menu', action: 'main_menu' }
                     ]
@@ -782,11 +825,18 @@
                     flowState = 'awaiting_support_topic';
                     setInputMode('text');
                     addBotMessage('Found Order *#' + singleId + '*. What do you need help with?', [
+                        { label: 'Paid Online but Asking COD', action: 'support_cod_confusion', primary: true },
                         { label: 'Order Issue', action: 'support_order_issue' },
                         { label: 'Product Question', action: 'support_product' },
                         { label: 'Delivery Problem', action: 'support_delivery' },
                         { label: 'Other', action: 'support_other' }
                     ]);
+                } else if (intent === 'cod_refund') {
+                    flowContext.orderId = singleId;
+                    flowContext.supportTopic = 'COD Double Payment Refund';
+                    doCreateSupportTicket(
+                        '[COD_DOUBLE_PAYMENT_REFUND] Customer paid online but courier demanded cash at delivery. Advised to pay to prevent RTO. Please verify payment proof and refund collected cash amount to original payment method/bank account for Order #' + singleId + '.'
+                    );
                 } else {
                     addBotMessage('Found Order *#' + singleId + '* (' + escapeHtml(single.status) + '). Fetching tracking details...');
                     doTrackOrder(singleId);
@@ -803,8 +853,13 @@
             });
             buttons.push({ label: 'Menu', action: 'main_menu' });
 
+            var intentLabel = 'track';
+            if (intent === 'edit') intentLabel = 'modify';
+            else if (intent === 'cod_refund') intentLabel = 'request COD refund for';
+            else if (intent === 'ticket') intentLabel = 'get support for';
+
             addBotMessage(
-                'Found ' + data.orders.length + ' orders for mobile ending in *' + String(phone).slice(-4) + '*.\n\nPlease select which order you want to ' + (intent === 'edit' ? 'modify' : 'track') + ':',
+                'Found ' + data.orders.length + ' orders for mobile ending in *' + String(phone).slice(-4) + '*.\n\nPlease select which order you want to ' + intentLabel + ':',
                 buttons
             );
             flowState = 'awaiting_order_selection';
@@ -812,7 +867,7 @@
         .catch(function () {
             hideTyping();
             addBotMessage('Unable to look up orders by phone right now. Please enter your *order number* directly.', [
-                { label: 'Try Order Number', action: intent === 'edit' ? 'edit_request' : 'track_order', primary: true },
+                { label: 'Try Order Number', action: intent === 'edit' ? 'edit_request' : (intent === 'cod_refund' ? 'raise_cod_refund_ticket' : 'track_order'), primary: true },
                 { label: 'Menu', action: 'main_menu' }
             ]);
             flowState = 'idle';
@@ -1172,7 +1227,9 @@
         flowContext = {};
         flowContext.aiAttempts = 0;
         setInputMode('order');
-        addBotMessage('Please enter your *order number* so we can pull up your details.', [
+        addBotMessage('Please enter your *order number* or registered *mobile number* so we can pull up your details.\n\nOr select an urgent topic below:', [
+            { label: 'Paid Online but Asking COD', action: 'support_cod_confusion', primary: true },
+            { label: 'Order Issue', action: 'support_order_issue' },
             { label: 'Back to Menu', action: 'main_menu' }
         ]);
     }
@@ -1482,6 +1539,7 @@
                     setInputMode('text');
                     var greeting = flowContext.customerName ? 'Thanks, ' + flowContext.customerName + '. ' : 'Got it. ';
                     addBotMessage(greeting + 'Order *#' + cleaned + '*. What do you need help with?', [
+                        { label: 'Paid Online but Asking COD', action: 'support_cod_confusion', primary: true },
                         { label: 'Order Issue', action: 'support_order_issue' },
                         { label: 'Product Question', action: 'support_product' },
                         { label: 'Delivery Problem', action: 'support_delivery' },
@@ -1494,6 +1552,7 @@
                     flowState = 'awaiting_support_topic';
                     setInputMode('text');
                     addBotMessage('Got it — Order *#' + cleaned + '*. What do you need help with?', [
+                        { label: 'Paid Online but Asking COD', action: 'support_cod_confusion', primary: true },
                         { label: 'Order Issue', action: 'support_order_issue' },
                         { label: 'Product Question', action: 'support_product' },
                         { label: 'Delivery Problem', action: 'support_delivery' },
@@ -1560,6 +1619,19 @@
         } else if (flowState === 'awaiting_ticket_message') {
             addUserMessage(text);
             doCreateSupportTicket(text);
+        } else if (flowState === 'awaiting_cod_order_id') {
+            addUserMessage(text);
+            var parsedCod = parseOrderOrTracking(text);
+            if (parsedCod && parsedCod.type === 'phone') {
+                doSearchOrdersByPhone(parsedCod.id, 'cod_refund');
+            } else {
+                var codOrderId = parsedCod ? parsedCod.id : text.trim().replace(/^#/, '');
+                flowContext.orderId = codOrderId;
+                flowContext.supportTopic = 'COD Double Payment Refund';
+                doCreateSupportTicket(
+                    '[COD_DOUBLE_PAYMENT_REFUND] Customer paid online but courier demanded cash at delivery. Advised to pay to prevent RTO. Please verify payment proof and refund collected cash amount to original payment method/bank account for Order #' + codOrderId + '.'
+                );
+            }
         } else {
             if (/^(edit\s*request|edit\s*order|change\s*(my\s*)?(size|address|details?)|modify\s*order)\b/i.test(text.trim())) {
                 addUserMessage(text);
