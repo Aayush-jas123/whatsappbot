@@ -167,6 +167,9 @@ const caches = {
   
   // Support tickets (expensive portal_id filter, cache to reduce query frequency)
   tickets: new LRUCache(50, 30 * 1000),         // 50 entries, 30s TTL
+  
+  // Inventory movements (expensive JSONB scans on store_shoppers, cache to reduce load)
+  inventory: new LRUCache(20, 120 * 1000),      // 20 entries, 2min TTL
 };
 
 // Cache key generator for queries

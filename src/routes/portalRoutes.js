@@ -5,6 +5,7 @@ const jwt = require('jsonwebtoken');
 const multer = require('multer');
 const whatsappService = require('../services/whatsappService');
 const { dbAdapter } = require('../database/db');
+const { caches } = require('../utils/cache');
 
 // Multer config: disk storage (avoids holding files in RAM)
 const upload = multer({
@@ -108,43 +109,47 @@ function timeRangeSqlClause(config, col = 'created_at') {
         : `(${mins} >= ${start} OR ${mins} < ${end})`;
 }
 
-// Helper to get portal tickets
+// Helper to get portal tickets (cached for 30s to reduce query frequency)
 async function getPortalTickets(portalId, portalType, portalConfig, status, channel) {
-    let baseWhere = '';
-    const params = [portalId];
+    const cacheKey = `portal_tickets_full:${portalId}:${status || 'all'}:${channel || 'all'}`;
+    
+    return await caches.tickets.getOrLoad(cacheKey, async () => {
+        let baseWhere = '';
+        const params = [portalId];
 
-    if (portalType === 'time_based') {
-        const config = portalConfig
-            ? (typeof portalConfig === 'string' ? JSON.parse(portalConfig) : portalConfig)
-            : {};
-        const rangeClause = timeRangeSqlClause(config);
-        if (rangeClause) {
-            baseWhere = `(portal_id = ? OR (portal_id IS NULL AND ${rangeClause}))`;
+        if (portalType === 'time_based') {
+            const config = portalConfig
+                ? (typeof portalConfig === 'string' ? JSON.parse(portalConfig) : portalConfig)
+                : {};
+            const rangeClause = timeRangeSqlClause(config);
+            if (rangeClause) {
+                baseWhere = `(portal_id = ? OR (portal_id IS NULL AND ${rangeClause}))`;
+            } else {
+                baseWhere = 'portal_id = ?';
+            }
         } else {
             baseWhere = 'portal_id = ?';
         }
-    } else {
-        baseWhere = 'portal_id = ?';
-    }
 
-    const conditions = [baseWhere];
-    if (status) {
-        conditions.push('status = ?');
-        params.push(status);
-    }
-    if (channel) {
-        conditions.push("(channel = ? OR (channel IS NULL AND ? = 'whatsapp'))");
-        params.push(channel, channel);
-    }
+        const conditions = [baseWhere];
+        if (status) {
+            conditions.push('status = ?');
+            params.push(status);
+        }
+        if (channel) {
+            conditions.push("(channel = ? OR (channel IS NULL AND ? = 'whatsapp'))");
+            params.push(channel, channel);
+        }
 
-    const whereSql = conditions.join(' AND ');
-    // Prioritize tickets explicitly assigned to this portal first, then newest
-    return await dbAdapter.query(
-        `SELECT * FROM support_tickets
-         WHERE ${whereSql}
-         ORDER BY (CASE WHEN portal_id = ? THEN 0 ELSE 1 END), created_at DESC LIMIT 200`,
-        [...params, portalId]
-    );
+        const whereSql = conditions.join(' AND ');
+        // Prioritize tickets explicitly assigned to this portal first, then newest
+        return await dbAdapter.query(
+            `SELECT * FROM support_tickets
+             WHERE ${whereSql}
+             ORDER BY (CASE WHEN portal_id = ? THEN 0 ELSE 1 END), created_at DESC LIMIT 200`,
+            [...params, portalId]
+        );
+    }, 30000); // 30 second TTL
 }
 
 // Helper to verify a phone belongs to the portal
@@ -353,12 +358,16 @@ router.get('/:slug/chat/:phone', verifyPortalToken, async (req, res) => {
                 `UPDATE support_tickets SET is_read = true WHERE ig_user_id = ? AND is_read = false`,
                 [phone]
             );
+            // Invalidate portal ticket cache
+            caches.tickets.keys().filter(k => k.startsWith('portal_tickets_full:')).forEach(k => caches.tickets.delete(k));
         } else {
             const cleanPhone = phone.replace(/\D/g, '');
             await dbAdapter.query(
                 `UPDATE support_tickets SET is_read = true WHERE customer_phone IN (?, ?, ?, ?) AND is_read = false`,
                 [cleanPhone, `+${cleanPhone}`, `91${cleanPhone}`, `+91${cleanPhone}`]
             );
+            // Invalidate portal ticket cache
+            caches.tickets.keys().filter(k => k.startsWith('portal_tickets_full:')).forEach(k => caches.tickets.delete(k));
         }
 
         res.json({
@@ -576,6 +585,9 @@ router.put('/:slug/tickets/:id', verifyPortalToken, async (req, res) => {
             updateParams
         );
 
+        // Invalidate portal ticket cache
+        caches.tickets.keys().filter(k => k.startsWith('portal_tickets_full:')).forEach(k => caches.tickets.delete(k));
+
         // Keep the portal's assigned_count in sync (open + follow-up = active work)
         const countResult = await dbAdapter.query(
             `SELECT COUNT(*) as count FROM support_tickets WHERE portal_id = ? AND status IN ('open', 'follow_up')`,
@@ -647,6 +659,9 @@ router.patch('/:slug/tickets/:id/mark-read', verifyPortalToken, async (req, res)
             `UPDATE support_tickets SET is_read = true WHERE id = ?`,
             [id]
         );
+
+        // Invalidate portal ticket cache
+        caches.tickets.keys().filter(k => k.startsWith('portal_tickets_full:')).forEach(k => caches.tickets.delete(k));
 
         res.json({ success: true, message: 'Ticket marked as read' });
     } catch (error) {

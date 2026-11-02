@@ -8554,30 +8554,35 @@ router.get('/inventory/movements', verifyToken, async (req, res) => {
         const fromIso = fromDate.toISOString();
         const toEndIso = new Date(toDate.getFullYear(), toDate.getMonth(), toDate.getDate(), 23, 59, 59, 999).toISOString();
 
-        const { extractItemSize } = require('../utils/orderItems');
-        const shopifyService = require('../services/shopifyService');
-        const catalog = await shopifyService.getProductCatalog(false);
+        // Cache key based on date range
+        const cacheKey = `movements:${fromIso}:${toEndIso}`;
+        const { caches } = require('../utils/cache');
+        
+        const cachedResult = await caches.inventory.getOrLoad(cacheKey, async () => {
+            const { extractItemSize } = require('../utils/orderItems');
+            const shopifyService = require('../services/shopifyService');
+            const catalog = await shopifyService.getProductCatalog(false);
 
-        // Build variant resolution indexes (same logic as /inventory endpoint)
-        const norm = (s) => String(s || '').toLowerCase().replace(/[^a-z0-9]+/g, ' ').trim();
-        const skuIndex = new Map();
-        const titleIndex = new Map();
-        const variantById = new Map();
-        for (const p of catalog) {
-            titleIndex.set(norm(p.title), p);
-            for (const v of (p.variants || [])) {
-                if (v.sku) skuIndex.set(norm(v.sku), { p, v });
-                variantById.set(String(v.id), { p, v });
+            // Build variant resolution indexes (same logic as /inventory endpoint)
+            const norm = (s) => String(s || '').toLowerCase().replace(/[^a-z0-9]+/g, ' ').trim();
+            const skuIndex = new Map();
+            const titleIndex = new Map();
+            const variantById = new Map();
+            for (const p of catalog) {
+                titleIndex.set(norm(p.title), p);
+                for (const v of (p.variants || [])) {
+                    if (v.sku) skuIndex.set(norm(v.sku), { p, v });
+                    variantById.set(String(v.id), { p, v });
+                }
             }
-        }
-        // Human-confirmed alias mappings (see /inventory endpoint)
-        let aliasIndex = new Map();
-        try {
-            const aliasRows = await dbAdapter.query(`SELECT raw_name, raw_size, variant_id FROM inventory_name_aliases`);
-            for (const a of aliasRows) {
-                aliasIndex.set(`${norm(a.raw_name)}|${norm(a.raw_size)}`, String(a.variant_id));
-            }
-        } catch (_) { /* table not migrated yet */ }
+            // Human-confirmed alias mappings (see /inventory endpoint)
+            let aliasIndex = new Map();
+            try {
+                const aliasRows = await dbAdapter.query(`SELECT raw_name, raw_size, variant_id FROM inventory_name_aliases`);
+                for (const a of aliasRows) {
+                    aliasIndex.set(`${norm(a.raw_name)}|${norm(a.raw_size)}`, String(a.variant_id));
+                }
+            } catch (_) { /* table not migrated yet */ }
         const resolveItem = (item) => {
             if (!item || typeof item !== 'object') return null;
 
@@ -8825,13 +8830,18 @@ router.get('/inventory/movements', verifyToken, async (req, res) => {
 
         const totals = result.reduce((acc, m) => ({ in: acc.in + m.qty_in, out: acc.out + m.qty_out }), { in: 0, out: 0 });
 
-        res.json({
-            success: true,
+        return {
             from: fromDate.toISOString().slice(0, 10),
             to: toDate.toISOString().slice(0, 10),
             movements: result,
             totals,
             sku_count: result.length
+        };
+        }, 120000); // 2 minute TTL
+        
+        res.json({
+            success: true,
+            ...cachedResult
         });
     } catch (error) {
         console.error('Inventory movements error:', error);
