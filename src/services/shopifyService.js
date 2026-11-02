@@ -2,6 +2,66 @@ const crypto = require('crypto');
 const axios = require('axios');
 
 class ShopifyService {
+    constructor() {
+        // Rate limiter state — Shopify allows 2 calls/second for most endpoints
+        this._rateLimiter = {
+            lastCallTime: 0,
+            minDelayMs: 550, // ~1.8 calls/sec to stay safely under the 2/sec limit
+            queue: Promise.resolve()
+        };
+    }
+
+    /**
+     * Rate-limited axios request wrapper. Enforces minimum delay between calls
+     * and retries automatically on 429 with exponential backoff.
+     */
+    async _rateLimitedRequest(requestFn, maxRetries = 3) {
+        // Chain requests sequentially to enforce rate limit
+        const previousCall = this._rateLimiter.queue;
+        
+        let resolveQueue;
+        this._rateLimiter.queue = new Promise(resolve => resolveQueue = resolve);
+        
+        await previousCall;
+        
+        try {
+            const now = Date.now();
+            const timeSinceLastCall = now - this._rateLimiter.lastCallTime;
+            const delayNeeded = Math.max(0, this._rateLimiter.minDelayMs - timeSinceLastCall);
+            
+            if (delayNeeded > 0) {
+                await new Promise(resolve => setTimeout(resolve, delayNeeded));
+            }
+            
+            this._rateLimiter.lastCallTime = Date.now();
+            
+            // Attempt the request with retry logic for 429s
+            for (let attempt = 0; attempt <= maxRetries; attempt++) {
+                try {
+                    const response = await requestFn();
+                    return response;
+                } catch (error) {
+                    if (error.response?.status === 429 && attempt < maxRetries) {
+                        // Respect Retry-After header or use exponential backoff
+                        const retryAfter = error.response.headers['retry-after'];
+                        const backoffMs = retryAfter 
+                            ? parseFloat(retryAfter) * 1000 
+                            : Math.min(1000 * Math.pow(2, attempt), 5000);
+                        
+                        console.warn(`⏳ Shopify rate limit hit, retrying in ${backoffMs}ms (attempt ${attempt + 1}/${maxRetries})`);
+                        await new Promise(resolve => setTimeout(resolve, backoffMs));
+                        
+                        // Update rate limiter state
+                        this._rateLimiter.lastCallTime = Date.now();
+                        continue;
+                    }
+                    throw error;
+                }
+            }
+        } finally {
+            resolveQueue();
+        }
+    }
     // Verify webhook signature
     verifyWebhook(data, hmacHeader) {
         if (!process.env.SHOPIFY_WEBHOOK_SECRET) {
@@ -839,9 +899,11 @@ class ShopifyService {
 
             // Re-ship: an existing fulfillment may carry the old AWB — update
             // its tracking instead of creating a duplicate fulfillment
-            const fulfillments = await axios.get(`${cfg.base}/orders/${order.id}/fulfillments.json`, {
-                headers: cfg.headers, timeout: 15000
-            });
+            const fulfillments = await this._rateLimitedRequest(() => 
+                axios.get(`${cfg.base}/orders/${order.id}/fulfillments.json`, {
+                    headers: cfg.headers, timeout: 15000
+                })
+            );
             const active = (fulfillments.data?.fulfillments || []).find(f =>
                 !['cancelled', 'failure'].includes(f.status)
             );
@@ -853,9 +915,11 @@ class ShopifyService {
                     return result;
                 }
                 try {
-                    await axios.put(`${cfg.base}/orders/${order.id}/fulfillments/${active.id}/tracking.json`,
-                        { tracking: { number: awb, company: trackingCompany, url: trackingUrl || undefined, notify_customer: false } },
-                        { headers: cfg.headers, timeout: 15000 });
+                    await this._rateLimitedRequest(() =>
+                        axios.put(`${cfg.base}/orders/${order.id}/fulfillments/${active.id}/tracking.json`,
+                            { tracking: { number: awb, company: trackingCompany, url: trackingUrl || undefined, notify_customer: false } },
+                            { headers: cfg.headers, timeout: 15000 })
+                    );
                     result.success = true;
                     result.action = `Updated Shopify fulfillment ${active.id} tracking to AWB ${awb}`;
                     return result;
@@ -873,15 +937,17 @@ class ShopifyService {
             // then answers 406, so fall back to the FulfillmentOrders flow.
             const lineItems = (order.line_items || []).map(li => ({ id: li.id, quantity: li.quantity }));
             try {
-                await axios.post(`${cfg.base}/orders/${order.id}/fulfillments.json`, {
-                    fulfillment: {
-                        tracking_number: awb,
-                        tracking_company: trackingCompany,
-                        tracking_urls: trackingUrl ? [trackingUrl] : [],
-                        notify_customer: Boolean(notifyCustomer),
-                        ...(lineItems.length ? { line_items: lineItems } : {})
-                    }
-                }, { headers: cfg.headers, timeout: 20000 });
+                await this._rateLimitedRequest(() =>
+                    axios.post(`${cfg.base}/orders/${order.id}/fulfillments.json`, {
+                        fulfillment: {
+                            tracking_number: awb,
+                            tracking_company: trackingCompany,
+                            tracking_urls: trackingUrl ? [trackingUrl] : [],
+                            notify_customer: Boolean(notifyCustomer),
+                            ...(lineItems.length ? { line_items: lineItems } : {})
+                        }
+                    }, { headers: cfg.headers, timeout: 20000 })
+                );
             } catch (legacyError) {
                 if (legacyError.response?.status !== 406) throw legacyError;
                 await this._fulfillViaFulfillmentOrders(cfg, order, {
@@ -908,9 +974,11 @@ class ShopifyService {
     async _fulfillViaFulfillmentOrders(cfg, order, { awb, trackingCompany, trackingUrl, notifyCustomer, result }) {
         let fulfillmentOrders;
         try {
-            const foRes = await axios.get(`${cfg.base}/orders/${order.id}/fulfillment_orders.json`, {
-                headers: cfg.headers, timeout: 15000
-            });
+            const foRes = await this._rateLimitedRequest(() =>
+                axios.get(`${cfg.base}/orders/${order.id}/fulfillment_orders.json`, {
+                    headers: cfg.headers, timeout: 15000
+                })
+            );
             fulfillmentOrders = foRes.data?.fulfillment_orders || [];
         } catch (error) {
             if (error.response?.status === 403) {
@@ -930,17 +998,19 @@ class ShopifyService {
             return;
         }
 
-        await axios.post(`${cfg.base}/fulfillments.json`, {
-            fulfillment: {
-                line_items_by_fulfillment_order: open.map(fo => ({ fulfillment_order_id: fo.id })),
-                tracking_info: {
-                    number: awb,
-                    company: trackingCompany,
-                    ...(trackingUrl ? { url: trackingUrl } : {})
-                },
-                notify_customer: Boolean(notifyCustomer)
-            }
-        }, { headers: cfg.headers, timeout: 20000 });
+        await this._rateLimitedRequest(() =>
+            axios.post(`${cfg.base}/fulfillments.json`, {
+                fulfillment: {
+                    line_items_by_fulfillment_order: open.map(fo => ({ fulfillment_order_id: fo.id })),
+                    tracking_info: {
+                        number: awb,
+                        company: trackingCompany,
+                        ...(trackingUrl ? { url: trackingUrl } : {})
+                    },
+                    notify_customer: Boolean(notifyCustomer)
+                }
+            }, { headers: cfg.headers, timeout: 20000 })
+        );
 
         result.success = true;
         result.action = `Marked Shopify order ${order.name || order.id} fulfilled with AWB ${awb} (FulfillmentOrders)`;
@@ -952,9 +1022,11 @@ class ShopifyService {
     async _updateTrackingViaFulfillmentOrders(cfg, order, { awb, trackingCompany, trackingUrl, result }) {
         let fulfillmentOrders;
         try {
-            const foRes = await axios.get(`${cfg.base}/orders/${order.id}/fulfillment_orders.json`, {
-                headers: cfg.headers, timeout: 15000
-            });
+            const foRes = await this._rateLimitedRequest(() =>
+                axios.get(`${cfg.base}/orders/${order.id}/fulfillment_orders.json`, {
+                    headers: cfg.headers, timeout: 15000
+                })
+            );
             fulfillmentOrders = foRes.data?.fulfillment_orders || [];
         } catch (error) {
             if (error.response?.status === 403) {
@@ -981,9 +1053,11 @@ class ShopifyService {
                 (a.status === 'pending' ? 0 : 1) - (b.status === 'pending' ? 0 : 1));
             for (const fo of ranked) {
                 try {
-                    const foRes = await axios.get(`${cfg.base}/fulfillment_orders/${fo.id}/fulfillments.json`, {
-                        headers: cfg.headers, timeout: 15000
-                    });
+                    const foRes = await this._rateLimitedRequest(() =>
+                        axios.get(`${cfg.base}/fulfillment_orders/${fo.id}/fulfillments.json`, {
+                            headers: cfg.headers, timeout: 15000
+                        })
+                    );
                     const live = (foRes.data?.fulfillments || []).find(f => !/cancel/i.test(String(f.status || '')));
                     if (live?.id) { target = live; break; }
                 } catch (error) {
@@ -996,15 +1070,17 @@ class ShopifyService {
             return;
         }
 
-        await axios.post(`${cfg.base}/fulfillments/${target.id}/update_tracking.json`, {
-            fulfillment: {
-                tracking_info: {
-                    number: awb,
-                    company: trackingCompany,
-                    ...(trackingUrl ? { url: trackingUrl } : {})
+        await this._rateLimitedRequest(() =>
+            axios.post(`${cfg.base}/fulfillments/${target.id}/update_tracking.json`, {
+                fulfillment: {
+                    tracking_info: {
+                        number: awb,
+                        company: trackingCompany,
+                        ...(trackingUrl ? { url: trackingUrl } : {})
+                    }
                 }
-            }
-        }, { headers: cfg.headers, timeout: 20000 });
+            }, { headers: cfg.headers, timeout: 20000 })
+        );
 
         result.success = true;
         result.action = `Updated Shopify fulfillment ${target.id} tracking to AWB ${awb} (FulfillmentOrders)`;
