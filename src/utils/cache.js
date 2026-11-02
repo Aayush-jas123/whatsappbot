@@ -164,6 +164,9 @@ const caches = {
   // Inbox unread conversations (expensive DISTINCT ON scan, own namespace so
   // confirming an order — which clears 'shoppers' — does not wipe it)
   unread: new LRUCache(40, 90 * 1000),          // 40 entries, 90s TTL
+  
+  // Support tickets (expensive portal_id filter, cache to reduce query frequency)
+  tickets: new LRUCache(50, 30 * 1000),         // 50 entries, 30s TTL
 };
 
 // Cache key generator for queries

@@ -734,32 +734,55 @@ router.post('/track-request', async (req, res) => {
 // ---------- GET /api/widget/poll ----------
 // Widget polls this to check for admin override messages since a given message ID.
 // Returns any new messages (admin or otherwise) the widget hasn't seen yet.
+// Supports long polling: if no new messages, waits up to `timeout` ms (default 25s)
+// before returning empty array. Reduces query frequency by 5×.
 
 router.get('/poll', async (req, res) => {
     try {
-        const { sessionId, afterId } = req.query;
+        const { sessionId, afterId, timeout = 25000 } = req.query;
         if (!sessionId) {
             return res.status(400).json({ error: 'sessionId is required' });
         }
 
         const { dbAdapter } = require('../database/db');
-        let query = 'SELECT id, sender, content, created_at FROM widget_chats WHERE session_id = $1';
-        const params = [sessionId];
+        const pollTimeout = Math.min(parseInt(timeout) || 25000, 30000); // Cap at 30s
+        const pollInterval = 2000; // Check every 2 seconds
+        const startTime = Date.now();
+        let messages = [];
+        let adminActive = false;
 
-        if (afterId) {
-            query += ' AND id > $2';
-            params.push(parseInt(afterId) || 0);
+        // Long polling: wait up to `pollTimeout` ms for new messages
+        while (Date.now() - startTime < pollTimeout) {
+            let query = 'SELECT id, sender, content, created_at FROM widget_chats WHERE session_id = $1';
+            const params = [sessionId];
+
+            if (afterId) {
+                query += ' AND id > $2';
+                params.push(parseInt(afterId) || 0);
+            }
+            query += ' ORDER BY created_at ASC LIMIT 20';
+
+            messages = await dbAdapter.query(query, params);
+
+            // Also check if admin is active on this session
+            const sessRows = await dbAdapter.query(
+                'SELECT admin_active FROM widget_chat_sessions WHERE session_id = $1',
+                [sessionId]
+            );
+            adminActive = sessRows?.[0]?.admin_active || false;
+
+            // If we have new messages or admin status changed, return immediately
+            if ((messages && messages.length > 0) || adminActive) {
+                break;
+            }
+
+            // Wait before next poll (but don't exceed timeout)
+            const elapsed = Date.now() - startTime;
+            if (elapsed + pollInterval >= pollTimeout) {
+                break; // Would exceed timeout, exit now
+            }
+            await new Promise(resolve => setTimeout(resolve, pollInterval));
         }
-        query += ' ORDER BY created_at ASC LIMIT 20';
-
-        const messages = await dbAdapter.query(query, params);
-
-        // Also check if admin is active on this session
-        const sessRows = await dbAdapter.query(
-            'SELECT admin_active FROM widget_chat_sessions WHERE session_id = $1',
-            [sessionId]
-        );
-        const adminActive = sessRows?.[0]?.admin_active || false;
 
         res.json({ messages: messages || [], adminActive });
     } catch (error) {

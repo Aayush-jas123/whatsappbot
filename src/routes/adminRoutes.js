@@ -2048,6 +2048,9 @@ router.put('/support-tickets/:id', verifyToken, async (req, res) => {
             params
         );
         
+        // Invalidate ticket cache when ticket is updated
+        clearAllCaches('tickets');
+        
         // If status changed, update the portal's assigned_count.
         // Follow-up tickets are still active work — they count as assigned.
         if (status) {
@@ -2146,6 +2149,9 @@ router.post('/support-tickets/:id/assign-portal', verifyToken, async (req, res) 
             `UPDATE support_tickets SET portal_id = ? WHERE id = ?`,
             [portalId || null, id]
         );
+        
+        // Invalidate ticket cache when portal assignment changes
+        clearAllCaches('tickets');
 
         // Update assigned_count for affected portals
         const affected = new Set();
@@ -4879,6 +4885,9 @@ router.post('/support-portals/:id/assign', verifyToken, async (req, res) => {
             `UPDATE support_tickets SET portal_id = ? WHERE id IN (${placeholders})`,
             [id, ...ticketIds]
         );
+        
+        // Invalidate ticket cache when bulk assignments change
+        clearAllCaches('tickets');
 
         // Update assigned_count for the portal
         const countResult = await dbAdapter.query(
@@ -4908,6 +4917,9 @@ router.post('/support-portals/:id/clear', verifyToken, async (req, res) => {
             'UPDATE support_tickets SET portal_id = NULL WHERE portal_id = ?',
             [id]
         );
+        
+        // Invalidate ticket cache when assignments are cleared
+        clearAllCaches('tickets');
 
         invalidateCache('stats');
         res.json({ success: true, message: 'All tickets cleared from portal' });
@@ -4922,31 +4934,36 @@ router.post('/support-portals/:id/clear', verifyToken, async (req, res) => {
 // see BOTH their explicitly-assigned tickets AND unassigned tickets in their time window.
 async function getPortalTicketRows(portal, onlyOpen = true) {
     const statusClause = onlyOpen ? " AND status = 'open'" : "";
-    if (portal.type === 'time_based') {
-        const config = portal.config
-            ? (typeof portal.config === 'string' ? JSON.parse(portal.config) : portal.config)
-            : {};
-        const rangeClause = timeRangeSqlClause(config);
-        if (!rangeClause) {
-            // No time window — fall back to explicitly-assigned only
+    const cacheKey = `portal_tickets:${portal.id}:${onlyOpen ? 'open' : 'all'}`;
+    
+    // Cache for 30 seconds to reduce query frequency during dashboard polling
+    return await caches.tickets.getOrLoad(cacheKey, async () => {
+        if (portal.type === 'time_based') {
+            const config = portal.config
+                ? (typeof portal.config === 'string' ? JSON.parse(portal.config) : portal.config)
+                : {};
+            const rangeClause = timeRangeSqlClause(config);
+            if (!rangeClause) {
+                // No time window — fall back to explicitly-assigned only
+                return await dbAdapter.query(
+                    `SELECT id, created_at, status, portal_id FROM support_tickets WHERE portal_id = ?${statusClause} ORDER BY created_at DESC LIMIT 1000`,
+                    [portal.id]
+                );
+            }
+            // Show BOTH: explicitly-assigned tickets (round-robin / split / transfer)
+            // AND unassigned tickets whose created_at falls in the portal's time window.
             return await dbAdapter.query(
-                `SELECT id, created_at, status, portal_id FROM support_tickets WHERE portal_id = ?${statusClause} ORDER BY created_at DESC LIMIT 1000`,
+                `SELECT id, created_at, status, portal_id FROM support_tickets
+                 WHERE (portal_id = ? OR (portal_id IS NULL AND (${rangeClause})))${statusClause}
+                 ORDER BY created_at DESC LIMIT 1000`,
                 [portal.id]
             );
         }
-        // Show BOTH: explicitly-assigned tickets (round-robin / split / transfer)
-        // AND unassigned tickets whose created_at falls in the portal's time window.
         return await dbAdapter.query(
-            `SELECT id, created_at, status, portal_id FROM support_tickets
-             WHERE (portal_id = ? OR (portal_id IS NULL AND (${rangeClause})))${statusClause}
-             ORDER BY created_at DESC LIMIT 1000`,
+            `SELECT id, created_at, status, portal_id FROM support_tickets WHERE portal_id = ?${statusClause} ORDER BY created_at DESC LIMIT 1000`,
             [portal.id]
         );
-    }
-    return await dbAdapter.query(
-        `SELECT id, created_at, status, portal_id FROM support_tickets WHERE portal_id = ?${statusClause} ORDER BY created_at DESC LIMIT 1000`,
-        [portal.id]
-    );
+    }, 30000); // 30 second TTL
 }
 
 // Split a portal into N portals with even (round-robin) ticket distribution.

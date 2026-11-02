@@ -35,6 +35,14 @@ pool.on('error', (err) => {
   console.error('⚠️ pg pool: idle client error (connection reset by pooler):', err.message);
 });
 
+// Monitor pool utilization every 30 seconds when active (>50%)
+setInterval(() => {
+  const utilization = (pool.totalCount / pool.options.max) * 100;
+  if (utilization > 50) {
+    console.warn(`📊 DB POOL: ${pool.totalCount}/${pool.options.max} (${utilization.toFixed(0)}%) | Waiting: ${pool.waitingCount}`);
+  }
+}, 30000);
+
 // CRITICAL FIX: pg Pool does NOT have endIdleClients() — implement it manually
 // This drains idle connections to free native TLS buffers (~5-10MB per idle connection)
 // Without this, native memory grows unbounded and causes OOM at 512MB
@@ -1093,6 +1101,19 @@ async function initializePerformanceIndexes() {
     // production. idx_ss_inv_cover covers the same (status, created_at) prefix
     // for the inventory queries, so dropping it only removes write overhead. ──
     await pool.query('DROP INDEX IF EXISTS idx_store_shoppers_inv_intel');
+
+    // ── Phase 1 optimization: covering indexes for slow queries identified in Nov 2026 logs ──
+    // Widget chat polling: covers (session_id, id) range scans with all selected columns
+    await pool.query('CREATE INDEX IF NOT EXISTS idx_widget_chats_session_id_cover ON widget_chats(session_id, id DESC) INCLUDE (sender, content, created_at)');
+    
+    // Support tickets: composite index for portal_id + created_at (most common filter pattern)
+    await pool.query('CREATE INDEX IF NOT EXISTS idx_support_tickets_portal_created ON support_tickets(portal_id, created_at DESC)');
+    
+    // Store shoppers: covering index for order lookup queries
+    await pool.query('CREATE INDEX IF NOT EXISTS idx_store_shoppers_phone_order_cover ON store_shoppers(phone, created_at DESC) INCLUDE (order_id, status, delivery_type, customer_message)');
+    
+    // Shipments: partial index for tracking URL lookups (only rows with tracking URLs)
+    await pool.query('CREATE INDEX IF NOT EXISTS idx_shipments_awb_tracking_partial ON shipments(awb) WHERE tracking_url IS NOT NULL AND tracking_url <> \'\'');
 
     console.log('✅ Performance indexes initialized');
   } catch (error) {

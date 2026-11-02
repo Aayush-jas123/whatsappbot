@@ -2,6 +2,7 @@ const zohoService = require('./zohoService');
 const { buildZohoInvoicePayload, buildCodPaymentPayload } = require('./zohoTransform');
 const { createItemResolver } = require('./zohoItemResolver');
 const { dbAdapter } = require('../database/db');
+const { caches } = require('../utils/cache');
 
 // ============================================================
 // ZOHO SYNC ORCHESTRATOR
@@ -496,40 +497,50 @@ async function retryFailedSyncs() {
  * Log a sync attempt to the database.
  */
 async function logSync(orderId, shopifyOrder, zohoInvoiceId, status, error = null) {
-    return await dbAdapter.run(
+    const result = await dbAdapter.run(
         `INSERT INTO zoho_sync_log (shopify_order_id, zoho_invoice_id, status, original_payload, error_message)
          VALUES (?, ?, ?, ?, ?)`,
         [orderId, zohoInvoiceId, status, JSON.stringify(shopifyOrder), error]
     );
+    
+    // Invalidate stats cache when new sync log is added
+    caches.stats.delete('zoho_sync_stats');
+    
+    return result;
 }
 
 /**
  * Get sync stats for the dashboard.
+ * Cached for 60 seconds to reduce COUNT query frequency.
  */
 async function getSyncStats() {
-    const today = new Date().toISOString().split('T')[0];
+    const cacheKey = 'zoho_sync_stats';
+    
+    return await caches.stats.getOrLoad(cacheKey, async () => {
+        const today = new Date().toISOString().split('T')[0];
 
-    const [totalToday, syncedToday, failedToday, pendingRetry, totalSynced, totalFailed] = await Promise.all([
-        dbAdapter.query(`SELECT COUNT(*) as count FROM zoho_sync_log WHERE created_at >= ?`, [today]),
-        dbAdapter.query(`SELECT COUNT(*) as count FROM zoho_sync_log WHERE status = ? AND created_at >= ?`, ['synced', today]),
-        dbAdapter.query(`SELECT COUNT(*) as count FROM zoho_sync_log WHERE status = ? AND created_at >= ?`, ['failed', today]),
-        dbAdapter.query(`SELECT COUNT(*) as count FROM zoho_sync_log WHERE status = ? AND retry_count < ?`, ['failed', MAX_RETRIES]),
-        dbAdapter.query(`SELECT COUNT(*) as count FROM zoho_sync_log WHERE status = ?`, ['synced']),
-        dbAdapter.query(`SELECT COUNT(*) as count FROM zoho_sync_log WHERE status = ?`, ['failed'])
-    ]);
+        const [totalToday, syncedToday, failedToday, pendingRetry, totalSynced, totalFailed] = await Promise.all([
+            dbAdapter.query(`SELECT COUNT(*) as count FROM zoho_sync_log WHERE created_at >= ?`, [today]),
+            dbAdapter.query(`SELECT COUNT(*) as count FROM zoho_sync_log WHERE status = ? AND created_at >= ?`, ['synced', today]),
+            dbAdapter.query(`SELECT COUNT(*) as count FROM zoho_sync_log WHERE status = ? AND created_at >= ?`, ['failed', today]),
+            dbAdapter.query(`SELECT COUNT(*) as count FROM zoho_sync_log WHERE status = ? AND retry_count < ?`, ['failed', MAX_RETRIES]),
+            dbAdapter.query(`SELECT COUNT(*) as count FROM zoho_sync_log WHERE status = ?`, ['synced']),
+            dbAdapter.query(`SELECT COUNT(*) as count FROM zoho_sync_log WHERE status = ?`, ['failed'])
+        ]);
 
-    return {
-        today: {
-            total: totalToday[0]?.count || 0,
-            synced: syncedToday[0]?.count || 0,
-            failed: failedToday[0]?.count || 0,
-            pendingRetry: pendingRetry[0]?.count || 0
-        },
-        allTime: {
-            synced: totalSynced[0]?.count || 0,
-            failed: totalFailed[0]?.count || 0
-        }
-    };
+        return {
+            today: {
+                total: totalToday[0]?.count || 0,
+                synced: syncedToday[0]?.count || 0,
+                failed: failedToday[0]?.count || 0,
+                pendingRetry: pendingRetry[0]?.count || 0
+            },
+            allTime: {
+                synced: totalSynced[0]?.count || 0,
+                failed: totalFailed[0]?.count || 0
+            }
+        };
+    }, 60000); // 60 second TTL
 }
 
 /**
