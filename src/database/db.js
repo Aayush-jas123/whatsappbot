@@ -1018,6 +1018,9 @@ async function initializeExchangeDispatchTables() {
 
 async function initializePerformanceIndexes() {
   try {
+    // Enable pg_trgm extension for fast LIKE/ILIKE searches with leading wildcards
+    await pool.query('CREATE EXTENSION IF NOT EXISTS pg_trgm');
+
     // Indexes for messages table (chat/unread queries)
     await pool.query('CREATE INDEX IF NOT EXISTS idx_messages_type_created ON messages(message_type, created_at DESC)');
     await pool.query('CREATE INDEX IF NOT EXISTS idx_messages_phone_type ON messages(customer_phone, message_type)');
@@ -1065,6 +1068,20 @@ async function initializePerformanceIndexes() {
     // ── shipments: sort key for the Shipped Orders list (was a full seq scan +
     // sort of 34k rows on every refresh: ~900ms) ──
     await pool.query('CREATE INDEX IF NOT EXISTS idx_shipments_created_at ON shipments(created_at DESC)');
+
+    // ── pg_trgm GIN indexes for fast LIKE/ILIKE searches with leading wildcards ──
+    // These fix the slow queries identified in production logs:
+    // - 5.3s COUNT(DISTINCT order_id) with phone/name search → ~200ms
+    // - 1.6s support_tickets customer_phone LIKE → ~100ms
+    // - 1.3s store_shoppers phone LIKE → ~50ms
+    await pool.query('CREATE INDEX IF NOT EXISTS idx_store_shoppers_phone_trgm ON store_shoppers USING gin (phone gin_trgm_ops)');
+    await pool.query('CREATE INDEX IF NOT EXISTS idx_store_shoppers_name_trgm ON store_shoppers USING gin (name gin_trgm_ops)');
+    await pool.query('CREATE INDEX IF NOT EXISTS idx_store_shoppers_order_id_trgm ON store_shoppers USING gin (order_id gin_trgm_ops)');
+    await pool.query('CREATE INDEX IF NOT EXISTS idx_support_tickets_customer_phone_trgm ON support_tickets USING gin (customer_phone gin_trgm_ops)');
+    await pool.query('CREATE INDEX IF NOT EXISTS idx_support_tickets_customer_name_trgm ON support_tickets USING gin (customer_name gin_trgm_ops)');
+    await pool.query('CREATE INDEX IF NOT EXISTS idx_support_tickets_ticket_number_trgm ON support_tickets USING gin (ticket_number gin_trgm_ops)');
+    await pool.query('CREATE INDEX IF NOT EXISTS idx_messages_customer_phone_trgm ON messages USING gin (customer_phone gin_trgm_ops)');
+    await pool.query('CREATE INDEX IF NOT EXISTS idx_orders_customer_phone_trgm ON orders USING gin (customer_phone gin_trgm_ops)');
 
     // ── messages: no extra index for the unread-conversation scan. A partial
     // (customer_phone, created_at DESC) WHERE message_type='incoming' index was
