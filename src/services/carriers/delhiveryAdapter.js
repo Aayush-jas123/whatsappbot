@@ -29,6 +29,22 @@
 const axios = require('axios');
 const BaseCarrier = require('./baseCarrier');
 
+// Rate limiting to prevent Delhivery WAF from blocking requests with 403 Forbidden
+// Delhivery's WAF triggers when requests come in too rapidly (< 300ms apart)
+const RATE_LIMIT_DELAY_MS = 350; // Slightly above 300ms threshold
+let lastRequestTime = 0;
+
+async function rateLimitedRequest(requestFn) {
+    const now = Date.now();
+    const timeSinceLastRequest = now - lastRequestTime;
+    if (timeSinceLastRequest < RATE_LIMIT_DELAY_MS) {
+        const delay = RATE_LIMIT_DELAY_MS - timeSinceLastRequest;
+        await new Promise(resolve => setTimeout(resolve, delay));
+    }
+    lastRequestTime = Date.now();
+    return requestFn();
+}
+
 class DelhiveryAdapter extends BaseCarrier {
     constructor() {
         super('delhivery', 'Delhivery');
@@ -139,11 +155,13 @@ class DelhiveryAdapter extends BaseCarrier {
         for (const candidate of [...new Set([bare, `#${bare}`])]) {
             try {
                 lastError = null; // a successful request clears prior failures
-                const response = await axios.get(`${this.baseURL}/api/v1/packages/json/`, {
-                    headers: this.authHeaders(),
-                    params: { ref_ids: candidate, size: 10 },
-                    timeout: 20000
-                });
+                const response = await rateLimitedRequest(() => 
+                    axios.get(`${this.baseURL}/api/v1/packages/json/`, {
+                        headers: this.authHeaders(),
+                        params: { ref_ids: candidate, size: 10 },
+                        timeout: 20000
+                    })
+                );
 
                 const pkgs = response.data?.ShipmentData || response.data?.shipments || [];
                 const list = (Array.isArray(pkgs) ? pkgs : [pkgs]).filter(Boolean);
@@ -311,10 +329,12 @@ class DelhiveryAdapter extends BaseCarrier {
         });
 
         try {
-            const response = await axios.post(`${this.baseURL}/api/cmu/create.json`, requestPayload.toString(), {
-                headers: { ...this.authHeaders(), 'Content-Type': 'application/x-www-form-urlencoded' },
-                timeout: 30000
-            });
+            const response = await rateLimitedRequest(() =>
+                axios.post(`${this.baseURL}/api/cmu/create.json`, requestPayload.toString(), {
+                    headers: { ...this.authHeaders(), 'Content-Type': 'application/x-www-form-urlencoded' },
+                    timeout: 30000
+                })
+            );
 
             // HTTP 200 can still be a per-package failure — inspect the package
             const pkg = response.data?.packages?.[0];
@@ -462,14 +482,16 @@ class DelhiveryAdapter extends BaseCarrier {
     // Packing slip / label PDF link — omit pdf_size so the carrier returns its native label format
     async generateLabel(shipment) {
         try {
-            const response = await axios.get(`${this.baseURL}/api/p/packing_slip`, {
-                headers: this.authHeaders(),
-                params: { wbns: shipment.awb, pdf: 'true' },
-                responseType: 'arraybuffer',
-                maxContentLength: 10 * 1024 * 1024,
-                signal: AbortSignal.timeout(25000),
-                timeout: 20000
-            });
+            const response = await rateLimitedRequest(() =>
+                axios.get(`${this.baseURL}/api/p/packing_slip`, {
+                    headers: this.authHeaders(),
+                    params: { wbns: shipment.awb, pdf: 'true' },
+                    responseType: 'arraybuffer',
+                    maxContentLength: 10 * 1024 * 1024,
+                    signal: AbortSignal.timeout(25000),
+                    timeout: 20000
+                })
+            );
 
             const buffer = Buffer.from(response.data);
             if (buffer.subarray(0, 1024).includes(Buffer.from('%PDF-'))) {
@@ -503,10 +525,12 @@ class DelhiveryAdapter extends BaseCarrier {
                 expected_package_count: 1
             };
 
-            const response = await axios.post(`${this.baseURL}/fm/request/new/`, payload, {
-                headers: { ...this.authHeaders(), 'Content-Type': 'application/json' },
-                timeout: 20000
-            });
+            const response = await rateLimitedRequest(() =>
+                axios.post(`${this.baseURL}/fm/request/new/`, payload, {
+                    headers: { ...this.authHeaders(), 'Content-Type': 'application/json' },
+                    timeout: 20000
+                })
+            );
 
             const pickupId = response.data?.pickup_id || response.data?.pr_exist_id || null;
             return this.ok({
@@ -529,13 +553,15 @@ class DelhiveryAdapter extends BaseCarrier {
         if (!shipment.awb) return this.fail('Delhivery cancellation failed: shipment has no AWB on record');
 
         try {
-            const response = await axios.post(`${this.baseURL}/api/p/edit`, {
-                waybill: String(shipment.awb),
-                cancellation: 'true'
-            }, {
-                headers: { ...this.authHeaders(), 'Content-Type': 'application/json' },
-                timeout: 20000
-            });
+            const response = await rateLimitedRequest(() =>
+                axios.post(`${this.baseURL}/api/p/edit`, {
+                    waybill: String(shipment.awb),
+                    cancellation: 'true'
+                }, {
+                    headers: { ...this.authHeaders(), 'Content-Type': 'application/json' },
+                    timeout: 20000
+                })
+            );
 
             // Delhivery is inconsistent here: boolean false, "false", "Failure"...
             const status = response.data?.status;
@@ -563,11 +589,13 @@ class DelhiveryAdapter extends BaseCarrier {
     // Normalized tracking timeline (newest first)
     async track(awb) {
         try {
-            const response = await axios.get(`${this.baseURL}/api/v1/packages/json/`, {
-                headers: this.authHeaders(),
-                params: { waybill: awb },
-                timeout: 20000
-            });
+            const response = await rateLimitedRequest(() =>
+                axios.get(`${this.baseURL}/api/v1/packages/json/`, {
+                    headers: this.authHeaders(),
+                    params: { waybill: awb },
+                    timeout: 20000
+                })
+            );
 
             const shipmentData = response.data?.ShipmentData?.[0]?.Shipment;
             if (!shipmentData) return this.fail('No tracking data found for this AWB', response.data);
