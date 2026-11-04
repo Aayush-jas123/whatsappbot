@@ -356,9 +356,32 @@ async function refreshOrder(ref) {
     return rows[0] || null;
 }
 
+// Read one order straight from Shopify and return a cache-row-shaped object
+// WITHOUT touching the database. This is what lets the customer catalog and the
+// desk work when support_order_cache is empty or not yet migrated — the order
+// list itself now comes from native customer.orders in the theme, so nothing on
+// the customer path depends on the webhook cache any more.
+async function fetchLiveOrder(ref) {
+    const key = String(ref || '').trim();
+    if (!key) throw new Error('Order required');
+    let order = null;
+    if (/^\d+$/.test(key)) {
+        try { const byId = await shopifyREST(`orders/${key}.json`); order = byId.order || null; } catch { order = null; }
+    }
+    if (!order) {
+        const data = await shopifyREST(`orders.json?name=${encodeURIComponent(key.replace(/^#/, ''))}&status=any&limit=1`);
+        order = (data.orders || [])[0] || null;
+    }
+    if (!order) return null;
+    const phone = normalizePhone(
+        (order.customer && order.customer.phone) || (order.shipping_address && order.shipping_address.phone) || ''
+    );
+    return await buildCacheRow(order, phone);
+}
+
 module.exports = {
     shopifyREST, verifyWebhookHmac, normalizePhone, detectPayment, extractCourier, extractAWB,
     formatAddress, computeOrderStage, buildCacheRow, slimOrderJson, upsertOrder, handleOrderWebhook,
-    syncOrdersForPhone, syncAllWhitelisted, refreshOrder, hasActiveRequest, isWhitelistedCached,
+    syncOrdersForPhone, syncAllWhitelisted, refreshOrder, fetchLiveOrder, hasActiveRequest, isWhitelistedCached,
     requestsQuery, requestsInsert, CACHE_MONTHS
 };

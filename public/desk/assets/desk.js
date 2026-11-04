@@ -275,6 +275,7 @@
     var approveHtml = d.requestKey ? approveCard(d, t) : '';
     var riskHtml = riskCard(d);
     var issueHtml = issueCard(d, t);
+    var contextHtml = contextCard(d);
     var threadHtml = threadCard(d, t);
     el.innerHTML = ''
       + '<div class="desk-card desk-detail-head">'
@@ -289,6 +290,7 @@
       + '<div class="desk-grid2">' + custHtml + orderHtml + '</div>'
       + approveHtml
       + '<div class="desk-grid2">' + riskHtml + issueHtml + '</div>'
+      + contextHtml
       + threadHtml;
     if (window.innerWidth < 980) { var b = $('DeskBack'); if (b) b.style.display = ''; }
   }
@@ -333,6 +335,44 @@
       + (o.address ? '<div class="desk-kv"><span class="k">Address</span><span class="v">' + esc(o.address) + '</span></div>' : '')
       + (o.placed ? '<div class="desk-kv"><span class="k">Placed</span><span class="v">' + fmtTime(o.placed) + '</span></div>' : '')
       + (items ? '<table class="desk-items"><tr><th>Item</th><th class="num">Qty</th><th class="num">Price</th></tr>' + items + '</table>' : '')
+      + '</div>';
+  }
+
+  // Shoppers Hub customer context — the same orders / returns / exchanges /
+  // RTO aggregation the Shoppers Hub chat sidebar renders for this phone.
+  function contextCard(d) {
+    var ctx = d.context;
+    if (!ctx) return '';
+    var tid = String(d.ticket.order_id || '').replace(/^#/, '');
+    var orderRows = (ctx.orders || []).map(function (o) {
+      var st = String(o.status || '').toLowerCase();
+      var label = STAGE_LABELS[st] || st.replace(/_/g, ' ');
+      var cur = String(o.order_id || '').replace(/^#/, '') === tid;
+      return '<div class="desk-ctx-row' + (cur ? ' current' : '') + '">'
+        + '<span class="o">#' + esc(o.order_id) + (cur ? ' \u00b7 this ticket' : '') + '</span>'
+        + '<span class="s">' + esc(label) + '</span>'
+        + '<span class="t">' + (o.awb ? esc(o.awb) + ' \u00b7 ' : '') + money(o.total) + '</span>'
+        + '</div>';
+    }).join('');
+    var reqs = [];
+    (ctx.returns || []).forEach(function (r) { reqs.push({ kind: 'Return', r: r }); });
+    (ctx.exchanges || []).forEach(function (r) { reqs.push({ kind: 'Exchange', r: r }); });
+    reqs.sort(function (a, b) { return new Date(b.r.created_at || 0) - new Date(a.r.created_at || 0); });
+    var reqRows = reqs.slice(0, 6).map(function (x) {
+      return '<div class="desk-ctx-row">'
+        + '<span class="o">' + x.kind + ' #' + esc(x.r.order_id) + '</span>'
+        + '<span class="s">' + esc(String(x.r.status || '').replace(/_/g, ' ')) + '</span>'
+        + '<span class="t">' + (x.r.source === 'portal' ? 'portal' : 'local') + ' \u00b7 ' + fmtTime(x.r.created_at) + '</span>'
+        + '</div>';
+    }).join('');
+    var chips = [];
+    if ((ctx.returns || []).length) chips.push(ctx.returns.length + ' return' + (ctx.returns.length > 1 ? 's' : ''));
+    if ((ctx.exchanges || []).length) chips.push(ctx.exchanges.length + ' exchange' + (ctx.exchanges.length > 1 ? 's' : ''));
+    if ((ctx.rto || []).length) chips.push(ctx.rto.length + ' RTO');
+    return '<div class="desk-card"><h3>Customer history <span class="ctx-sub">(Shoppers Hub)</span></h3>'
+      + '<div class="desk-ctx-summary">' + (ctx.orders || []).length + ' orders' + (chips.length ? ' \u00b7 ' + chips.join(' \u00b7 ') : '') + '</div>'
+      + (reqRows ? '<div class="desk-ctx-sec">Open returns &amp; exchanges</div>' + reqRows : '')
+      + (orderRows ? '<div class="desk-ctx-sec">Orders</div>' + orderRows : '')
       + '</div>';
   }
 

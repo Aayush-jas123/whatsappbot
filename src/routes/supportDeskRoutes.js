@@ -144,21 +144,37 @@ router.get('/tickets/:id', async (req, res) => {
     try {
         const t = await Support.getTicket(req.params.id);
         if (!t) return res.status(404).json({ error: 'Ticket not found' });
-        const [order, settings, history, ticketCount, images] = await Promise.all([
-            Support.getOrderByNumber(t.order_id),
+        const [order, settings, history, ticketCount, images, ctx] = await Promise.all([
+            Support.getOrderByNumber(t.order_id, t.customer_phone),
             Support.getAllSettings(),
             Support.customerHistory(t.customer_phone),
             Support.countTicketsByPhone(t.customer_phone),
-            Support.listTicketImages(t.id)
+            Support.listTicketImages(t.id),
+            // Shoppers Hub customer context (orders/returns/exchanges/RTO) —
+            // cached, so this is one shared read for everything above too.
+            Support.contextFor(t.customer_phone)
         ]);
         const slaCfg = settings.sla || {}, costCfg = settings.cost_config || {};
         const enriched = { ...t, history };
         const key = t.reason + '/' + t.sub;
+        const trimReq = r => ({
+            id: r.request_id || r.return_id || r.exchange_id, order_id: r.order_id || r.order_number,
+            status: r.status, reason: r.reason || null, created_at: r.created_at, source: r.source
+        });
         res.json({
             ticket: { ...t, images },
             order,
             history,
             ticketCount,
+            context: ctx ? {
+                orders: (ctx.orders || []).slice(0, 10).map(o => ({
+                    order_id: o.order_id, status: o.status, awb: o.awb, courier_name: o.courier_name,
+                    total: o.order_total, created_at: o.created_at, delivered_at: o.delivered_at
+                })),
+                returns: (ctx.returns || []).slice(0, 10).map(trimReq),
+                exchanges: (ctx.exchanges || []).slice(0, 10).map(trimReq),
+                rto: (ctx.rto || []).slice(0, 10).map(o => ({ order_id: o.order_id, awb: o.awb, status: o.status }))
+            } : null,
             sla: Support.slaOf(t, slaCfg),
             risk: order ? Support.riskOf(enriched, order, costCfg, ticketCount) : null,
             econ: order ? Support.econOf(t, order, costCfg) : null,
@@ -255,7 +271,7 @@ router.post('/tickets/:id/resolve', async (req, res) => {
         if (t.status === 'closed') return res.status(400).json({ error: 'Ticket is already closed' });
         const b = req.body || {};
         const templates = (await Support.getSetting('resolution_templates')) || {};
-        const order = await Support.getOrderByNumber(t.order_id);
+        const order = await Support.getOrderByNumber(t.order_id, t.customer_phone);
         const label = String(b.type || 'info');
         const message = String(b.message || templates[label] || '').trim();
         if (!message) return res.status(400).json({ error: 'Resolution message is required' });
@@ -307,7 +323,7 @@ router.post('/tickets/:id/approve', async (req, res) => {
         if (!Support.REQUESTS[key]) return res.status(400).json({ error: 'This ticket is not an actionable request' });
         const b = req.body || {};
         const agent = agentName(req);
-        const order = await Support.getOrderByNumber(t.order_id);
+        const order = await Support.getOrderByNumber(t.order_id, t.customer_phone);
         if (!order) return res.status(404).json({ error: 'Cached order not found for this ticket' });
         const raw = await Support.getCacheRow(order.id);
         const shopifyId = raw && raw.shopify_id;

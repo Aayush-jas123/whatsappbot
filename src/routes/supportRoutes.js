@@ -89,10 +89,11 @@ router.get('/orders', verifyCustomerPhone, async (req, res) => {
             Support.listTicketsByPhone(req.customerPhone)
         ]);
         const openByOrder = {};
+        const key = Support.normOrderId;
         tickets.filter(t => t.status !== 'closed').forEach(t => {
-            openByOrder[t.order_id] = { id: t.id, number: t.ticket_number, status: t.status };
+            openByOrder[key(t.order_id)] = { id: t.id, number: t.ticket_number, status: t.status };
         });
-        res.json({ orders: orders.map(o => ({ ...o, openTicket: openByOrder[o.id] || null })) });
+        res.json({ orders: orders.map(o => ({ ...o, openTicket: openByOrder[key(o.id)] || null })) });
     } catch (error) {
         console.error('[Support] orders error:', error.message);
         res.status(500).json({ error: 'Failed to load orders' });
@@ -105,8 +106,10 @@ router.get('/catalog', verifyCustomerPhone, async (req, res) => {
         const orderId = req.query.orderId;
         let order = null;
         if (orderId) {
-            order = await Support.getOrderByNumber(orderId);
-            if (!order || order.customerKey !== req.customerPhone) {
+            order = await Support.getOrderByNumber(orderId, req.customerPhone);
+            // Hub-sourced orders are already fetched inside this phone's
+            // customer context, so ownership is proven by construction.
+            if (!order || (!order.hubSourced && order.customerKey !== req.customerPhone)) {
                 return res.status(404).json({ error: 'Order not found' });
             }
             const costCfg = (await Support.getSetting('cost_config')) || {};
@@ -154,8 +157,8 @@ router.post('/tickets', verifyCustomerPhone, async (req, res) => {
         if (!b.orderId || !b.reason || !b.sub) {
             return res.status(400).json({ error: 'orderId, reason and sub are required' });
         }
-        const order = await Support.getOrderByNumber(b.orderId);
-        if (!order || order.customerKey !== req.customerPhone) {
+        const order = await Support.getOrderByNumber(b.orderId, req.customerPhone);
+        if (!order || (!order.hubSourced && order.customerKey !== req.customerPhone)) {
             return res.status(404).json({ error: 'Order not found' });
         }
         const existing = await Support.openTicketForOrder(order.id);

@@ -372,21 +372,184 @@ const CACHE_READ_COLS = [
     'address', 'delivered_at', 'total', 'replaced_by', 'replacements', 'order_json'
 ].join(', ');
 
-async function listOrdersByPhone(phone) {
-    const rows = await dbAdapter.query(
-        `SELECT ${CACHE_READ_COLS} FROM support_order_cache WHERE customer_phone = ?
-         ORDER BY placed_at DESC LIMIT 50`,
-        [phone]
-    );
-    return rows.map(mapCachedOrder);
+// ---------- order context (Shoppers Hub customer-context) ----------
+// Order status truth comes from the same customer-context aggregation the
+// Shoppers Hub chat sidebar renders (store_shoppers + orders tracking +
+// local/portal returns and exchanges). The webhook cache is only a merge
+// source for desk bookkeeping, so the support flow works with zero Shopify
+// webhooks and an empty cache, and agents never see a stage that differs
+// from the hub.
+const normOrderId = v => String(v || '').replace(/^#/, '').trim();
+
+function parseHubItems(itemsJson) {
+    try {
+        const parsed = JSON.parse(itemsJson || '[]');
+        return Array.isArray(parsed) ? parsed : [parsed];
+    } catch { return []; }
 }
 
-async function getOrderByNumber(orderId) {
-    const rows = await dbAdapter.query(
-        `SELECT ${CACHE_READ_COLS} FROM support_order_cache WHERE order_id = ?`,
-        [String(orderId)]
-    );
-    return mapCachedOrder(rows[0] || null);
+// store_shoppers/orders status -> support stage. Unknown hub statuses pass
+// through verbatim when the support STAGES map already labels them.
+function hubStage(row, openReturns, openExchanges) {
+    const s = String(row.shopper_status || '').toLowerCase();
+    const s2 = String(row.order_status || '').toLowerCase();
+    // The orders table carries the carrier truth (rto/failed) even when the
+    // shopper row still says confirmed, so check both statuses.
+    const anyRto = [s, s2].some(x => x.startsWith('rto') || x === 'failed' || x === 'untrackable');
+    const shippedLike = ['shipped', 'in_transit', 'scheduled', 'pickup_booked', 'pickup_scheduled'].includes(s) || s2 === 'shipped';
+    let stage;
+    if (s === 'cancelled' || s2 === 'cancelled') stage = 'cancelled';
+    else if (anyRto) stage = 'rto';
+    else if (s === 'delivered' || s2 === 'delivered') stage = 'delivered';
+    else if (s === 'out_for_delivery' || s2 === 'out_for_delivery') stage = 'out_for_delivery';
+    else if (shippedLike || (s === 'confirmed' && row.awb)) stage = 'shipped';
+    else if (s === 'pending' || s === 'confirmed' || !s) stage = 'unshipped';
+    else if (STAGES[s]) stage = s;
+    else stage = 'unshipped';
+    // A live return/exchange request outranks the plain delivery status, the
+    // same rule supportSync.computeStage applies for the cache.
+    if (stage === 'shipped' || stage === 'delivered' || stage === 'out_for_delivery') {
+        if (openExchanges) stage = 'exchange';
+        else if (openReturns) stage = 'return';
+    }
+    return stage;
+}
+
+const HUB_CLOSED_RE = /^(closed|cancelled|completed|refunded|rejected|returned|failed)$/;
+function hubExtrasFor(ctx, orderId) {
+    const id = normOrderId(orderId);
+    const row = (ctx.orders || []).find(o => normOrderId(o.order_id) === id) || null;
+    const isOpen = r => !HUB_CLOSED_RE.test(String(r.status || '').toLowerCase());
+    const openReturns = (ctx.returns || []).filter(r => normOrderId(r.order_id || r.order_number) === id && isOpen(r));
+    const openExchanges = (ctx.exchanges || []).filter(r => normOrderId(r.order_id || r.order_number) === id && isOpen(r));
+    const stage = row ? hubStage(row, openReturns.length, openExchanges.length) : null;
+    return { row, stage, openReturns, openExchanges };
+}
+
+// Full order from the hub row alone (order not in the cache at all).
+function orderFromHub(r, extras) {
+    const items = parseHubItems(r.items_json).map(i => ({
+        n: i.name || i.title || 'Item', v: i.variant_title || i.size || '', q: Number(i.quantity) || 1, p: Number(i.price || 0)
+    }));
+    const ts = v => { const t = v ? new Date(v).getTime() : NaN; return Number.isNaN(t) ? null : t; };
+    return {
+        id: normOrderId(r.order_id),
+        placed: ts(r.created_at) || Date.now(),
+        stage: extras.stage,
+        confirmed: String(r.status || '') !== 'pending',
+        payment: /cod|cash/i.test(String(r.payment_method || '')) ? 'COD' : (r.payment_method || 'Prepaid'),
+        courier: r.courier_name || '', awb: r.awb || '',
+        address: r.address || '',
+        deliveredAt: ts(r.delivered_at),
+        items, total: Number(r.order_total || 0) || items.reduce((a, i) => a + i.q * i.p, 0),
+        replacedBy: null, replacements: 0, isNew: false,
+        customerKey: normalizePhone(r.phone) || null, paidVia: r.payment_method || null,
+        hubSourced: true,
+        hubStatus: r.status || null,
+        openReturns: extras.openReturns.length, openExchanges: extras.openExchanges.length
+    };
+}
+
+// Overlay hub truth on a cache/live-shaped order. The hub carries the fresher
+// status; the cache keeps the desk bookkeeping (replacements, Shopify id).
+function applyHub(order, extras) {
+    if (!order) return order;
+    const r = extras.row || {};
+    if (extras.stage) {
+        // the cache may know about an RTO the hub rows do not flag
+        if (!(extras.stage === 'shipped' && order.stage === 'rto')) order.stage = extras.stage;
+    }
+    if (r.awb) order.awb = String(r.awb);
+    if (r.courier_name) order.courier = String(r.courier_name);
+    if (r.delivered_at && !order.deliveredAt) {
+        const t = new Date(r.delivered_at).getTime();
+        if (!Number.isNaN(t)) order.deliveredAt = t;
+    }
+    if (extras.row && (Number(r.order_total) || 0) && !Number(order.total)) order.total = Number(r.order_total);
+    order.replacedBy = order.replacedBy || null;
+    order.replacements = order.replacements || 0;
+    order.hubStatus = r.status || order.hubStatus || null;
+    order.hubSourced = true;
+    order.openReturns = extras.openReturns.length;
+    order.openExchanges = extras.openExchanges.length;
+    return order;
+}
+
+async function contextFor(phone) {
+    try {
+        const CustomerContext = require('./customerContextService');
+        return await CustomerContext.buildCached(phone);
+    } catch (e) {
+        console.warn('[Support] customer context unavailable:', e.message);
+        return null;
+    }
+}
+
+async function listOrdersByPhone(phone) {
+    const ctx = await contextFor(phone);
+    let byId = {};
+    try {
+        const rows = await dbAdapter.query(
+            `SELECT ${CACHE_READ_COLS} FROM support_order_cache WHERE customer_phone = ?
+             ORDER BY placed_at DESC LIMIT 50`,
+            [phone]
+        );
+        rows.forEach(r => { byId[normOrderId(r.order_id)] = r; });
+    } catch (e) { /* table may not be migrated yet — the hub alone is enough */ }
+
+    if (ctx) {
+        const out = [];
+        const seen = new Set();
+        for (const r of (ctx.orders || [])) {
+            const id = normOrderId(r.order_id);
+            if (!id || seen.has(id)) continue;
+            seen.add(id);
+            const extras = hubExtrasFor(ctx, id);
+            const row = byId[id];
+            out.push(row ? applyHub(mapCachedOrder(row), extras) : orderFromHub(r, extras));
+        }
+        // Cache rows the hub does not know (e.g. replaced orders) still show
+        Object.entries(byId).forEach(([id, row]) => { if (!seen.has(id)) out.push(mapCachedOrder(row)); });
+        out.sort((a, b) => (b.placed || 0) - (a.placed || 0));
+        return out;
+    }
+    return Object.values(byId).map(mapCachedOrder).sort((a, b) => (b.placed || 0) - (a.placed || 0));
+}
+
+// One order with the hub context merged when the customer's phone is known
+// (the catalog and desk routes pass it). Falls back to the cache, then to a
+// live Shopify read, so nothing here needs the webhook cache to have run.
+async function getOrderByNumber(orderId, phone) {
+    const id = normOrderId(orderId);
+    if (phone) {
+        const ctx = await contextFor(phone);
+        const extras = ctx && hubExtrasFor(ctx, id);
+        if (extras && extras.row) {
+            let row = null;
+            try {
+                const rows = await dbAdapter.query(
+                    `SELECT ${CACHE_READ_COLS} FROM support_order_cache WHERE order_id = ?`, [id]
+                );
+                row = rows[0] || null;
+            } catch (e) { /* no cache table yet — the hub row is enough */ }
+            return applyHub(row ? mapCachedOrder(row) : orderFromHub(extras.row, extras), extras);
+        }
+    }
+    try {
+        const rows = await dbAdapter.query(
+            `SELECT ${CACHE_READ_COLS} FROM support_order_cache WHERE order_id = ?`,
+            [id]
+        );
+        if (rows.length) return mapCachedOrder(rows[0]);
+    } catch (e) { /* table may not be migrated yet — fall through to live */ }
+    try {
+        const SupportSync = require('./supportSync');
+        const row = await SupportSync.fetchLiveOrder(id);
+        return mapCachedOrder(row);
+    } catch (e) {
+        console.error('[Support] live order fetch failed:', e.message);
+        return null;
+    }
 }
 
 // Columns the cache may be patched on (whitelisted so the SET clause is never user input)
@@ -408,13 +571,26 @@ async function patchCachedOrder(orderId, patch = {}) {
     return true;
 }
 
-// Customer history aggregates from the cache
-async function customerHistory(phone) {
+// Customer history aggregates — from the hub context when available (same
+// numbers the Shoppers Hub shows), cache counts as the supplement.
+async function customerHistory(phone, ctx) {
+    const p = normalizePhone(phone);
+    ctx = ctx || await contextFor(p);
+    const history = { orders: 0, delivered: 0, rto: 0 };
+    if (ctx) {
+        history.orders = (ctx.orders || []).length;
+        (ctx.orders || []).forEach(o => {
+            const st = hubStage(o, 0, 0);
+            if (st === 'delivered') history.delivered++;
+            if (st === 'rto') history.rto++;
+        });
+        return history;
+    }
     const rows = await dbAdapter.query(
         'SELECT stage FROM support_order_cache WHERE customer_phone = ? ORDER BY placed_at DESC LIMIT 100',
-        [phone]
+        [p]
     );
-    const history = { orders: rows.length, delivered: 0, rto: 0 };
+    history.orders = rows.length;
     rows.forEach(r => {
         if (r.stage === 'delivered') history.delivered++;
         if (r.stage === 'rto') history.rto++;
@@ -745,6 +921,7 @@ module.exports = {
     getSetting, getAllSettings, putSetting, fillTemplate,
     riskOf, econOf, slaOf, ticketBase, nextTicketNumber,
     listOrdersByPhone, getOrderByNumber, patchCachedOrder, customerHistory, mapCachedOrder, cacheRowsFor, getCacheRow, listOrderCache,
+    contextFor, normOrderId,
     isWhitelisted, listWhitelist, addWhitelist, removeWhitelist,
     listTicketsByPhone, countTicketsByPhone, getTicket, getTicketByNumber, openTicketForOrder,
     createTicket, updateTicket, listTicketImages, deskQueryTickets, deskStatsAgg, publicTicket, customerTicket
