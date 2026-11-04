@@ -112,11 +112,31 @@ router.post('/checkout/update', verifyShopifyWebhook, async (req, res) => {
 router.post('/orders/create', verifyShopifyWebhook, async (req, res) => {
     try {
         await abandonedCartService.handleOrderCreated(req.body);
+        supportSyncFire('orders/create', req.body || {});
         res.status(200).send('OK');
     } catch (error) {
         console.error('Webhook error:', error);
         res.status(500).send('Error');
     }
+});
+
+// Support order cache — kept out of the recovery path so a cache problem can
+// never break abandoned-cart handling. Only whitelisted phones are stored.
+function supportSyncFire(topic, order) {
+    require('../services/supportSync').handleOrderWebhook(topic, order)
+        .catch(err => console.warn('[SupportSync] webhook failed:', err.message));
+}
+
+// orders/create already fires above; add the topics that carry status changes
+// (fulfilment, delivery, cancellation) so ticket context stays fresh.
+router.post('/orders/updated', verifyShopifyWebhook, async (req, res) => {
+    supportSyncFire('orders/updated', req.body || {});
+    res.status(200).send('OK');
+});
+
+router.post('/orders/cancelled', verifyShopifyWebhook, async (req, res) => {
+    supportSyncFire('orders/cancelled', req.body || {});
+    res.status(200).send('OK');
 });
 
 module.exports = router;

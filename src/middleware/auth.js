@@ -78,6 +78,7 @@ const PERMISSIONS = {
         { key: 'edit_orders', label: 'Edit / Delete Shoppers', description: 'Edit shopper details, change status, delete records' },
         { key: 'send_messages', label: 'Send WhatsApp Messages', description: 'Reply to customers via live chat' },
         { key: 'ship_orders', label: 'Ship Orders', description: 'Create shipments, generate labels, cancel shipments' },
+        { key: 'support_desk', label: 'Support Desk', description: 'Website customer support desk: answer tickets and approve customer requests' },
         { key: 'ai_copilot', label: 'AI Copilot', description: 'Use AI Copilot chat, suggestions and actions' }
     ]
 };

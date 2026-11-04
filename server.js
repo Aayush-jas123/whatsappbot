@@ -79,8 +79,10 @@ const PORT = process.env.PORT || 3000;
 // Middleware
 app.use(cors({
     origin: '*',
-    methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
-    allowedHeaders: ['Content-Type', 'Authorization']
+    methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
+    // X-Customer-Phone: the storefront "Help & Tickets" tab identifies the signed-in
+    // customer with this header (injected by Liquid), so preflight must allow it.
+    allowedHeaders: ['Content-Type', 'Authorization', 'X-Customer-Phone']
 }));
 
 // Rate Limiter for public/unauthenticated routes (2000 requests per 15 minutes per IP)
@@ -165,12 +167,38 @@ const dashboardCsp = helmet({
 app.use('/dashboard', dashboardCsp);
 app.use('/admin', dashboardCsp);
 
+// Support Desk CSP override — the desk renders its queue via innerHTML with
+// inline handlers, and pulls product/proof images from Cloudinary + Shopify's
+// CDN. Same relaxation as the admin dashboard, plus cloudinary/Shopify img hosts.
+const deskCsp = helmet({
+    contentSecurityPolicy: {
+        directives: {
+            'default-src': ["'self'"],
+            'script-src': ["'self'"],
+            'script-src-attr': ["'unsafe-inline'"],
+            'style-src': ["'self'", "'unsafe-inline'", 'https://fonts.googleapis.com'],
+            'font-src': ["'self'", 'https://fonts.gstatic.com'],
+            'img-src': ["'self'", 'data:', 'https:'],
+            'connect-src': ["'self'"],
+            'frame-ancestors': ["'none'"]
+        }
+    }
+});
+app.use('/desk', deskCsp);
+
 // Widget assets — allow cross-origin loading (e.g. Shopify storefront)
 // Must run before express.static so headers are set before files are served.
 app.use('/widget', helmet({
     crossOriginResourcePolicy: { policy: 'cross-origin' },
     contentSecurityPolicy: false
 }));
+
+// Website support desk (separate agent dashboard for storefront tickets).
+// Registered before express.static so /desk answers 200 instead of relying on
+// the static middleware's redirect to /desk/.
+app.get('/desk', (req, res) => {
+    res.sendFile(path.join(__dirname, 'public', 'desk', 'index.html'));
+});
 
 // Serve static files (admin dashboard)
 // HTML must always revalidate so deploys ship fresh markup immediately;
@@ -240,6 +268,15 @@ app.use('/webhooks/zoho', zohoWebhookRoutes);
 // Zoho admin API routes (dashboard data, config, manual actions)
 const zohoRoutes = require('./src/routes/zohoRoutes');
 app.use('/api/admin/zoho', zohoRoutes);
+
+// Website customer support — storefront "Help & Tickets" tab (phone-gated)
+// and its agent desk. The desk router is mounted FIRST so /api/support/admin/*
+// is never swallowed by the customer router's /api/support/* patterns.
+const supportDeskRoutes = require('./src/routes/supportDeskRoutes');
+app.use('/api/support/admin', supportDeskRoutes);
+
+const supportRoutes = require('./src/routes/supportRoutes');
+app.use('/api/support', supportRoutes);
 
 // Instagram webhook rate limiter — DISABLED (Instagram bot turned off)
 // Instagram Graph API allows ~500 calls/hour; 300/min per IP is generous

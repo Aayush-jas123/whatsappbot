@@ -75,6 +75,49 @@ class RazorpayService {
     }
 
     /**
+     * Create a support-desk payment link (COD->prepaid conversion, reship
+     * fees). Unlike createPaymentLink this takes an arbitrary description and
+     * notes blob and does not stamp type:exchange_balance.
+     * @param {Object} opts - { amount (INR), description, name, contact, email, notes }
+     */
+    async createSupportLink(opts = {}) {
+        if (!this.enabled) {
+            return { success: false, error: 'Razorpay not configured. Add RAZORPAY_KEY_ID and RAZORPAY_KEY_SECRET.' };
+        }
+        try {
+            const amount = Math.round(Number(opts.amount) || 0);
+            if (amount <= 0) return { success: false, error: 'Amount must be greater than zero' };
+            const link = await this.razorpay.paymentLink.create({
+                amount: amount * 100,
+                currency: 'INR',
+                accept_partial: false,
+                description: opts.description || 'Offcomfrt payment',
+                customer: {
+                    name: opts.name || 'Customer',
+                    contact: String(opts.contact || '').replace(/\D/g, '').slice(-10) || undefined,
+                    email: opts.email || undefined
+                },
+                notify: { sms: false, email: false },
+                reminder_enable: true,
+                notes: opts.notes || {},
+                callback_url: `${process.env.APP_URL}/payment/callback`,
+                callback_method: 'get',
+                expire_by: Math.floor(Date.now() / 1000) + 86400
+            });
+            return {
+                success: true,
+                paymentLinkId: link.id,
+                shortUrl: link.short_url,
+                longUrl: link.long_url,
+                amount
+            };
+        } catch (error) {
+            console.error('Support payment link error:', error);
+            return { success: false, error: error.message };
+        }
+    }
+
+    /**
      * Get payment link status
      */
     async getPaymentStatus(paymentLinkId) {
