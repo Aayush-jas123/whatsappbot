@@ -34,15 +34,32 @@ const BaseCarrier = require('./baseCarrier');
 const RATE_LIMIT_DELAY_MS = 350; // Slightly above 300ms threshold
 let lastRequestTime = 0;
 
+// WAF blocks are transient — one patient retry clears them, whereas failing
+// (or worse, creating blindly after a failed lookup) risks duplicates.
+const WAF_RETRY_WAITS_MS = [3000, 8000];
+
 async function rateLimitedRequest(requestFn) {
-    const now = Date.now();
-    const timeSinceLastRequest = now - lastRequestTime;
-    if (timeSinceLastRequest < RATE_LIMIT_DELAY_MS) {
-        const delay = RATE_LIMIT_DELAY_MS - timeSinceLastRequest;
-        await new Promise(resolve => setTimeout(resolve, delay));
+    for (let attempt = 0; ; attempt++) {
+        const now = Date.now();
+        const timeSinceLastRequest = now - lastRequestTime;
+        if (timeSinceLastRequest < RATE_LIMIT_DELAY_MS) {
+            const delay = RATE_LIMIT_DELAY_MS - timeSinceLastRequest;
+            await new Promise(resolve => setTimeout(resolve, delay));
+        }
+        lastRequestTime = Date.now();
+        try {
+            return await requestFn();
+        } catch (error) {
+            const status = error.response?.status;
+            if ((status === 403 || status === 429) && attempt < WAF_RETRY_WAITS_MS.length) {
+                const wait = WAF_RETRY_WAITS_MS[attempt];
+                console.warn(`⚠️ Delhivery WAF ${status} — retrying in ${wait / 1000}s (attempt ${attempt + 1}/${WAF_RETRY_WAITS_MS.length})`);
+                await new Promise(resolve => setTimeout(resolve, wait));
+                continue;
+            }
+            throw error;
+        }
     }
-    lastRequestTime = Date.now();
-    return requestFn();
 }
 
 class DelhiveryAdapter extends BaseCarrier {
@@ -376,7 +393,17 @@ class DelhiveryAdapter extends BaseCarrier {
                         // Before retrying with -c suffix, check if that variant already exists
                         const retryOrderId = `${orderId}-c`;
                         const existingRetry = await this.findSyncedOrder(retryOrderId);
-                        
+
+                        // Fail closed: a WAF/lookup error here does NOT prove the -c
+                        // variant is absent — creating anyway would mint a second
+                        // carrier order + label for the same internal order
+                        if (existingRetry?.lookupError) {
+                            return this.fail(
+                                `Could not verify whether retry variant ${retryOrderId} already exists at Delhivery ` +
+                                `(${existingRetry.lookupError}). Refusing to create to avoid a duplicate — please retry.`
+                            );
+                        }
+
                         if (existingRetry?.awb) {
                             // The -c variant already exists — check its status
                             const retryTracking = await this.track(existingRetry.awb);
@@ -416,10 +443,10 @@ class DelhiveryAdapter extends BaseCarrier {
                         });
                         
                         try {
-                            const retryResponse = await axios.post(`${this.baseURL}/api/cmu/create.json`, retryPayload.toString(), {
+                            const retryResponse = await rateLimitedRequest(() => axios.post(`${this.baseURL}/api/cmu/create.json`, retryPayload.toString(), {
                                 headers: { ...this.authHeaders(), 'Content-Type': 'application/x-www-form-urlencoded' },
                                 timeout: 30000
-                            });
+                            }));
                             
                             const retryPkg = retryResponse.data?.packages?.[0];
                             const retryAwb = retryPkg?.waybill ? String(retryPkg.waybill) : '';

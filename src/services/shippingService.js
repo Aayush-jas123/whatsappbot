@@ -26,6 +26,11 @@ const DEFAULT_PACKAGE = { weightGrams: 500, lengthCm: 30, breadthCm: 40, heightC
 // (mirrors the idx_shipments_open_order_v2 partial unique index in db.js)
 const TERMINAL_STATUSES = ['cancelled', 'failed', 'delivered', 'rto', 'untrackable'];
 
+// In-flight claim rows (status 'creating') older than this are considered
+// abandoned — the request died between the claim insert and the carrier
+// response — so a new ship may take over instead of being locked out forever.
+const STALE_CLAIM_MS = 5 * 60 * 1000;
+
 function invalidateShoppersCache() {
     if (caches && caches.shoppers) {
         caches.shoppers.clear();
@@ -203,37 +208,70 @@ async function ship({ shopperId, carrier, courierId, packageOverrides, consignee
     // Idempotency: one open shipment per order (also enforced by DB partial unique index)
     const existing = await getActiveShipment(ctx.orderId);
     if (existing) {
-        return {
-            error: `Order ${ctx.orderId} already has an active shipment (AWB: ${existing.awb || 'pending'} via ${existing.carrier})`,
-            status: 409,
-            shipment: existing
-        };
+        // A 'creating' row is another request mid-flight (or a crashed one).
+        // Only take over when the claim is clearly stale, otherwise the
+        // concurrent request may still be talking to the carrier.
+        if (existing.status === 'creating' &&
+            Date.now() - new Date(existing.created_at).getTime() > STALE_CLAIM_MS) {
+            console.warn(`⚠️ Shipping order ${ctx.orderId}: taking over stale 'creating' claim #${existing.id}`);
+            await dbAdapter.update('shipments', {
+                status: 'failed',
+                error_message: 'In-flight shipment claim went stale (server died mid-request) and was taken over by a new ship',
+                updated_at: new Date().toISOString()
+            }, { id: existing.id });
+        } else {
+            return {
+                error: existing.status === 'creating'
+                    ? `Order ${ctx.orderId} is already being shipped by another request — wait for it to finish and check shipment history before retrying`
+                    : `Order ${ctx.orderId} already has an active shipment (AWB: ${existing.awb || 'pending'} via ${existing.carrier})`,
+                status: 409,
+                shipment: existing
+            };
+        }
+    }
+
+    // Claim the order BEFORE calling the carrier. The row is non-terminal, so
+    // the idx_shipments_open_order_v2 partial unique index makes any parallel
+    // ship for the same order_id fail with 23505 — this is what stops bulk
+    // runs from multiple tabs/sessions stampeding one order into a dozen
+    // carrier create attempts, duplicate labels and WAF-403 lookup failures.
+    let claimRow;
+    try {
+        claimRow = await dbAdapter.insert('shipments', {
+            order_id: ctx.orderId,
+            shopper_id: String(shopperId),
+            carrier,
+            status: 'creating',
+            payment_mode: ctx.payment.mode,
+            cod_amount: ctx.payment.codAmount,
+            weight_grams: ctx.package.weightGrams,
+            length_cm: ctx.package.lengthCm,
+            breadth_cm: ctx.package.breadthCm,
+            height_cm: ctx.package.heightCm,
+            request_payload: JSON.stringify(ctx),
+            shipped_by: shippedBy || 'admin',
+            reship_of_shipment_id: reshipOf ? reshipOf.id : null,
+            reship_reason: reshipReason || null,
+            batch_id: batchId || null
+        });
+    } catch (dbError) {
+        if (dbError.code === '23505') {
+            return { error: `Order ${ctx.orderId} is already being shipped by another request — check shipment history before retrying`, status: 409 };
+        }
+        throw dbError;
     }
 
     const result = await adapter.createShipment(ctx);
 
     if (!result.success) {
-        // Persist the failure for audit (status 'failed' keeps the order re-shippable)
+        // Record the failure on the claim row (status 'failed' keeps the order re-shippable)
         try {
-            await dbAdapter.insert('shipments', {
-                order_id: ctx.orderId,
-                shopper_id: String(shopperId),
-                carrier,
+            await dbAdapter.update('shipments', {
                 status: 'failed',
-                payment_mode: ctx.payment.mode,
-                cod_amount: ctx.payment.codAmount,
-                weight_grams: ctx.package.weightGrams,
-                length_cm: ctx.package.lengthCm,
-                breadth_cm: ctx.package.breadthCm,
-                height_cm: ctx.package.heightCm,
-                request_payload: JSON.stringify(ctx),
                 response_payload: result.raw ? JSON.stringify(result.raw) : null,
                 error_message: result.error,
-                shipped_by: shippedBy || 'admin',
-                reship_of_shipment_id: reshipOf ? reshipOf.id : null,
-                reship_reason: reshipReason || null,
-                batch_id: batchId || null
-            });
+                updated_at: new Date().toISOString()
+            }, { id: claimRow.id });
         } catch (auditError) {
             console.error('⚠️ Failed to persist failed-shipment audit row:', auditError.message);
         }
@@ -243,36 +281,24 @@ async function ship({ shopperId, carrier, courierId, packageOverrides, consignee
     const data = result.data;
     let shipmentRow;
     try {
-        shipmentRow = await dbAdapter.insert('shipments', {
-            order_id: ctx.orderId,
-            shopper_id: String(shopperId),
-            carrier,
+        await dbAdapter.update('shipments', {
             carrier_shipment_id: data.carrierShipmentId || null,
             carrier_order_id: data.carrierOrderId || null,
             awb: data.awb,
             courier_name: data.courierName,
             status: 'awb_assigned',
-            payment_mode: ctx.payment.mode,
-            cod_amount: ctx.payment.codAmount,
-            weight_grams: ctx.package.weightGrams,
-            length_cm: ctx.package.lengthCm,
-            breadth_cm: ctx.package.breadthCm,
-            height_cm: ctx.package.heightCm,
             freight_charge: data.freightCharge,
             tracking_url: data.trackingUrl || null,
             request_payload: JSON.stringify(data.requestPayload || ctx),
             response_payload: result.raw ? JSON.stringify(result.raw) : null,
-            shipped_by: shippedBy || 'admin',
-            reship_of_shipment_id: reshipOf ? reshipOf.id : null,
-            reship_reason: reshipReason || null,
-            batch_id: batchId || null
-        });
+            updated_at: new Date().toISOString()
+        }, { id: claimRow.id });
+        shipmentRow = (await dbAdapter.select('shipments', { id: claimRow.id }))[0] || { ...claimRow, ...data };
     } catch (dbError) {
-        // Unique-index race: another request shipped this order between our check and insert
         if (dbError.code === '23505') {
             return { error: `Order ${ctx.orderId} was just shipped by another request`, status: 409 };
         }
-        console.error('❌ Shipment created at carrier but DB insert failed:', dbError.message);
+        console.error('❌ Shipment created at carrier but DB update failed:', dbError.message);
         return {
             error: `Shipment created at ${adapter.name} (AWB: ${data.awb}) but failed to save locally: ${dbError.message}`,
             status: 500,
