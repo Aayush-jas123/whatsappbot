@@ -7,6 +7,7 @@ const cors = require('cors');
 const path = require('path');
 const axios = require('axios');
 const { sharedHttpsAgent, sharedHttpAgent, reapIdleSockets } = require('./src/utils/httpAgent');
+const { createAppLogger, installConsoleShim } = require('./src/utils/logger');
 
 // Route ALL outbound axios traffic (Meta WhatsApp, Shiprocket, Delhivery,
 // Ekart, Shopify, Zoho, AI providers) through the bounded shared agent.
@@ -15,6 +16,12 @@ const { sharedHttpsAgent, sharedHttpAgent, reapIdleSockets } = require('./src/ut
 // capping + reaping free sockets in httpAgent.js.
 axios.defaults.httpsAgent = sharedHttpsAgent;
 axios.defaults.httpAgent = sharedHttpAgent;
+
+// Route every console.* call in this app through winston with central redaction
+// (Phase 1 §A1): ~5,486 existing sites, none of them edited. Installed before
+// the route/service requires below so their boot-time logs go through it too.
+// dotenv ran on line 1, so LOG_LEVEL / LOG_QUIET / LOG_RAW are already live.
+installConsoleShim(createAppLogger({ level: 'warn' }));
 
 const messageHandler = require('./src/handlers/messageHandler');
 const adminRoutes = require('./src/routes/adminRoutes');
