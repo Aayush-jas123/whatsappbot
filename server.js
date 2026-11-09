@@ -125,10 +125,16 @@ app.use('/webhooks/shopify', express.raw({ type: '*/*' }));
 // Raw body for GoKwik webhook HMAC verification (parsed after signature check)
 app.use('/webhooks/gokwik', express.raw({ type: '*/*' }));
 
-// Raw body for Zoho middleware webhook HMAC verification — must run BEFORE
-// the global JSON parser, otherwise req.body is already an Object and the
-// HMAC check crashes with ERR_INVALID_ARG_TYPE
-app.use('/webhooks/zoho', express.raw({ type: '*/*' }));
+// Raw body for the Zoho middleware's Shopify notification webhooks ONLY —
+// their HMAC check needs the exact bytes, and raw must run BEFORE the global
+// JSON parser or req.body is already an Object and the check crashes with
+// ERR_INVALID_ARG_TYPE. It is deliberately NOT mounted on the whole
+// /webhooks/zoho prefix: the internal intake routes on that prefix
+// (/exchange, /return, /manual-sync) destructure req.body directly, and a
+// prefix-wide raw parser leaves it a Buffer — every field reads as undefined,
+// they answer 200 "received" and then silently do nothing.
+app.use('/webhooks/zoho/orders', express.raw({ type: '*/*' }));
+app.use('/webhooks/zoho/refunds', express.raw({ type: '*/*' }));
 
 // Regular JSON parsing for all other routes
 app.use(express.json());

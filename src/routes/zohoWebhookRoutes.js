@@ -281,12 +281,30 @@ function requireInternalToken(req, res, next) {
     return res.status(401).json({ error: 'Unauthorized' });
 }
 
+// Internal callers post plain JSON, but express.raw() still leaves req.body a
+// Buffer whenever a raw parser runs for the mounted path. Destructuring a
+// Buffer yields undefined for every field, so a route would answer 200 and
+// then bail on "missing order_id" — the exchange/return never reaches Zoho.
+// Parses the raw bytes when they are there; a no-op once JSON parsing ran.
+function parseJsonBody(req, res, next) {
+    const raw = Buffer.isBuffer(req.body)
+        ? req.body.toString('utf8')
+        : (typeof req.body === 'string' ? req.body : null);
+    if (raw === null) return next();
+    try {
+        req.body = raw ? JSON.parse(raw) : {};
+    } catch (e) {
+        return res.status(400).json({ error: 'Invalid JSON body' });
+    }
+    next();
+}
+
 // ============================================================
 // CARRIER DELIVERY WEBHOOK — COD reconciliation + RTO
 // Called by existing carrier webhook handlers or Delhivery/Shiprocket
 // ============================================================
 
-router.post('/carrier/delivery', requireInternalToken, async (req, res) => {
+router.post('/carrier/delivery', requireInternalToken, parseJsonBody, async (req, res) => {
     res.status(200).json({ received: true });
 
     try {
@@ -338,7 +356,7 @@ router.post('/carrier/delivery', requireInternalToken, async (req, res) => {
 // Ensures Zoho reflects the REAL returned/exchanged product, not the original.
 // ============================================================
 
-router.post('/exchange', requireInternalToken, async (req, res) => {
+router.post('/exchange', requireInternalToken, parseJsonBody, async (req, res) => {
     res.status(200).json({ received: true });
 
     try {
@@ -381,7 +399,7 @@ router.post('/exchange', requireInternalToken, async (req, res) => {
 // Creates a credit note in Zoho mirroring the original invoice.
 // ============================================================
 
-router.post('/return', requireInternalToken, async (req, res) => {
+router.post('/return', requireInternalToken, parseJsonBody, async (req, res) => {
     res.status(200).json({ received: true });
 
     try {
@@ -402,7 +420,7 @@ router.post('/return', requireInternalToken, async (req, res) => {
 // MANUAL SYNC — trigger sync for a specific order (dashboard)
 // ============================================================
 
-router.post('/manual-sync', async (req, res) => {
+router.post('/manual-sync', parseJsonBody, async (req, res) => {
     try {
         const { order_id } = req.body;
         if (!order_id) {
