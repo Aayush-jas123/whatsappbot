@@ -27,9 +27,11 @@ const summary = {
     totalOverdue: 0,
     withRtoCreditNote: 0,
     alreadyBalanced: 0,
+    alreadyToppedUp: 0,
     unbalanced: 0,
     appliedCredit: 0,
     createdCreditNote: 0,
+    skipped: 0,
     failed: 0,
     errors: []
 };
@@ -130,6 +132,22 @@ function buildRtoCreditNoteMap(rtoCreditNotes) {
 }
 
 /**
+ * Orders that a top-up note (RTO-MISC-* / RTO-ROUND-*) has already been
+ * issued for. Without this the script re-issued a fresh note on every run —
+ * production shows the same order credited by RTO-<order>, RTO-MISC-<order>
+ * and two RTO-ROUND-<order> notes, four documents where one was enough.
+ */
+function buildAlreadyToppedUpSet(rtoCreditNotes) {
+    const done = new Set();
+    for (const cn of rtoCreditNotes) {
+        const ref = String(cn.reference_number || '');
+        const m = ref.match(/^RTO-(?:MISC|ROUND)-.*?(\d{3,})/);
+        if (m) done.add(m[1]);
+    }
+    return done;
+}
+
+/**
  * Create additional credit notes for remaining non-product charges
  * (shipping, COD charges, etc.) that were missed in the original RTO credit note.
  */
@@ -211,7 +229,8 @@ async function fixRtoInvoiceBalancesBulk() {
     // Step 1: Fetch RTO credit notes (list API — fast)
     const rtoCreditNotes = await fetchAllRtoCreditNotes();
     const rtoMap = buildRtoCreditNoteMap(rtoCreditNotes);
-    log(`Built RTO credit note map: ${rtoMap.size} invoices linked`);
+    const toppedUp = buildAlreadyToppedUpSet(rtoCreditNotes);
+    log(`Built RTO credit note map: ${rtoMap.size} invoices linked, ${toppedUp.size} orders already topped up`);
 
     // Step 2: Fetch overdue invoices (list API — fast, includes balance)
     const overdueInvoices = await fetchOverdueInvoices();
@@ -231,6 +250,13 @@ async function fixRtoInvoiceBalancesBulk() {
 
         const rtoCn = rtoMap.get(invOrderNum);
         if (!rtoCn) continue; // overdue but no RTO credit note — not our problem
+
+        // A top-up note for this order already exists — re-issuing one is how
+        // invoices ended up with three or four credit notes.
+        if (toppedUp.has(invOrderNum)) {
+            summary.alreadyToppedUp++;
+            continue;
+        }
 
         summary.withRtoCreditNote++;
         unbalanced.push({
@@ -258,8 +284,12 @@ async function fixRtoInvoiceBalancesBulk() {
 
     // Step 4: Fix each unbalanced invoice — OPTIMIZED: 1 API call per invoice
     // No getInvoice detail fetch, no checkCreditNoteBalance.
-    // Compute credit note from list data: balance is tax-inclusive at 5% IGST,
-    // so rate = balance/1.05, igst_rate = 5, is_inclusive_tax = true.
+    // The note is issued tax-INCLUSIVE (is_inclusive_tax: true), the same basis
+    // as the invoice, so the line rate IS the amount credited: rate = balance.
+    // Dividing the balance by 1.05 (or searching for a rate whose rate+GST
+    // equals the balance) makes Books extract the GST INSIDE the given rate, so
+    // the note credits less than the balance and the invoice still owes the tax
+    // — that residual is exactly what produced the extra RTO-ROUND note on top.
     log(`\nProcessing ${Math.min(unbalanced.length, LIMIT)} unbalanced RTO invoices (1 API call each)...`);
     const toProcess = unbalanced.slice(0, LIMIT);
     let totalCreditValue = 0;
@@ -270,8 +300,12 @@ async function fixRtoInvoiceBalancesBulk() {
 
         try {
             if (APPLY) {
-                // Compute pre-tax amount: balance / 1.05 (tax-inclusive at 5% IGST)
-                const preTaxRate = Math.round((inv.balance / 1.05) * 100) / 100;
+                const balance = Math.round(parseFloat(inv.balance) * 100) / 100;
+                if (!(balance > 1)) {
+                    log(`  [${i + 1}/${toProcess.length}] ⏭️  ${inv.invoice_number}: balance ₹${balance.toFixed(2)} is rounding dust — no document`);
+                    summary.skipped++;
+                    continue;
+                }
 
                 const creditNotePayload = {
                     customer_id: inv.customer_id,
@@ -281,7 +315,7 @@ async function fixRtoInvoiceBalancesBulk() {
                         name: 'RTO Shipping/COD Charge Reversal',
                         description: `Reversal of unreversed shipping/COD charges for RTO order`,
                         quantity: 1,
-                        rate: preTaxRate,
+                        rate: balance,
                         igst_rate: 5
                     }],
                     notes: `RTO balance reversal — Shopify Order ${orderNum}`,
@@ -325,10 +359,12 @@ async function fixRtoInvoiceBalancesBulk() {
     log('SUMMARY');
     log('='.repeat(60));
     log(`Total overdue invoices scanned:    ${summary.totalOverdue}`);
+    log(`Already topped up (skipped):       ${summary.alreadyToppedUp}`);
     log(`With RTO credit note:              ${summary.withRtoCreditNote}`);
     log(`Already balanced:                  ${summary.alreadyBalanced}`);
     log(`Unbalanced (needs fix):            ${summary.unbalanced}`);
     log(`Applied unapplied credit:          ${summary.appliedCredit}`);
+    log(`Rounding dust (no document):       ${summary.skipped}`);
     log(`Created additional credit note:    ${summary.createdCreditNote}`);
     log(`Total credit value:                ₹${totalCreditValue.toFixed(2)}`);
     log(`Failed:                            ${summary.failed}`);

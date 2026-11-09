@@ -329,21 +329,35 @@ async function applyCreditNote(creditNoteId, invoiceId, amount) {
 }
 
 /**
- * Search credit notes. Books' list API does not reliably filter by
- * reference_number server-side, so fetch pages and filter client-side.
- * Used for Zoho-side duplicate prevention (one order → one credit note).
+ * Search credit notes. Books filters `reference_number` and `search_text`
+ * server-side (verified against production: reference_number=RTO-61484 returns
+ * that one note, search_text=61484 returns every note naming the order), so a
+ * duplicate lookup no longer has to page the whole ledger. The previous
+ * implementation scanned only the 5 newest pages (~1,000 notes) and filtered
+ * locally — with 2,400+ notes in the FY and ~100 created a day, an order's own
+ * note fell out of that window within days, the dedupe check reported "no
+ * existing note" and a second/third credit note was written against the same
+ * invoice.
  */
-async function searchCreditNotes({ reference_number, page_limit = 5 } = {}) {
+async function searchCreditNotes({ reference_number, search_text, page_limit = 20 } = {}) {
+    const filters = {};
+    if (reference_number) filters.reference_number = String(reference_number).trim();
+    else if (search_text) filters.search_text = String(search_text).trim();
+
     const all = [];
     for (let page = 1; page <= page_limit; page++) {
-        const result = await zohoRequest('get', `${BOOKS_BASE()}/creditnotes`, null, { page, per_page: 200 });
+        const result = await zohoRequest('get', `${BOOKS_BASE()}/creditnotes`, null, { ...filters, page, per_page: 200 });
         const notes = result.creditnotes || [];
         all.push(...notes);
         if (notes.length < 200) break;
     }
-    if (!reference_number) return all;
-    const ref = String(reference_number).trim();
-    return all.filter(cn => String(cn.reference_number || '').trim() === ref);
+    // Keep the exact-match guarantee: a server-side filter can also return
+    // notes whose reference merely contains the value.
+    if (reference_number) {
+        const ref = String(reference_number).trim();
+        return all.filter(cn => String(cn.reference_number || '').trim() === ref);
+    }
+    return all;
 }
 
 async function updateInvoice(invoiceId, invoicePayload, reason) {

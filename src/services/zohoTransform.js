@@ -617,7 +617,7 @@ function taxFromInvoiceLine(line) {
     return out;
 }
 
-function creditLineFromInvoiceLine(line, qty, returnType) {
+function creditLineFromInvoiceLine(line, qty, returnType, isInclusiveTax = false) {
     const invoiceQty = parseFloat(line.quantity || 1) || 1;
 
     // Per-unit discount the original invoice gave on this line, so the
@@ -643,9 +643,14 @@ function creditLineFromInvoiceLine(line, qty, returnType) {
     discount = Math.min(discount, round2(rate * qty));
 
     // No explicit discount fields but item_total shows a lower net — fall
-    // back to the net unit price so credited amount still matches invoice
+    // back to the net unit price so credited amount still matches invoice.
+    // ONLY for tax-EXCLUSIVE lines: on an inclusive line item_total is the
+    // ex-GST value by definition (rate 1199 → item_total 1141.90), so
+    // adopting it would strip the GST off the credit and leave the invoice
+    // owing exactly that tax — which is what forced the second and third
+    // "RTO-MISC"/"RTO-ROUND" credit notes onto every RTO invoice.
     const itemTotal = parseFloat(line.item_total);
-    if (!lineDiscountTotal && !isNaN(itemTotal) && itemTotal < rate * invoiceQty - 0.01 && invoiceQty > 0) {
+    if (!isInclusiveTax && !lineDiscountTotal && !isNaN(itemTotal) && itemTotal < rate * invoiceQty - 0.01 && invoiceQty > 0) {
         rate = round2(itemTotal / invoiceQty);
         discount = 0;
     }
@@ -730,7 +735,7 @@ async function buildCreditNoteFromInvoice({
         const qty = Math.min(parseInt(ret.quantity || 1) || 1, (line.quantity || 0) - line._credited);
         if (qty <= 0) continue;
         line._credited += qty;
-        lineItems.push(creditLineFromInvoiceLine(line, qty, returnType));
+        lineItems.push(creditLineFromInvoiceLine(line, qty, returnType, !!originalInvoice?.is_inclusive_tax));
     }
 
     return {

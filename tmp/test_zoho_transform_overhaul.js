@@ -122,6 +122,64 @@ function check(label, cond, detail = '') {
     });
     check('returned bundle credited as size-wise singles', cn3.line_items.length === 1 && cn3.line_items[0].name.includes('- S') && cn3.line_items[0].quantity === 3 && cn3.line_items[0].item_id === '333', JSON.stringify(cn3.line_items));
 
+    // ---- 4b. Tax-inclusive lines must NOT be knocked down to item_total ----
+    // Production shape (order #65569 / OFF/26-27/51583): undiscounted line,
+    // rate is GST-inclusive, item_total is the ex-GST value. Adopting
+    // item_total credited ₹1,141.90 of a ₹1,199.00 line and left the invoice
+    // owing ₹57.10 — the residual that became a second and third credit note.
+    const inclusiveInvoice = {
+        invoice_id: 'invInc', is_inclusive_tax: true,
+        line_items: [
+            {
+                name: 'RAGLAN 001 (W) - L', sku: 'RAGLAN 001 (W) - L', item_id: '555',
+                quantity: 1, rate: 1199, item_total: 1141.90, discounts: [],
+                taxes: [{ tax_name: 'IGST', rate: 5 }]
+            },
+            {
+                name: 'HENLEY - 001 ( GREY ) (M)', sku: 'HENLEY - 001 ( GREY ) (M)',
+                item_id: '666', quantity: 1, rate: 1199, discount: 191.52,
+                discount_amount: 191.52, item_total: 959.50,
+                // Zoho also reports the invoice-level discount allocation here;
+                // it is NOT deducted from the invoice total, so it must not be
+                // added to the line discount (order #61484 credited ₹1,818 of
+                // a ₹2,198 invoice this way).
+                discounts: [{ discount_amount: 182.40 }],
+                taxes: [{ tax_name: 'IGST', rate: 5 }]
+            }
+        ]
+    };
+    const cnInc = await buildCreditNoteFromInvoice({
+        shopifyOrder,
+        returnItems: [{ title: 'RAGLAN 001 (W) - L', sku: 'RAGLAN 001 (W) - L', quantity: 1, price: 1199 }],
+        returnType: 'rto', originalInvoice: inclusiveInvoice, referenceNumber: 'RTO-65569'
+    });
+    check('inclusive line keeps its GST-inclusive rate', cnInc.line_items[0].rate === 1199, `rate=${cnInc.line_items[0].rate}`);
+
+    const cnInc2 = await buildCreditNoteFromInvoice({
+        shopifyOrder,
+        returnItems: [{ title: 'HENLEY - 001 ( GREY ) (M)', sku: 'HENLEY - 001 ( GREY ) (M)', quantity: 1, price: 1199 }],
+        returnType: 'rto', originalInvoice: inclusiveInvoice, referenceNumber: 'RTO-61484'
+    });
+    check('inclusive line discount is the largest source, not the sum',
+        cnInc2.line_items[0].discount === 191.52, `discount=${cnInc2.line_items[0].discount}`);
+
+    // Tax-exclusive line whose item_total really is a hidden discount still
+    // falls back, so the guard does not lose the case it was written for.
+    const exclusiveInvoice = {
+        invoice_id: 'invEx', is_inclusive_tax: false,
+        line_items: [{
+            name: 'RAGLAN - 002 ( G ) - M', sku: 'RAGLAN - 002 ( G ) - M', item_id: '777',
+            quantity: 1, rate: 1000, item_total: 900, discounts: [],
+            taxes: [{ tax_name: 'IGST', rate: 5 }]
+        }]
+    };
+    const cnEx = await buildCreditNoteFromInvoice({
+        shopifyOrder,
+        returnItems: [{ title: 'RAGLAN - 002 ( G ) - M', sku: 'RAGLAN - 002 ( G ) - M', quantity: 1, price: 1000 }],
+        returnType: 'rto', originalInvoice: exclusiveInvoice, referenceNumber: 'RTO-70001'
+    });
+    check('exclusive line still adopts item_total', cnEx.line_items[0].rate === 900, `rate=${cnEx.line_items[0].rate}`);
+
     // ---- 5. Legacy fallback derives tax from decision (not hardcoded) ----
     const legacy = buildCreditNotePayload(shopifyOrder, [{ title: 'X', quantity: 1, price: 100 }], 'rto', '', { taxType: 'igst' });
     check('legacy fallback honors IGST decision', legacy.line_items[0].igst_rate === 5 && !legacy.line_items[0].cgst_rate, JSON.stringify(legacy.line_items[0]));

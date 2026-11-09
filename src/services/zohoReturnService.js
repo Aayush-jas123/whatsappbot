@@ -134,6 +134,20 @@ async function buildMirroredCreditNotePayload({
 }
 
 /**
+ * What a payload would credit, measured the same way Books will: tax-
+ * inclusive lines already contain their GST, exclusive lines need it added.
+ */
+function estimatePayloadTotal(payload) {
+    const inclusive = !!payload?.is_inclusive_tax;
+    return (payload?.line_items || []).reduce((sum, l) => {
+        const net = (parseFloat(l.rate) || 0) * (parseFloat(l.quantity) || 1) - (parseFloat(l.discount) || 0);
+        const pct = (parseFloat(l.cgst_rate) || 0) + (parseFloat(l.sgst_rate) || 0)
+            + (parseFloat(l.igst_rate) || 0);
+        return sum + (inclusive ? net : net * (1 + pct / 100));
+    }, 0);
+}
+
+/**
  * Books rejects a credit note whose total would exceed the invoice total or
  * fall below zero ("credit notes balance isn't negative") — cap the lines at
  * the remaining creditable amount, proportionally, instead of failing. Runs
@@ -146,18 +160,18 @@ function capCreditNoteToBalance(payload, fullInvoice, reference, returnType) {
         const alreadyCredited = parseFloat(fullInvoice?.credits_applied) || 0;
         if (Number.isFinite(invoiceTotal) && invoiceTotal > 0) {
             const remaining = invoiceTotal - alreadyCredited;
-            const inclusive = !!payload.is_inclusive_tax;
-
-            const estTotal = (payload.line_items || []).reduce((sum, l) => {
-                const net = (parseFloat(l.rate) || 0) * (parseFloat(l.quantity) || 1) - (parseFloat(l.discount) || 0);
-                const pct = (parseFloat(l.cgst_rate) || 0) + (parseFloat(l.sgst_rate) || 0)
-                    + (parseFloat(l.igst_rate) || 0);
-                return sum + (inclusive ? net : net * (1 + pct / 100));
-            }, 0);
+            const estTotal = estimatePayloadTotal(payload);
 
             if (remaining <= 0.02) {
                 console.log(`ℹ️ Zoho ${returnType}: invoice ${fullInvoice.invoice_id} already fully credited (₹${alreadyCredited.toFixed(2)} of ₹${invoiceTotal.toFixed(2)}) — skipping ${reference}`);
-                return { fullyCredited: true };
+                return { fullyCredited: true, estTotal };
+            }
+            // A note for less than ₹1 is accounting dust: it costs a document,
+            // needs applying, and is what the "RTO-ROUND" notes were. Leave the
+            // paise on the invoice instead of issuing another credit note.
+            if (remaining <= 1) {
+                console.log(`ℹ️ Zoho ${returnType}: only ₹${remaining.toFixed(2)} creditable on invoice ${fullInvoice.invoice_number || fullInvoice.invoice_id} — skipping ${reference} (rounding dust, no document issued)`);
+                return { fullyCredited: true, estTotal };
             }
             if (estTotal < -0.02) {
                 throw new Error(`Credit note ${reference} built a negative total (₹${estTotal.toFixed(2)}) — discount mirroring bug, aborting before Zoho rejects it`);
@@ -177,7 +191,31 @@ function capCreditNoteToBalance(payload, fullInvoice, reference, returnType) {
         if (/negative total/.test(capErr.message)) throw capErr;
         console.warn(`⚠️ Zoho ${returnType}: balance-cap check failed (${capErr.message}) — attempting full amount`);
     }
-    return { fullyCredited: false };
+    return { fullyCredited: false, estTotal: 0 };
+}
+
+/**
+ * Amount already credited on this invoice by notes raised for the same order
+ * under ANY reference prefix. Each trigger names its own reference (RTO-,
+ * RET-, RETP-, EXCH-, and the RTO-MISC-/RTO-ROUND- remediation notes), so the
+ * per-reference dedupe cannot see that the order has already been reversed —
+ * that blindness is what left three or four credit notes on one invoice.
+ */
+async function creditedForOrderOnInvoice({ orderId, fullInvoice }) {
+    const orderNum = String(orderId || '').replace(/^#/, '').trim();
+    const invoiceNumber = String(fullInvoice?.invoice_number || '').trim();
+    if (!orderNum || !invoiceNumber) return { notes: [], total: 0 };
+    const notes = await zohoService.searchCreditNotes({ search_text: orderNum });
+    const onThisInvoice = notes.filter(cn => {
+        const ref = String(cn.reference_number || '');
+        if (!ref.includes(orderNum)) return false;
+        const linked = String(cn.invoice_number || '') || JSON.stringify(cn.applied_invoices || '');
+        return linked.includes(invoiceNumber) || linked.includes(orderNum);
+    });
+    return {
+        notes: onThisInvoice,
+        total: onThisInvoice.reduce((s, cn) => s + (parseFloat(cn.total) || 0), 0)
+    };
 }
 
 /**
@@ -246,11 +284,17 @@ async function prepareAndCreateCreditNote({ shopifyOrder, orderId, returnItems, 
         const invoiceItemLines = fullInvoice.line_items.filter(l => !isNonProductLine(l));
         const nonProductLines = fullInvoice.line_items.filter(l => isNonProductLine(l));
 
-        // Check if all invoice product items are being returned
+        // Check if all invoice product items are being returned. The count has
+        // to come from the lines actually built into the note, not from the
+        // incoming returnItems: a returned BUNDLE arrives as one unit but is
+        // credited as its components, so comparing raw return qty (1) against
+        // invoice product qty (2) failed the test and left shipping/COD on the
+        // invoice — the residual that later needed its own credit note.
         const totalInvoiceQty = invoiceItemLines.reduce((sum, l) => sum + parseFloat(l.quantity || 0), 0);
-        const totalReturnQty = returnItems.reduce((sum, l) => sum + parseInt(l.quantity || 1), 0);
+        const totalCreditedQty = (creditNotePayload.line_items || [])
+            .reduce((sum, l) => sum + (parseFloat(l.quantity) || 0), 0);
 
-        if (totalReturnQty >= totalInvoiceQty && totalInvoiceQty > 0) {
+        if (totalCreditedQty >= totalInvoiceQty && totalInvoiceQty > 0) {
             // All items returned — add shipping/COD lines to credit note
             for (const extraLine of nonProductLines) {
                 const creditLine = {
@@ -283,6 +327,32 @@ async function prepareAndCreateCreditNote({ shopifyOrder, orderId, returnItems, 
     const cap = capCreditNoteToBalance(creditNotePayload, fullInvoice, reference, returnType);
     if (cap.fullyCredited) {
         return { success: true, creditNoteId: null, fullyCredited: true, creditNoteTotal: 0, customerId };
+    }
+
+    // Invoice-level dedupe: the same order can reach Zoho through several
+    // triggers (RTO hook, Shopify refund, returns portal, exchange), each with
+    // its own reference prefix, so the per-reference check above cannot see
+    // the earlier note. Without this the later trigger silently issued another
+    // document for whatever was still uncredited — the 2nd/3rd/4th credit note
+    // on one invoice.
+    const wantToCredit = Math.round(estimatePayloadTotal(creditNotePayload) * 100) / 100;
+    try {
+        const already = await creditedForOrderOnInvoice({ orderId, fullInvoice });
+        if (already.notes.length > 0 && already.total >= wantToCredit - 1) {
+            console.log(`✅ Zoho ${returnType}: order #${String(orderId).replace(/^#/, '')} already carries ${already.notes.length} credit note(s) on ${fullInvoice.invoice_number || fullInvoice.invoice_id} totalling ₹${already.total.toFixed(2)} ≥ this request ₹${wantToCredit.toFixed(2)} — no new document`);
+            return {
+                success: true,
+                alreadyProcessed: true,
+                creditNoteId: already.notes[0].creditnote_id,
+                creditNoteTotal: already.total,
+                customerId
+            };
+        }
+        if (already.notes.length > 0) {
+            console.warn(`⚠️ Zoho ${returnType}: order #${String(orderId).replace(/^#/, '')} already has ${already.notes.length} credit note(s) worth ₹${already.total.toFixed(2)} on ${fullInvoice.invoice_number || fullInvoice.invoice_id}; this request needs ₹${wantToCredit.toFixed(2)}, so ₹${(wantToCredit - already.total).toFixed(2)} will be credited as an additional note`);
+        }
+    } catch (guardErr) {
+        console.warn(`⚠️ Zoho ${returnType}: invoice-level credit note dedupe failed (${guardErr.message}) — continuing with the per-reference result`);
     }
 
     const creditNote = await zohoService.createCreditNote(creditNotePayload);

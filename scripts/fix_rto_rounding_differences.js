@@ -1,7 +1,8 @@
 #!/usr/bin/env node
 /**
- * Fix small rounding differences (₹2-5) on RTO invoices
+ * Fix rounding differences on RTO invoices
  * Creates additional credit notes for the exact remaining balance
+ * Handles both small (₹1-10) and larger (₹10-100) residuals
  */
 
 require('dotenv').config();
@@ -72,8 +73,14 @@ async function main() {
   // Build set of order numbers with RTO credit notes + customer info map + tax type
   const rtoOrderSet = new Set();
   const customerMap = new Map();
+  // Orders that already got a rounding note: this script ran twice on 22 Oct
+  // and issued a second RTO-ROUND note for the same order on ~200 invoices,
+  // because nothing here remembered the notes it had just created.
+  const alreadyRounded = new Set();
   for (const cn of allCreditNotes) {
     const ref = cn.reference_number || '';
+    const roundMatch = ref.match(/^RTO-ROUND-.*?(\d{3,})/);
+    if (roundMatch) alreadyRounded.add(roundMatch[1]);
     const match = ref.match(/RTO[-_]?(?:MISC[-_]|ROUND[-_])?(\d+)/);
     if (match) {
       const orderNum = match[1];
@@ -104,14 +111,14 @@ async function main() {
   const sampleRtoOrders = Array.from(rtoOrderSet).slice(0, 5);
   log(`Sample RTO order numbers: ${sampleRtoOrders.join(', ')}`);
 
-  // Debug: show invoices with small balances
-  const smallBalInvoices = allInvoices.filter(inv => {
+  // Debug: show invoices with balances
+  const balInvoices = allInvoices.filter(inv => {
     const balance = parseFloat(inv.balance);
-    return balance > 0.5 && balance <= 10;
+    return balance > 0.5 && balance <= 100;
   });
-  log(`Invoices with balance ₹1-10: ${smallBalInvoices.length}`);
-  if (smallBalInvoices.length > 0) {
-    const sample = smallBalInvoices.slice(0, 3);
+  log(`Invoices with balance ₹0.50-100: ${balInvoices.length}`);
+  if (balInvoices.length > 0) {
+    const sample = balInvoices.slice(0, 3);
     for (const inv of sample) {
       const invRef = inv.reference_number || '';
       const orderNum = invRef.replace(/^#/, '').replace(/.*\//, '').trim();
@@ -119,17 +126,19 @@ async function main() {
     }
   }
 
-  // Filter to invoices with small balances (₹1-10) that have RTO credit notes
+  // Filter to invoices with balances (₹0.50-100) that have RTO credit notes
+  // Expanded from ₹1-10 to catch larger residuals like ₹61.86
   const smallBalanceInvoices = allInvoices.filter(inv => {
     const balance = parseFloat(inv.balance);
     const invRef = inv.reference_number || '';
     const orderNum = invRef.replace(/^#/, '').replace(/.*\//, '').trim();
     
-    // Small balance + in RTO set = needs rounding fix
-    return balance > 0.5 && balance <= 10 && rtoOrderSet.has(orderNum);
+    // Balance in range + in RTO set = needs rounding fix
+    return balance > 0.5 && balance <= 100 && rtoOrderSet.has(orderNum)
+        && !alreadyRounded.has(orderNum);
   });
 
-  log(`Found ${smallBalanceInvoices.length} invoices with small balances (₹1-10) and RTO credit notes`);
+  log(`Found ${smallBalanceInvoices.length} invoices with balances (₹0.50-100) and RTO credit notes`);
 
   if (smallBalanceInvoices.length === 0) {
     log('No invoices to fix');
@@ -159,54 +168,18 @@ async function main() {
         continue;
       }
       
-      // Calculate pre-tax rate that will result in exact balance after tax
-      // For IGST: total = rate + round(rate × 0.05, 2)
-      // For CGST/SGST: total = rate + round(rate × 0.025, 2) × 2
-      // Try multiple rates and pick the one that produces exact balance
-      
-      const isCgstSgst = customerInfo.tax_type === 'cgst_sgst';
-      const initialEstimate = balance / (isCgstSgst ? 1.05 : 1.05);
-      
-      let preTaxRate = null;
-      let bestDiff = Infinity;
-      
-      // Try rates in a range around the initial estimate
-      for (let cents = Math.floor(initialEstimate * 100) - 10; cents <= Math.ceil(initialEstimate * 100) + 10; cents++) {
-        const rate = cents / 100;
-        let total;
-        
-        if (isCgstSgst) {
-          // CGST + SGST: each 2.5%, rounded independently
-          const cgst = Math.round(rate * 0.025 * 100) / 100;
-          const sgst = Math.round(rate * 0.025 * 100) / 100;
-          total = rate + cgst + sgst;
-        } else {
-          // IGST: 5%
-          const igst = Math.round(rate * 0.05 * 100) / 100;
-          total = rate + igst;
-        }
-        
-        const diff = Math.abs(total - balance);
-        if (diff < bestDiff) {
-          bestDiff = diff;
-          preTaxRate = rate;
-        }
-        
-        // If we found an exact match, stop
-        if (diff === 0) break;
-      }
-      
-      // If no exact match found, use the closest
-      if (bestDiff > 0) {
-        log(`  [${i+1}/${smallBalanceInvoices.length}] ⚠️  ${inv.invoice_number}: No exact match, best diff: ₹${bestDiff.toFixed(2)}`);
-      }
-      
-      // Build line item with matching tax structure
+      // The note is issued tax-INCLUSIVE (is_inclusive_tax: true below), the
+      // same basis as the invoice, so the line rate IS the amount credited:
+      // rate = balance. Searching for a rate whose rate+GST equals the balance
+      // makes Books extract the GST inside the given rate, so the note credits
+      // less than the balance and the invoice keeps owing tax — the very
+      // residual this script exists to clear, which is how one invoice ended up
+      // with an RTO note, an RTO-MISC note and two RTO-ROUND notes.
       const lineItem = {
         name: 'RTO Rounding Adjustment',
         description: 'Adjustment for tax rounding difference on RTO order',
         quantity: 1,
-        rate: preTaxRate
+        rate: Math.round(balance * 100) / 100
       };
             
       // Apply tax based on invoice tax type
