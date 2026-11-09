@@ -447,10 +447,13 @@ function dominantInvoiceTax(invoiceLines) {
  * down proportionally and the last line absorbs the rounding, so the document
  * lands exactly on the credit note total.
  *
- * The comparison is TAX INCLUSIVE, because the ceiling is a credit note total
- * (which carries GST) and the line rates do not. Comparing a pre-tax rate with
- * a tax-inclusive note leaves the tax behind as a phantom due: a ₹1,234.05 note
- * against a ₹1,234.05 rate plus 5% GST still bills ₹61.70.
+ * The comparison is made on the amount the document actually bills, which
+ * depends on the line's tax basis: on an is_inclusive_tax line Books lifts the
+ * GST out of the rate, so the rate itself is the gross amount, while a
+ * tax-exclusive line bills rate + tax. The ceiling is a credit note total,
+ * which is always tax-inclusive, so comparing it against a pre-tax rate leaves
+ * the tax behind as a phantom due: a ₹1,234.05 note against a ₹1,234.05
+ * tax-exclusive rate still bills ₹1,295.75.
  *
  * Only ever scales DOWN: a cheaper replacement keeps its own price and the
  * difference stays as unused customer credit (refundable), which is correct.
@@ -465,7 +468,9 @@ const lineTaxPct = (l) => {
 function capLinesToTotal(lines, capTotal) {
     if (!lines?.length) return lines;
     const qtyOf = (l) => parseFloat(l.quantity) || 1;
-    const multOf = (l) => 1 + lineTaxPct(l) / 100;
+    // An inclusive line already bills its own rate — grossing it up again here
+    // would make the cap shrink a rate that never needed shrinking.
+    const multOf = (l) => (l.is_inclusive_tax ? 1 : 1 + lineTaxPct(l) / 100);
     const gross = (l) => money(money(l.rate) * qtyOf(l) * multOf(l));
     const total = money(lines.reduce((s, l) => s + gross(l), 0));
     const target = money(capTotal);
@@ -496,6 +501,20 @@ function capLinesToTotal(lines, capTotal) {
  */
 async function buildReplacementInvoiceLines({ invoiceLines = [], originalItems = [], exchangedItems = [], capTotal = 0 }) {
     if (!exchangedItems?.length) return [];
+    // The price on an exchange record is the PRE-TAX amount, while every line
+    // written here is marked is_inclusive_tax — Books then lifts the GST out of
+    // the rate instead of adding it on top (verified on OFF/26-27/55894: rate
+    // ₹1,175.29 → total ₹1,175.29, sub_total ₹1,119.32). Billing the recorded
+    // price as it comes therefore drops the tax the customer already paid: a
+    // ₹1,234.05 credit note against a ₹1,175.29 replacement, the ₹58.76
+    // difference stranded as unused customer credit, and revenue understated by
+    // it. That was happening on 674 of the 751 backfilled swaps. Gross the
+    // recorded price by the tax split of the line it replaces, so the two
+    // documents mirror each other and a like-for-like swap nets to zero.
+    const recordedPct = dominantInvoiceTax(invoiceLines)?.tax_percentage || 0;
+    const toGross = (price, origLine) => money(price * (1
+        + (origLine ? taxFromInvoiceLine(origLine).tax_percentage : recordedPct) / 100));
+
     const lines = await buildSwapLines({
         invoiceLines,
         fromItems: originalItems,
@@ -504,7 +523,7 @@ async function buildReplacementInvoiceLines({ invoiceLines = [], originalItems =
         newDocument: true,
         rateFor: (exItem, inheritedRate, origLine) => {
             const explicit = parseFloat(exItem.price) || 0;
-            if (explicit > 0) return explicit;
+            if (explicit > 0) return toGross(explicit, origLine);
             // No price on the exchange record: bill what the customer ACTUALLY
             // paid for the item being replaced, net of its line discount. The
             // replacement line carries no discount of its own, so inheriting
