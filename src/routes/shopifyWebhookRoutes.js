@@ -46,19 +46,13 @@ const verifyShopifyWebhook = (req, res, next) => {
         .digest('base64');
 
     if (digest !== hmacHeader) {
-        console.warn('╔════════════════════════════════════════════════════════════════════╗');
-        console.warn('║  ⚠️  SHOPIFY WEBHOOK HMAC VERIFICATION FAILED                      ║');
-        console.warn('╠════════════════════════════════════════════════════════════════════╣');
-        console.warn('║  Expected (computed):', digest);
-        console.warn('║  Received (header):  ', hmacHeader);
-        console.warn('║  Secret used (first 8 chars):', secret.substring(0, 8) + '...');
-        console.warn('╠════════════════════════════════════════════════════════════════════╣');
-        console.warn('║  ACTION REQUIRED:                                                  ║');
-        console.warn('║  1. Copy the correct webhook secret from your Shopify Admin        ║');
-        console.warn('║     Settings → Notifications → Webhooks                            ║');
-        console.warn('║  2. Update SHOPIFY_WEBHOOK_SECRET in your environment variables    ║');
-        console.warn('║  3. Restart the server                                             ║');
-        console.warn('╚════════════════════════════════════════════════════════════════════╝');
+        // Never log the computed digest, the received header, or any prefix of the
+        // secret: the digest of an attacker-chosen body plus a leaked secret prefix
+        // together materially weaken the HMAC secret (Phase 1 §0.4).
+        console.warn('⚠️ SHOPIFY WEBHOOK HMAC VERIFICATION FAILED', {
+            path: req.originalUrl,
+            secretLen: secret.length
+        });
         // TODO: Return 401 here once the secret is corrected to prevent spoofing.
         // Until then, we proceed so abandoned-cart/order webhooks are not dropped.
     }

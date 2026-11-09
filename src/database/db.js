@@ -17,6 +17,91 @@ const pool = new Pool({
   query_timeout: 35000
 });
 
+// ── Readiness telemetry (Phase 1 §B2) ──────────────────────────────────────
+// /ready has to answer "is the database actually working?" WITHOUT running a
+// probe query of its own: a probe would take a pool slot on every poll, and
+// polling is exactly what keeps happening when traffic stops. So the pool
+// records its own round-trips as the app uses it, and readiness reads a
+// timestamp instead of spending a connection.
+// These are plain scalars — no arrays, no growth, nothing to leak.
+let lastSuccessfulQueryAt = null;
+let lastQueryMs = null;
+let slowestQueryMs = null;
+let lastQueryErrorAt = null;
+let lastQueryErrorMessage = null;
+let lastPoolErrorAt = null;
+let lastPoolErrorMessage = null;
+let queryCount = 0;
+let queryErrorCount = 0;
+let poolErrorCount = 0;
+let slowQueryCount = 0;
+
+function noteQuerySuccess(durationMs) {
+  lastSuccessfulQueryAt = Date.now();
+  queryCount++;
+  if (Number.isFinite(durationMs)) {
+    lastQueryMs = durationMs;
+    slowestQueryMs = slowestQueryMs === null ? durationMs : Math.max(slowestQueryMs, durationMs);
+  }
+}
+
+function noteQueryFailure(err) {
+  queryErrorCount++;
+  lastQueryErrorAt = Date.now();
+  // Message only, never the parameters: query text can carry a phone number.
+  lastQueryErrorMessage = err && err.message ? String(err.message).slice(0, 200) : String(err).slice(0, 200);
+}
+
+function notePoolError(err) {
+  poolErrorCount++;
+  lastPoolErrorAt = Date.now();
+  lastPoolErrorMessage = err && err.message ? String(err.message).slice(0, 200) : String(err).slice(0, 200);
+}
+
+// Snapshot for /ready. Read-only: touches no connection and runs no query.
+function poolStats() {
+  const max = pool.options.max;
+  const total = pool.totalCount || 0;
+  const idle = pool.idleCount || 0;
+  return {
+    configured: Boolean(process.env.SUPABASE_DB_URL),
+    total,
+    idle,
+    inUse: Math.max(0, total - idle),
+    waiting: pool.waitingCount || 0,
+    max,
+    utilizationPercent: max ? Math.round((total / max) * 100) : 0,
+    lastSuccessfulQueryAt,
+    lastQueryAgeMs: lastSuccessfulQueryAt === null ? null : Date.now() - lastSuccessfulQueryAt,
+    lastQueryMs,
+    slowestQueryMs,
+    lastQueryErrorAt,
+    lastQueryErrorMessage,
+    lastPoolErrorAt,
+    lastPoolErrorMessage,
+    queryCount,
+    queryErrorCount,
+    poolErrorCount,
+    slowQueryCount
+  };
+}
+
+// Most model helpers in this file call pool.query() directly instead of going
+// through dbAdapter.query(), so the same bookkeeping is wrapped around the pool
+// method as well — otherwise readiness would answer "no successful query since
+// boot" on a server that has been serving traffic all day.
+const rawPoolQuery = pool.query.bind(pool);
+pool.query = function trackedQuery(...args) {
+  const startedAt = Date.now();
+  const pending = rawPoolQuery(...args);
+  // Callback-style calls return undefined from pg-pool; leave those alone.
+  if (!pending || typeof pending.then !== 'function') return pending;
+  return pending.then(
+    (result) => { noteQuerySuccess(Date.now() - startedAt); return result; },
+    (err) => { noteQueryFailure(err); throw err; }
+  );
+};
+
 // Per-connection session tuning. work_mem is the important one: the default 4MB
 // forced the unread-conversation sort (5MB) to spill to a temp file on this
 // instance's very slow temp storage — 4-13s per run vs ~400ms with 16MB.
@@ -32,6 +117,7 @@ pool.on('connect', (client) => {
 // listener pg emits 'error' on the pool with no handler → uncaught exception
 // → process crash (giant Client dump in logs followed by restart).
 pool.on('error', (err) => {
+  notePoolError(err);
   console.error('⚠️ pg pool: idle client error (connection reset by pooler):', err.message);
 });
 
@@ -112,15 +198,18 @@ class DatabaseAdapter {
     try {
       result = await client.query(pgSql, values);
     } catch (err) {
+      noteQueryFailure(err);
       client.release(err);
       throw err;
     }
     const duration = Date.now() - acquiredAt;
     const poolWait = acquiredAt - queuedAt;
     client.release();
+    noteQuerySuccess(duration);
 
     // Log slow queries (>100ms) and any query that had to wait for a connection
     if (duration > 100 || poolWait > 250) {
+      slowQueryCount++;
       console.warn(`⚠️ SLOW QUERY (${duration}ms exec, ${poolWait}ms pool wait, pool ${pool.totalCount}/${pool.options.max}): ${sql.substring(0, 100)}`);
     }
 
@@ -1123,6 +1212,7 @@ async function initializePerformanceIndexes() {
 
 module.exports = {
   pool,
+  poolStats,
   dbAdapter: new DatabaseAdapter(),
   testConnection,
   initializeDatabase
