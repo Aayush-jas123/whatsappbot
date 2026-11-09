@@ -357,8 +357,16 @@ async function planOne(order, data, cnIndex) {
             exchangedItems: data.exchangedItems,
             requireMatch: true,
             withPayments: MOVE_PAYMENTS,
-            // known from the bulk note map — null means "none for this order"
-            creditNoteId: cnIndex.get(`EXCH-${order}`) ?? null
+            // known from the bulk note map — null means "none for this order".
+            // That map is cached for 12h and cannot contain a note an earlier
+            // run wrote today, and passing null tells the planner to book a
+            // SECOND credit note — it did exactly that to the 2026-11-09
+            // canary orders. An explicit --orders list is by definition a
+            // re-check of records this system already touched, so the cache is
+            // dropped and Books is searched live (undefined = "look it up").
+            creditNoteId: ONLY_ORDERS.length
+                ? undefined
+                : (cnIndex.get(`EXCH-${order}`) ?? null)
         });
     } catch (e) {
         return { orderId: order, status: 'error', notes: [e.message], before: [], after: [] };

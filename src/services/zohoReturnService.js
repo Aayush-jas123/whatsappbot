@@ -357,11 +357,14 @@ async function prepareAndCreateCreditNote({ shopifyOrder, orderId, returnItems, 
 
     const creditNote = await zohoService.createCreditNote(creditNotePayload);
     const creditNoteTotal = parseFloat(creditNote?.total) || 0;
-    await ensureCreditNoteApplied({ creditNote, fullInvoice, reference, returnType });
+    // Returned so an exchange caller can retry once the payment move has
+    // opened the invoice — see handleExchange step 3a.
+    const creditNoteApplied = await ensureCreditNoteApplied({ creditNote, fullInvoice, reference, returnType });
     return {
         success: true,
         creditNoteId: creditNote?.creditnote_id || null,
         creditNoteTotal,
+        creditNoteApplied,
         customerId
     };
 }
@@ -1514,6 +1517,7 @@ async function applyExchangePlan(plan) {
     }
 
     // 2. Credit note on the ORIGINAL invoice for the returned item(s).
+    let creditNeedsReapply = false;
     if (out.creditNotePayload?.line_items?.length && !out.creditNoteId) {
         try {
             const cn = await zohoService.createCreditNote(out.creditNotePayload);
@@ -1523,7 +1527,7 @@ async function applyExchangePlan(plan) {
             // Books can leave the new note as unused customer credit; apply it
             // so the original invoice actually drops by the returned amount.
             if (out.creditNoteId) {
-                await ensureCreditNoteApplied({
+                creditNeedsReapply = !(await ensureCreditNoteApplied({
                     creditNote: { creditnote_id: out.creditNoteId, total: out.creditNoteTotal },
                     fullInvoice: {
                         invoice_id: out.invoiceId,
@@ -1532,7 +1536,7 @@ async function applyExchangePlan(plan) {
                     },
                     reference: creditNoteReference(ref, 'exchange'),
                     returnType: 'exchange'
-                });
+                }));
             }
         } catch (e) {
             return { ...out, status: 'credit_note_failed', notes: [...out.notes, e.message] };
@@ -1591,6 +1595,29 @@ async function applyExchangePlan(plan) {
             });
             out.paymentMove = moved;
             out.notes.push(...moved.warnings);
+
+            // A fully paid invoice sits in Books' "closed" status, and Books
+            // refuses to apply a credit note to a closed invoice — the move
+            // above is what takes the payment off and opens it, so the credit
+            // can only land afterwards. Without this retry every paid exchange
+            // (726 of the 751 backfilled) leaves the note as stranded customer
+            // credit while the original invoice shows the returned amount as
+            // due. Verified on the 2026-11-09 canary: 3 of 3 rejected.
+            if (creditNeedsReapply && out.creditNoteId) {
+                const reapplied = await ensureCreditNoteApplied({
+                    creditNote: { creditnote_id: out.creditNoteId, total: out.creditNoteTotal },
+                    fullInvoice: {
+                        invoice_id: out.invoiceId,
+                        invoice_number: out.invoiceNumber,
+                        credits_applied: 0
+                    },
+                    reference: creditNoteReference(ref, 'exchange'),
+                    returnType: 'exchange'
+                });
+                out.notes.push(reapplied
+                    ? 'credit note applied once the payment move opened the invoice'
+                    : 'credit note could not be applied even after the payment move');
+            }
         } catch (e) {
             out.notes.push(`payment move failed: ${e.message}`);
         }
@@ -1712,6 +1739,27 @@ async function handleExchange(shopifyOrder, originalItems, exchangedItems) {
                 }
             } catch (pmErr) {
                 console.warn(`⚠️ Zoho exchange: payment move failed for #${orderId}: ${pmErr.message}`);
+            }
+
+            // 3a. A fully paid invoice sits in Books' "closed" status and Books
+            // refuses to apply a credit note to a closed invoice, so step 1
+            // cannot land the credit on exactly the orders that need it. The
+            // move above takes the payment off and opens the invoice, which is
+            // the only moment the note can be applied. Skipping this leaves
+            // every paid exchange with its credit note as stranded customer
+            // credit while the original invoice shows the returned amount as
+            // due — verified on the 2026-11-09 bulk canary (3 of 3 paid orders).
+            if (result.creditNoteId && result.creditNoteApplied === false) {
+                const reopened = await fetchFullInvoice(originalInvoice).catch(() => fullInvoice);
+                const applied = await ensureCreditNoteApplied({
+                    creditNote: { creditnote_id: result.creditNoteId, total: result.creditNoteTotal },
+                    fullInvoice: reopened,
+                    reference,
+                    returnType: 'exchange'
+                });
+                console.log(`🔁 Zoho exchange: order #${orderId} — credit note ${reference} `
+                    + (applied ? 'applied once the payment move opened the invoice'
+                        : 'still unapplied after the payment move'));
             }
 
             // 3b. Settle what the move could not cover. Without this the
