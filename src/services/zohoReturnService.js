@@ -1035,7 +1035,32 @@ async function expandItem(item, bundleMap) {
     });
 }
 
-const tightName = (s) => String(s || '').replace(/\s+/g, '').toUpperCase();
+// Size tokens as they appear at the END of a product name. Deliberately an
+// explicit list rather than "any short trailing word": a single letter can also
+// be a colourway ("HENLEY - 001 ( W )"), and folding that into a size would
+// point a credit note at the wrong stock item.
+const SIZE_TOKEN_RE = /^(?:\d?(?:XS|S|M|L|XL|XXL|XXXL|XXXXL)|FREE|OS|OSFM)$/;
+
+/**
+ * Name key used for every invoice-line comparison.
+ *
+ * Whitespace is dropped entirely: the catalog and the dashboard disagree on
+ * spacing around parens ("( ACID WASH)" vs "( ACID WASH )") while meaning the
+ * same variant.
+ *
+ * The trailing size is then folded into one notation. Zoho invoices exist in
+ * two shapes for the SAME variant — the canonical "PRODUCT ( COLOR ) - SIZE"
+ * our sync writes today, and the older "PRODUCT ( COLOR ) (SIZE)" left by the
+ * pre-convention backfills (~14% of the exchanged orders). Compared as they
+ * come, a legacy line matches nothing and the exchange is quarantined as
+ * needs_review, so the fold is what keeps real matches explicit: identical
+ * style, identical colourway, identical size token — no fuzzy containment.
+ */
+const tightName = (s) => {
+    const tight = String(s || '').replace(/\s+/g, '').toUpperCase();
+    return tight.replace(/\(([A-Z0-9]{1,5})\)$/, (group, token) =>
+        (SIZE_TOKEN_RE.test(token) ? `-${token}` : group));
+};
 
 // An older backfill appended the replacement as an extra ₹0 line ("Exchange
 // replacement - S") instead of re-lining the original. It is never a real
@@ -1103,10 +1128,9 @@ async function buildSwapLines({
     const { originals, replacements: brokenExchanged } = await pairExchangeItems({ fromItems, toItems, invoiceLines });
 
     let lines = (invoiceLines || []).map(l => ({ ...l, _matched: false }));
-    // Whitespace is dropped entirely: the catalog and the dashboard disagree on
-    // spacing around parens ("( ACID WASH)" vs "( ACID WASH )") while meaning
-    // the same variant.
-    const norm = (s) => String(s || '').toUpperCase().replace(/\s+/g, '');
+    // Same key as everywhere else: whitespace-free, uppercase, size notation
+    // folded ("( M )" ≡ " - M") so a legacy invoice line still matches.
+    const norm = tightName;
     const isProductLine = (l) => !isChargeLine(l);
 
     // An older backfill appended the replacement as an extra ₹0 line
@@ -1196,8 +1220,8 @@ async function buildSwapLines({
     // different size ("HENLEY - 001 ( B ) - L" ↔ "HENLEY - 001 ( B ) - M").
     // A bundle expands into several components, so line order alone would put
     // the wrong colourway on the wrong stock item.
-    const baseKey = (name) => String(name || '').toUpperCase().replace(/\s+/g, ' ')
-        .replace(/\s*-\s*[A-Z0-9]{1,3}$/, '').trim();
+    const baseKey = (name) => tightName(name)
+        .replace(/-([A-Z0-9]{1,5})$/, (group, token) => (SIZE_TOKEN_RE.test(token) ? '' : group));
     const taken = new Array(brokenExchanged.length).fill(false);
     const takeReplacement = (lineName) => {
         const key = baseKey(lineName);
@@ -1300,7 +1324,7 @@ async function planExchangeInvoice({
     }
     if (!full?.line_items?.length) return { ...out, status: 'no_invoice_lines' };
 
-    const keyOf = (v) => String(v || '').toUpperCase().replace(/\s+/g, '');
+    const keyOf = tightName;
     const lineMatches = (l, item) => {
         const name = keyOf(l.name);
         return [item?.sku, item?.title].filter(Boolean).map(keyOf).some(k =>
@@ -2012,5 +2036,9 @@ module.exports = {
     creditNoteReference,
     retryReturn,
     getReturnStats,
-    getReturnLog
+    getReturnLog,
+    // exported for the name-comparator test (tmp/test-tightname.js) — the fold
+    // of "( SIZE )" into " - SIZE" is the one matching rule with no safe
+    // fallback, so it needs a regression test rather than eyeballing.
+    tightName
 };
