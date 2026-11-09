@@ -28,6 +28,7 @@ const adminRoutes = require('./src/routes/adminRoutes');
 const followUpService = require('./src/services/followUpService');
 const { testConnection, initializeDatabase, dbAdapter } = require('./src/database/db');
 const { startCacheStatsLogging, getCacheStats } = require('./src/utils/cache');
+const { createHealthRouter } = require('./src/routes/healthRoutes');
 
 // Safety net: keep the process alive on stray async failures (e.g. pg
 // connection timeouts inside cron jobs). Log full details for diagnosis.
@@ -79,6 +80,22 @@ app.use((req, res, next) => {
     next();
 });
 
+
+// ── Liveness + readiness (Phase 1 §B1–B5) ───────────────────────────────────
+// Registered BEFORE cors() and every rate limiter, on purpose:
+//  · a rate-limited instance still has to be able to prove it is alive — that
+//    is precisely when the probe matters most;
+//  · /ready reports pool sizing, queue depth and memory headroom, so it must
+//    not be readable from an arbitrary browser origin, and mounting ahead of
+//    cors() means no Access-Control-Allow-Origin is ever emitted for it.
+// The endpoint bodies are built from counters that already exist; polling
+// /health allocates nothing and takes no database connection.
+const MEMORY_LIMIT_MB = 512; // Render free-plan ceiling — also the watchdog's budget
+app.use(createHealthRouter({
+    version: require('./package.json').version,
+    rssLimitMB: MEMORY_LIMIT_MB,
+    getQueueStats
+}));
 
 // Apply generic rate limiter to all requests (adjust as needed)
 const PORT = process.env.PORT || 3000;
@@ -387,6 +404,28 @@ let activeTasks = 0;
 const MAX_CONCURRENT_TASKS = 25; // Increased to 25 for 2000 customers/day capacity
 const MAX_QUEUE_SIZE = 1000; // NEW: Prevent unbounded queue growth
 
+// /ready counters. Queue depth on its own is misleading: enqueueTask drops the
+// oldest task once the queue is full and the watchdog empties it past 100
+// items, so work gets lost while the depth still reads low. These only ever
+// hold numbers, so they cost nothing to maintain.
+const queueCounters = { enqueued: 0, processed: 0, drops: 0, watchdogClears: 0, clearedItems: 0 };
+
+function getQueueStats() {
+  return {
+    queued: taskQueue.length,
+    active: activeTasks,
+    maxQueueSize: MAX_QUEUE_SIZE,
+    maxConcurrent: MAX_CONCURRENT_TASKS,
+    // Every worker busy AND work waiting: throughput has hit the ceiling.
+    saturated: activeTasks >= MAX_CONCURRENT_TASKS && taskQueue.length > 0,
+    enqueued: queueCounters.enqueued,
+    processed: queueCounters.processed,
+    drops: queueCounters.drops,
+    watchdogClears: queueCounters.watchdogClears,
+    clearedItems: queueCounters.clearedItems
+  };
+}
+
 function processQueue() {
   if (!taskQueue.length || activeTasks >= MAX_CONCURRENT_TASKS) {
     return;
@@ -401,6 +440,7 @@ function processQueue() {
     } catch (e) {
       console.error('Error in task:', e);
     } finally {
+      queueCounters.processed++;
       activeTasks--;
       processQueue();
     }
@@ -412,9 +452,11 @@ function processQueue() {
 function enqueueTask(task) {
   // NEW: Drop oldest task if queue is full to prevent memory buildup
   if (taskQueue.length >= MAX_QUEUE_SIZE) {
+    queueCounters.drops++;
     console.warn(`⚠️ Task queue full (${MAX_QUEUE_SIZE}), dropping oldest task`);
     taskQueue.shift(); // Remove oldest
   }
+  queueCounters.enqueued++;
   taskQueue.push(task);
   processQueue();
 }
@@ -621,13 +663,8 @@ function handleButtonResponse(buttonId) {
     return buttonMap[buttonId] || buttonId;
 }
 
-// Health check endpoint
-app.get('/health', (req, res) => {
-    res.json({
-        status: 'ok',
-        timestamp: new Date().toISOString()
-    });
-});
+// Health check lives in src/routes/healthRoutes.js — mounted near the top of
+// this file, ahead of cors() and the rate limiters (Phase 1 §B1).
 
 // Serve admin dashboard
 app.get('/admin', (req, res) => {
@@ -828,6 +865,8 @@ async function startServer() {
 
                 // 3. Stuck task queue safety valve
                 if (taskQueue.length > 100) {
+                    queueCounters.watchdogClears++;
+                    queueCounters.clearedItems += taskQueue.length;
                     console.warn(`[QUEUE] Task queue has ${taskQueue.length} items, clearing to prevent memory buildup`);
                     taskQueue.length = 0;
                 }
@@ -842,7 +881,7 @@ async function startServer() {
                 const used = process.memoryUsage();
                 const memoryMB = Math.round(used.rss / 1024 / 1024);
                 const heapMB = Math.round(used.heapUsed / 1024 / 1024);
-                const limitMB = 512;
+                const limitMB = MEMORY_LIMIT_MB;
                 const usagePercent = Math.round((memoryMB / limitMB) * 100);
 
                 if (every5) {

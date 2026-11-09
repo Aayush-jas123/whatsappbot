@@ -9,7 +9,8 @@
     "migrate": "node scripts/migrateExcel.js",
     "test:redact": "node test/testRedact.js",
     "test:logger": "node test/testLogger.js",
-    "test:phase1": "node test/testRedact.js && node test/testLogger.js"
+    "test:health": "node test/testHealth.js",
+    "test:phase1": "node test/testRedact.js && node test/testLogger.js && node test/testHealth.js"
   },
   "keywords": [
     "whatsapp",
