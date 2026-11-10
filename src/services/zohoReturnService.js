@@ -1628,6 +1628,26 @@ async function applyExchangePlan(plan) {
     const ref = String(out.orderId || '').replace(/^#/, '');
     if (!out.invoiceId) return { ...out, status: 'invalid_plan' };
 
+    // 0. Write-time backstop for guard 7a. The planner refuses to park an
+    // exchange with nothing to credit, but a plan is a serialisable snapshot:
+    // a queue built before that guard existed still holds entries whose credit
+    // note totals ₹0 while the replacement carries a real price, and replaying
+    // one books a receivable the customer never owed. Nothing here can be
+    // trusted to have been re-planned, so the same rule is enforced again on
+    // the way out — before step 1, so a blocked plan writes no document at all.
+    const noteOnFile = money(out.creditNoteTotal);
+    const noteToWrite = money(estimatePayloadTotal(out.creditNotePayload));
+    const ceiling = out.creditNoteId ? noteOnFile : noteToWrite;
+    const willBill = (out.replacementInvoiceLines || [])
+        .reduce((s, l) => s + money(l.rate) * (parseFloat(l.quantity) || 1), 0);
+    if (!(ceiling > 0) && willBill > 0.01) {
+        return {
+            ...out,
+            status: 'needs_review',
+            notes: [...out.notes, `plan carries no credit note to bill against (ceiling ₹${money(ceiling).toFixed(2)}) while the replacement would bill ₹${money(willBill).toFixed(2)} — nothing was written; re-plan this order instead of replaying it`]
+        };
+    }
+
     // 1. Undo an old in-place re-line: the invoice must bill what the customer
     //    ordered before the credit note can reverse the returned item.
     if (Array.isArray(out.revertLineItems) && out.revertLineItems.length > 0) {
