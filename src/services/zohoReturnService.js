@@ -1358,6 +1358,23 @@ async function planExchangeInvoice({
     const billsAll = (items) => (items || []).length > 0
         && items.every(it => productLines.some(l => lineMatches(l, it)));
 
+    // 2a. An invoice that bills EVERY product line at ₹0 was never priced — the
+    // sync wrote the catalogue item without a rate (legacy unresolved items).
+    // There is no money on it to reverse, so the credit note caps to nothing,
+    // and capLinesToTotal bails out when its ceiling is not positive — which
+    // leaves the replacement billing a real due against a ₹0 invoice. Seen on
+    // 98 orders totalling ₹1,53,737, 87 of them flagged paid. These need the
+    // product-price backfill, not exchange documents, so they are reported.
+    if (productLines.length && !productLines.some(l => parseFloat(l.rate) > 0)) {
+        return {
+            ...out,
+            status: 'needs_review',
+            before: full.line_items.map(lineFingerprint),
+            notes: [...out.notes,
+                'original invoice bills every line at ₹0 — prices never synced, so there is nothing to credit; needs a product-price backfill']
+        };
+    }
+
     // 3. Safety gate for bulk runs: only touch an order whose returned items
     //    can be tied to a real invoice line by name/SKU. Anything ambiguous is
     //    reported instead of written.
@@ -1367,8 +1384,7 @@ async function planExchangeInvoice({
             fromItems: originalItems, toItems: exchangedItems, invoiceLines: full.line_items
         });
         const unmatched = matchedItems.filter(it => !productLines.some(l => lineMatches(l, it)));
-        const allZero = productLines.length > 0 && productLines.every(l => !(parseFloat(l.rate) > 0));
-        if (unmatched.length && !allZero && !billsReplacement) {
+        if (unmatched.length && !billsReplacement) {
             return {
                 ...out,
                 status: 'needs_review',
