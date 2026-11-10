@@ -204,7 +204,7 @@ function capCreditNoteToBalance(payload, fullInvoice, reference, returnType) {
 async function creditedForOrderOnInvoice({ orderId, fullInvoice }) {
     const orderNum = String(orderId || '').replace(/^#/, '').trim();
     const invoiceNumber = String(fullInvoice?.invoice_number || '').trim();
-    if (!orderNum || !invoiceNumber) return { notes: [], total: 0 };
+    if (!orderNum || !invoiceNumber) return { notes: [], total: 0, openUsable: 0, openNotes: [] };
     const notes = await zohoService.searchCreditNotes({ search_text: orderNum });
     const onThisInvoice = notes.filter(cn => {
         const ref = String(cn.reference_number || '');
@@ -212,10 +212,35 @@ async function creditedForOrderOnInvoice({ orderId, fullInvoice }) {
         const linked = String(cn.invoice_number || '') || JSON.stringify(cn.applied_invoices || '');
         return linked.includes(invoiceNumber) || linked.includes(orderNum);
     });
+    // An OPEN note is credit that has been RAISED but not yet APPLIED. Books
+    // does not count it against the invoice, so capCreditNoteToBalance cannot
+    // see it — and a second trigger would then raise the full amount again on
+    // top of the unapplied one (seen in production on 9–10 Nov: an RTO note of
+    // ₹1,423.86 left open, a refund trigger raised the whole ₹1,899.05 invoice
+    // as a second note; the same on ₹1,618.10 + ₹1,699.00). Track it so the
+    // request can be reduced to what the ledger has not already committed.
+    const openNotes = onThisInvoice.filter(cn => String(cn.status) !== 'closed');
     return {
         notes: onThisInvoice,
-        total: onThisInvoice.reduce((s, cn) => s + (parseFloat(cn.total) || 0), 0)
+        total: onThisInvoice.reduce((s, cn) => s + (parseFloat(cn.total) || 0), 0),
+        openNotes,
+        openUsable: openNotes.reduce((s, cn) => s + (parseFloat(cn.balance_amount ?? cn.balance) || 0), 0)
     };
+}
+
+/**
+ * Reaches the wanted total by scaling every line proportionally, keeping each
+ * line's own tax basis — used when the ledger has already committed part of the
+ * credit and only the difference should become a document.
+ */
+function scalePayloadToTotal(payload, target) {
+    const est = estimatePayloadTotal(payload);
+    if (!(est > 0) || !(target > 0) || Math.abs(est - target) < 0.02) return;
+    const factor = target / est;
+    for (const l of payload.line_items || []) {
+        l.rate = Math.round((parseFloat(l.rate) || 0) * factor * 100) / 100;
+        if (l.discount !== undefined) l.discount = Math.round((parseFloat(l.discount) || 0) * factor * 100) / 100;
+    }
 }
 
 /**
@@ -329,27 +354,48 @@ async function prepareAndCreateCreditNote({ shopifyOrder, orderId, returnItems, 
         return { success: true, creditNoteId: null, fullyCredited: true, creditNoteTotal: 0, customerId };
     }
 
-    // Invoice-level dedupe: the same order can reach Zoho through several
-    // triggers (RTO hook, Shopify refund, returns portal, exchange), each with
-    // its own reference prefix, so the per-reference check above cannot see
-    // the earlier note. Without this the later trigger silently issued another
-    // document for whatever was still uncredited — the 2nd/3rd/4th credit note
-    // on one invoice.
+    // Ledger rule for this order + invoice. Each trigger names its own
+    // reference (RTO hook, Shopify refund, returns portal, exchange, and the
+    // RTO-MISC-/RTO-ROUND- remediation notes), so the per-reference check above
+    // cannot see the earlier note and a later trigger used to raise the FULL
+    // amount again on top of it — the 2nd/3rd/4th credit note on one invoice.
+    //
+    // The invariant is the INVOICE TOTAL, not this request: notes raised for the
+    // order may add up to the invoice, never past it. Capping against the
+    // request instead would be wrong, because a customer who returns the second
+    // unit of a two-unit order legitimately needs a second note.
     const wantToCredit = Math.round(estimatePayloadTotal(creditNotePayload) * 100) / 100;
     try {
+        const invoiceTotal = Math.round((parseFloat(fullInvoice?.total) || 0) * 100) / 100;
         const already = await creditedForOrderOnInvoice({ orderId, fullInvoice });
-        if (already.notes.length > 0 && already.total >= wantToCredit - 1) {
-            console.log(`✅ Zoho ${returnType}: order #${String(orderId).replace(/^#/, '')} already carries ${already.notes.length} credit note(s) on ${fullInvoice.invoice_number || fullInvoice.invoice_id} totalling ₹${already.total.toFixed(2)} ≥ this request ₹${wantToCredit.toFixed(2)} — no new document`);
-            return {
-                success: true,
-                alreadyProcessed: true,
-                creditNoteId: already.notes[0].creditnote_id,
-                creditNoteTotal: already.total,
-                customerId
-            };
-        }
-        if (already.notes.length > 0) {
-            console.warn(`⚠️ Zoho ${returnType}: order #${String(orderId).replace(/^#/, '')} already has ${already.notes.length} credit note(s) worth ₹${already.total.toFixed(2)} on ${fullInvoice.invoice_number || fullInvoice.invoice_id}; this request needs ₹${wantToCredit.toFixed(2)}, so ₹${(wantToCredit - already.total).toFixed(2)} will be credited as an additional note`);
+        if (already.notes.length > 0 && invoiceTotal > 0) {
+            const raised = Math.round(already.total * 100) / 100;
+            if (raised >= invoiceTotal - 1) {
+                // Nothing is left to credit. When part of it is still sitting on
+                // the ledger as an UNAPPLIED open note, apply that note instead
+                // of documenting the same money a second time.
+                const openNote = already.openNotes
+                    .find(cn => (parseFloat(cn.balance_amount ?? cn.balance) || 0) > 0.01);
+                if (openNote) {
+                    await ensureCreditNoteApplied({
+                        creditNote: openNote, fullInvoice,
+                        reference: openNote.reference_number || reference, returnType
+                    });
+                }
+                console.log(`✅ Zoho ${returnType}: order #${String(orderId).replace(/^#/, '')} is already reversed on ${fullInvoice.invoice_number || fullInvoice.invoice_id} by ${already.notes.length} credit note(s) totalling ₹${raised.toFixed(2)} of ₹${invoiceTotal.toFixed(2)} — no new document${openNote ? ` (re-applied ${openNote.creditnote_number})` : ''}`);
+                return {
+                    success: true,
+                    alreadyProcessed: true,
+                    creditNoteId: (openNote || already.notes[0]).creditnote_id,
+                    creditNoteTotal: raised,
+                    customerId
+                };
+            }
+            const headroom = Math.round((invoiceTotal - raised) * 100) / 100;
+            if (wantToCredit > headroom + 0.02) {
+                console.warn(`⚠️ Zoho ${returnType}: order #${String(orderId).replace(/^#/, '')} already has ${already.notes.length} credit note(s) worth ₹${raised.toFixed(2)} on ${fullInvoice.invoice_number || fullInvoice.invoice_id} of ₹${invoiceTotal.toFixed(2)} — this request of ₹${wantToCredit.toFixed(2)} is reduced to the remaining ₹${headroom.toFixed(2)} instead of stacking a second full-amount note`);
+                scalePayloadToTotal(creditNotePayload, headroom);
+            }
         }
     } catch (guardErr) {
         console.warn(`⚠️ Zoho ${returnType}: invoice-level credit note dedupe failed (${guardErr.message}) — continuing with the per-reference result`);

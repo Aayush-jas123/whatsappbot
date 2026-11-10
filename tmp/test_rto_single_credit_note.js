@@ -33,10 +33,12 @@ const { dbAdapter } = require(path.join(__dirname, '..', 'src', 'database', 'db'
 // ============================================================
 let invoicesById = {};
 let notes = [];               // credit notes already "in Zoho"
+let applied = [];             // applyCreditNote calls, in order
 let bundleRows = [];
 let nextNoteNumber = 1;
 
 const round2 = (n) => Math.round(n * 100) / 100;
+const r2sum = (list) => round2(list.reduce((s, n) => s + (parseFloat(n) || 0), 0));
 
 /**
  * Prices a line exactly as Books does. On a tax-INCLUSIVE document the GST
@@ -94,11 +96,16 @@ zohoService.createCreditNote = async (payload) => {
     return note;
 };
 zohoService.applyCreditNote = async (creditNoteId, invoiceId, amount) => {
+    applied.push({ creditNoteId, invoiceId, amount: round2(amount) });
     const invoice = invoicesById[invoiceId];
     const note = notes.find(n => n.creditnote_id === creditNoteId);
     invoice.credits_applied = round2((parseFloat(invoice.credits_applied) || 0) + amount);
     invoice.balance = round2(parseFloat(invoice.total) - invoice.credits_applied);
-    if (note) note.balance = round2((parseFloat(note.balance) || 0) - amount);
+    if (note) {
+        note.balance = round2((parseFloat(note.balance) || 0) - amount);
+        // Books closes a note once nothing is left unapplied
+        if (note.balance <= 0.01) { note.status = 'closed'; note.balance = 0; }
+    }
     return { code: 0 };
 };
 zohoService.searchCreditNotes = async ({ reference_number, search_text } = {}) => {
@@ -205,6 +212,7 @@ const shopifyOrder = (orderNumber) => ({
 function reset(invoice) {
     invoicesById = { [invoice.invoice_id]: invoice };
     notes = [];
+    applied = [];
     nextNoteNumber = 1;
 }
 
@@ -288,7 +296,7 @@ function reset(invoice) {
     check('balance drops to ₹698.50', inv4.balance === 698.50, `got ₹${inv4.balance}`);
 
     // ---------------------------------------------------------------- CASE 5
-    console.log('\n5️⃣  That same part-credited order re-triggered under a different prefix (the 2nd-note bug)');
+    console.log('\n5️⃣  The SECOND unit returned later, under a different prefix — legitimately a 2nd note');
     res = await prepareAndCreateCreditNote({
         shopifyOrder: shopifyOrder('65569'),
         orderId: '65569',
@@ -296,12 +304,60 @@ function reset(invoice) {
         returnType: 'return',
         reference: 'RET-65569-REFUND-42'
     });
-    check('invoice-level dedupe recognises the existing RTO note', res.alreadyProcessed === true, JSON.stringify(res));
-    check('no second document written', notes.length === 1, `got ${notes.length}`);
-    check('balance unchanged at ₹698.50', invoicesById['INV-51583'].balance === 698.50, `got ₹${invoicesById['INV-51583'].balance}`);
+    check('a second note was allowed (the ledger was not yet at the invoice total)', notes.length === 2, `got ${notes.length}`);
+    check('second note is also ₹599.50', notes[1] && notes[1].total === 599.50, notes[1] && `got ₹${notes[1].total}`);
+    check('two notes never exceed the invoice total', notes.reduce((s, n) => s + n.total, 0) <= 1298.01);
+    check('shipping ₹99.00 still due (correctly not reversed on a part return)',
+        invoicesById['INV-51583'].balance === 99, `got ₹${invoicesById['INV-51583'].balance}`);
 
     // ---------------------------------------------------------------- CASE 6
-    console.log('\n6️⃣  Sub-₹1 residual must not earn its own document (the RTO-ROUND note)');
+    console.log('\n6️⃣  Production shape of OFF/26-27/47489: a full-amount note raised on top of an UNAPPLIED one');
+    bundleRows = [];
+    const inv6 = invoice51583();
+    reset(inv6);
+    // An earlier RTO note already reverses the whole invoice but Books left it
+    // OPEN (unapplied) — the invoice still shows the full amount due.
+    notes.push({
+        creditnote_id: 'CN-EARLY', creditnote_number: 'CN/26-27/07365',
+        reference_number: 'RTO-65569', invoice_number: inv6.invoice_number,
+        status: 'open', total: 1298.00, balance: 1298.00, line_items: []
+    });
+    res = await prepareAndCreateCreditNote({
+        shopifyOrder: shopifyOrder('65569'),
+        orderId: '65569',
+        returnItems: [{ title: 'RAGLAN 001 - M', sku: 'RAGLAN-001-M', quantity: 1, price: 1199 }],
+        returnType: 'rto',
+        reference: 'RTO-65569-2'
+    });
+    check('no second full-amount document was written', notes.length === 1, `got ${notes.length}`);
+    check('flow reports alreadyProcessed', res.alreadyProcessed === true, JSON.stringify(res));
+    check('the unapplied note was APPLIED instead', applied.some(a => a.creditNoteId === 'CN-EARLY'),
+        JSON.stringify(applied));
+    check('invoice now at ₹0.00', invoicesById['INV-51583'].balance === 0, `got ₹${invoicesById['INV-51583'].balance}`);
+
+    // ---------------------------------------------------------------- CASE 7
+    console.log('\n7️⃣  Ledger only partly reversed → the new note is capped to the headroom, not the full amount');
+    reset(invoice51583());
+    notes.push({
+        creditnote_id: 'CN-EARLY-2', creditnote_number: 'CN/26-27/07366',
+        reference_number: 'RTO-65569', invoice_number: invoicesById['INV-51583'].invoice_number,
+        status: 'open', total: 1199.00, balance: 1199.00, line_items: []
+    });
+    res = await prepareAndCreateCreditNote({
+        shopifyOrder: shopifyOrder('65569'),
+        orderId: '65569',
+        returnItems: [{ title: 'RAGLAN 001 - M', sku: 'RAGLAN-001-M', quantity: 1, price: 1199 }],
+        returnType: 'rto',
+        reference: 'RTO-65569-3'
+    });
+    check('one extra note issued', notes.length === 2, `got ${notes.length}`);
+    check('capped to the ₹99.00 headroom instead of repeating ₹1,298',
+        notes[1] && notes[1].total === 99, notes[1] && `got ₹${notes[1].total}`);
+    check('ledger now sums exactly to the invoice total',
+        r2sum(notes.map(n => n.total)) === 1298, `got ₹${r2sum(notes.map(n => n.total))}`);
+
+    // ---------------------------------------------------------------- CASE 8
+    console.log('\n8️⃣  Sub-₹1 residual must not earn its own document (the RTO-ROUND note)');
     reset({ ...invoice51583(), credits_applied: 1297.40, balance: 0.60 });
     res = await prepareAndCreateCreditNote({
         shopifyOrder: shopifyOrder('65569'),
