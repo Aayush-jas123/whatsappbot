@@ -311,6 +311,16 @@ const PROGRESS_FILE = path.join(__dirname, '..', 'tmp', 'exchange_plan_progress.
 // 4: replacement lines are billed tax-INCLUSIVE (the recorded price is grossed
 //    by the replaced line's GST). Version 3 plans carry pre-tax replacement
 //    rates and would re-create the ₹58.76-per-order residue.
+//
+// Two later changes deliberately did NOT bump this: the planner now measures
+// the ceiling the way Books does (estimatePayloadTotal) and the credit-note
+// matcher prefers a priced invoice line over the old flow's ₹0 artifact. A v4
+// entry whose ceiling was the net amount is still applied correctly, because
+// applyExchangePlan re-bases the replacement onto the total of the note it
+// actually created — so re-running the log is not needed. The one population
+// that does need re-planning is the orders that v4 parked (needs_review with a
+// "no credit note to bill against" note): take them from the report and re-run
+// with --orders= so they stop being skipped by the resume log.
 const PLAN_VERSION = 4;
 
 function loadProgress() {

@@ -693,19 +693,28 @@ async function buildCreditNoteFromInvoice({
 
     // 2) Match each returned piece to an original invoice line
     const invoiceLines = (originalInvoice?.line_items || []).map(l => ({ ...l, _credited: 0 }));
+    // The old in-place exchange flow left ₹0 lines on real invoices that carry
+    // the SAME product name as the line that was actually billed (name "HENLEY
+    // - 001 ( B ) - S", description "Exchange replacement - M", rate ₹0).
+    // Taking the first name match credits nothing at all, so the exchange
+    // reverses no money and the replacement invoice is capped at zero — a swap
+    // that bills the customer a fresh due (98 orders, ₹1,53,737 in the all-time
+    // plan). Among the candidates for the returned item, money comes first:
+    // prefer a line that carries a price, exact name before loose.
+    const isPriced = (l) => parseFloat(l.rate) > 0;
     const findLine = (ret) => {
         const keys = [normName(ret.sku), normName(ret.name)].filter(Boolean);
         const available = invoiceLines.filter(l => l._credited < (l.quantity || 0));
+        const exact = [];
+        const loose = [];
         for (const key of keys) {
-            const hit = available.find(l => normName(l.sku || '') === key || normName(l.name || '') === key);
-            if (hit) return hit;
+            for (const l of available) {
+                if (exact.includes(l) || loose.includes(l)) continue;
+                if (normName(l.sku || '') === key || normName(l.name || '') === key) exact.push(l);
+                else if (key && (normName(l.name || '').includes(key) || key.includes(normName(l.name || '')))) loose.push(l);
+            }
         }
-        // Loose containment fallback ("HENLEY 001 (G) - M" vs catalogue spacing)
-        for (const key of keys) {
-            const hit = available.find(l => key && (normName(l.name || '').includes(key) || key.includes(normName(l.name || ''))));
-            if (hit) return hit;
-        }
-        return null;
+        return exact.find(isPriced) || loose.find(isPriced) || exact[0] || loose[0] || null;
     };
 
     const lineItems = [];

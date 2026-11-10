@@ -503,6 +503,9 @@ function dominantInvoiceTax(invoiceLines) {
  *
  * Only ever scales DOWN: a cheaper replacement keeps its own price and the
  * difference stays as unused customer credit (refundable), which is correct.
+ * `growToo` lifts that restriction for callers that know the ceiling — not the
+ * price — was the wrong number (see applyExchangePlan, where Books has just
+ * said what the credit note it created is really worth).
  */
 const lineTaxPct = (l) => {
     const split = (parseFloat(l.cgst_rate) || 0) + (parseFloat(l.sgst_rate) || 0) + (parseFloat(l.igst_rate) || 0);
@@ -511,7 +514,7 @@ const lineTaxPct = (l) => {
     return Number.isFinite(flat) ? flat : 0;
 };
 
-function capLinesToTotal(lines, capTotal) {
+function capLinesToTotal(lines, capTotal, growToo = false) {
     if (!lines?.length) return lines;
     const qtyOf = (l) => parseFloat(l.quantity) || 1;
     // An inclusive line already bills its own rate — grossing it up again here
@@ -520,7 +523,9 @@ function capLinesToTotal(lines, capTotal) {
     const gross = (l) => money(money(l.rate) * qtyOf(l) * multOf(l));
     const total = money(lines.reduce((s, l) => s + gross(l), 0));
     const target = money(capTotal);
-    if (!(target > 0) || !(total > 0) || total <= target + 0.01) return lines;
+    if (!(target > 0) || !(total > 0)) return lines;
+    if (!growToo && total <= target + 0.01) return lines;
+    if (growToo && Math.abs(total - target) <= 0.01) return lines;
 
     const factor = target / total;
     let allocated = 0;
@@ -1514,8 +1519,15 @@ async function planExchangeInvoice({
         });
         const cap = capCreditNoteToBalance(creditNotePayload, baseInvoice, creditReference, 'exchange');
         if (cap.fullyCredited) creditNotePayload = null;
-        creditNoteTotal = money((creditNotePayload?.line_items || []).reduce(
-            (s, l) => s + money(l.rate) * (parseFloat(l.quantity) || 1) - money(l.discount), 0));
+        // Measured the way Books measures the document it is about to create.
+        // Summing rate × quantity − discount gives the NET of the note, while
+        // the note's own total carries GST whenever the invoice is
+        // tax-exclusive — and this number is the ceiling the replacement is
+        // capped to. On a ₹1,199 exclusive invoice that meant a ₹1,199
+        // replacement against a ₹1,258.95 credit note: the GST the customer had
+        // already paid stayed on their account as unused credit instead of
+        // buying the replacement.
+        creditNoteTotal = money(estimatePayloadTotal(creditNotePayload));
         if (cap.fullyCredited) {
             const credited = parseFloat(baseInvoice.credits_applied) || 0;
             ceilingGap = `only ₹${money(parseFloat(baseInvoice.total) - credited).toFixed(2)} of the ₹${money(baseInvoice.total).toFixed(2)} invoice is still creditable (₹${credited.toFixed(2)} already credited)`;
@@ -1654,6 +1666,29 @@ async function applyExchangePlan(plan) {
             }
         } catch (e) {
             return { ...out, status: 'credit_note_failed', notes: [...out.notes, e.message] };
+        }
+    }
+
+    // 2b. Books has now said what the note it created is worth, so a plan that
+    // estimated that number differently must not bill the replacement short.
+    // The stale shape is exact: an older plan measured the note as the SUM OF
+    // ITS LINES, which on a tax-exclusive invoice is the amount net of GST, so
+    // the replacement was capped at net while the note Books applied totals
+    // net + GST — the tax the customer already paid would have stranded on
+    // their account as unused credit (₹59.95 on a ₹1,199 swap). Anything that
+    // is not that ratio is a real price difference, and a cheaper replacement
+    // keeps its own price.
+    if (out.creditNoteTotal > 0 && out.replacementInvoiceLines?.length) {
+        const amountOf = (l) => money(l.rate) * (parseFloat(l.quantity) || 1);
+        const planned = money(out.replacementInvoiceLines.reduce((s, l) => s + amountOf(l), 0));
+        const pct = planned > 0 ? money(
+            out.replacementInvoiceLines.reduce((s, l) => s + amountOf(l) * lineTaxPct(l), 0) / planned) : 0;
+        if (planned > 0 && out.creditNoteTotal > planned + 0.02
+            && Math.abs(money(planned * (1 + pct / 100)) - out.creditNoteTotal) <= 0.05) {
+            out.replacementInvoiceLines = capLinesToTotal(out.replacementInvoiceLines, out.creditNoteTotal, true);
+            out.replacementTotal = money(out.replacementInvoiceLines.reduce((s, l) => s + amountOf(l), 0));
+            out.totalAfter = out.replacementTotal;
+            out.notes.push(`replacement re-based from ₹${planned.toFixed(2)} onto the credit note's ₹${out.creditNoteTotal.toFixed(2)} (the plan had the note net of GST)`);
         }
     }
 
