@@ -1362,9 +1362,10 @@ async function planExchangeInvoice({
     // sync wrote the catalogue item without a rate (legacy unresolved items).
     // There is no money on it to reverse, so the credit note caps to nothing,
     // and capLinesToTotal bails out when its ceiling is not positive — which
-    // leaves the replacement billing a real due against a ₹0 invoice. Seen on
-    // 98 orders totalling ₹1,53,737, 87 of them flagged paid. These need the
-    // product-price backfill, not exchange documents, so they are reported.
+    // leaves the replacement billing a real due against a ₹0 invoice. These
+    // need the product-price backfill, not exchange documents, so they are
+    // reported here; guard 7a catches the rest of the no-ceiling shape (an
+    // invoice whose priced line was never matched) on the way through.
     if (productLines.length && !productLines.some(l => parseFloat(l.rate) > 0)) {
         return {
             ...out,
@@ -1442,6 +1443,11 @@ async function planExchangeInvoice({
     //    came from (rate, discount share, GST split, item linkage).
     let creditNotePayload = null;
     let creditNoteTotal = 0;
+    // Why the ceiling ended up at ₹0 when it does — guard 7a reports the real
+    // reason instead of guessing, because the ways it happens need different
+    // humans (a price backfill, a manual credit reconciliation, or a repair of
+    // the empty note already on file).
+    let ceilingGap = '';
     if (!creditNoteId) {
         const creditReference = creditNoteReference(ref, 'exchange');
         const baseInvoice = {
@@ -1464,14 +1470,24 @@ async function planExchangeInvoice({
         if (cap.fullyCredited) creditNotePayload = null;
         creditNoteTotal = money((creditNotePayload?.line_items || []).reduce(
             (s, l) => s + money(l.rate) * (parseFloat(l.quantity) || 1) - money(l.discount), 0));
+        if (cap.fullyCredited) {
+            const credited = parseFloat(baseInvoice.credits_applied) || 0;
+            ceilingGap = `only ₹${money(parseFloat(baseInvoice.total) - credited).toFixed(2)} of the ₹${money(baseInvoice.total).toFixed(2)} invoice is still creditable (₹${credited.toFixed(2)} already credited)`;
+        } else if (!(creditNoteTotal > 0)) {
+            ceilingGap = 'the returned item(s) mirror only ₹0 lines on the invoice, so the credit note comes out empty';
+        }
     } else {
         // The credit note already exists — its total is the ceiling the
         // replacement must respect, so read it once instead of guessing.
         try {
             const cn = await zohoService.getCreditNote(creditNoteId);
             creditNoteTotal = money(cn?.total);
+            if (!(creditNoteTotal > 0)) {
+                ceilingGap = `the credit note on file (${cn?.creditnote_number || creditNoteId}) totals ₹${creditNoteTotal.toFixed(2)}`;
+            }
         } catch (e) {
             out.notes.push(`credit note total lookup failed: ${e.message}`);
+            ceilingGap = 'the credit note on file could not be read';
         }
     }
 
@@ -1483,6 +1499,23 @@ async function planExchangeInvoice({
     });
     const replacementTotal = money(replacementInvoiceLines.reduce(
         (s, l) => s + money(l.rate) * (parseFloat(l.quantity) || 1), 0));
+    // 7a. Nothing to credit means nothing to bill either. The replacement
+    // invoice is capped at the credit note precisely so a swap never opens a
+    // due of its own, and capLinesToTotal deliberately returns its lines
+    // unscaled when the ceiling is not positive — so with no credit note the
+    // replacement would bill its full price against an invoice that owes
+    // nothing. That is a fabricated receivable, not an exchange: 98 orders in
+    // the all-time plan, ₹1,53,737. Report them with the reason the ceiling is
+    // missing; the price backfill or a human decides, the run writes nothing.
+    if (replacementInvoiceLines.length && !(creditNoteTotal > 0) && replacementTotal > 0) {
+        return {
+            ...out,
+            status: 'needs_review',
+            before: full.line_items.map(lineFingerprint),
+            notes: [...out.notes, `no credit note to bill against${ceilingGap ? ` — ${ceilingGap}` : ''} — the replacement would bill ₹${replacementTotal.toFixed(2)} against it, which is a due nobody owes. Needs a human, not a document`]
+        };
+    }
+
     // Re-line when the document is missing, carries no price (the old ₹0
     // artifact), or is priced differently from what the swap now calls for —
     // that last case is how an overstated replacement stops showing a due.
