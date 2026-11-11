@@ -1,6 +1,7 @@
 const crypto = require('crypto');
 const axios = require('axios');
 const { dbAdapter } = require('../database/db');
+const { getBreaker } = require('../utils/circuitBreaker');
 
 // ============================================================
 // SupportSync — keeps support_order_cache fresh from Shopify.
@@ -122,14 +123,19 @@ function reqHeaders(extra) {
 }
 
 function requestsQuery(params) {
-    return axios.get(`${process.env.SUPABASE_URL}/rest/v1/requests?${params}`,
-        { headers: reqHeaders(), timeout: 15000 }).then(r => r.data || []);
+    return getBreaker('internal', 'READ', 'requestsQuery', request => request()).fire(() =>
+        axios.get(`${process.env.SUPABASE_URL}/rest/v1/requests?${params}`,
+            { headers: reqHeaders(), timeout: 15000 })
+    ).then(r => r.data || []);
 }
 
 // jsonb columns take real arrays/objects here, not stringified JSON
 function requestsInsert(row) {
-    return axios.post(`${process.env.SUPABASE_URL}/rest/v1/requests`, row,
-        { headers: reqHeaders({ Prefer: 'return=minimal' }), timeout: 20000 });
+    return getBreaker('internal', 'MUTATE_IDEMPOTENT', 'requestsInsert', request => request(), {
+        timeout: 10000,
+        maxConcurrency: 5
+    }).fire(() => axios.post(`${process.env.SUPABASE_URL}/rest/v1/requests`, row,
+        { headers: reqHeaders({ Prefer: 'return=minimal' }), timeout: 20000 }));
 }
 
 // ---------- stage computation ----------

@@ -136,7 +136,10 @@ class EkartAdapter extends BaseCarrier {
             const pin = this.normalizePincode(ctx.consignee.pincode);
             if (!pin) return this.fail('Invalid delivery pincode (must be 6 digits)');
 
-            const response = await this.request({ method: 'get', url: `/api/v2/serviceability/${pin}` });
+            const response = await this.withBreaker('READ', 'checkServiceability', () =>
+                this.request({ method: 'get', url: `/api/v2/serviceability/${pin}` })
+            );
+            if (response && response.success === false) return response;
             const { status, remark, details } = response.data || {};
 
             const isCod = ctx.payment.mode === 'COD';
@@ -186,7 +189,7 @@ class EkartAdapter extends BaseCarrier {
         if (!pickupPin) return null;
         try {
             const isCod = ctx.payment.mode === 'COD';
-            const response = await this.request({
+            const response = await this.withBreaker('READ', 'fetchRateEstimate', () => this.request({
                 method: 'post',
                 url: '/data/pricing/estimate',
                 data: {
@@ -203,7 +206,8 @@ class EkartAdapter extends BaseCarrier {
                     height: Number(ctx.package.heightCm) || 2
                 },
                 timeout: 15000
-            });
+            }));
+            if (response && response.success === false) return null;
             const total = Number(response.data?.total);
             return Number.isFinite(total) && total > 0 ? total : null;
         } catch (error) {
@@ -303,11 +307,12 @@ class EkartAdapter extends BaseCarrier {
             payload.pickup_location = { name: process.env.EKART_PICKUP_ALIAS };
             payload.return_location = { name: process.env.EKART_RETURN_ALIAS || process.env.EKART_PICKUP_ALIAS };
 
-            const response = await this.request({
+            const response = await this.withBreaker('MUTATE_UNKNOWN', 'createShipment', () => this.request({
                 method: 'put',
                 url: '/api/v1/package/create',
                 data: payload
-            });
+            }));
+            if (response && response.success === false) return response;
 
             const result = response.data || {};
             if (result.status !== true || !result.tracking_id) {
@@ -341,12 +346,13 @@ class EkartAdapter extends BaseCarrier {
 
     async generateLabel(shipment) {
         try {
-            const response = await this.request({
+            const response = await this.withBreaker('READ', 'generateLabel', () => this.request({
                 method: 'post',
                 url: '/api/v1/package/label?json_only=false',
                 data: { ids: [shipment.awb] },
                 responseType: 'arraybuffer'
-            });
+            }));
+            if (response && response.success === false) return response;
 
             const buffer = Buffer.from(response.data);
             if (!buffer.length) return this.fail('Ekart returned an empty label file');
@@ -376,11 +382,12 @@ class EkartAdapter extends BaseCarrier {
 
     async generateManifest(shipment) {
         try {
-            const response = await this.request({
+            const response = await this.withBreaker('MUTATE_IDEMPOTENT', 'generateManifest', () => this.request({
                 method: 'post',
                 url: '/data/v2/generate/manifest',
                 data: { ids: [shipment.awb] }
-            });
+            }));
+            if (response && response.success === false) return response;
 
             const manifestUrl = response.data?.manifestDownloadUrl;
             if (!manifestUrl) return this.fail('Ekart did not return a manifest link', response.data);
@@ -396,10 +403,11 @@ class EkartAdapter extends BaseCarrier {
 
     async cancelShipment(shipment) {
         try {
-            const response = await this.request({
+            const response = await this.withBreaker('MUTATE_IDEMPOTENT', 'cancelShipment', () => this.request({
                 method: 'delete',
                 url: `/api/v1/package/cancel?tracking_id=${encodeURIComponent(shipment.awb)}`
-            });
+            }));
+            if (response && response.success === false) return response;
 
             // Response: { data: [ { status, remark, tracking_id } ] } (or a bare ack)
             const ack = response.data?.data?.[0] || response.data;
@@ -425,11 +433,12 @@ class EkartAdapter extends BaseCarrier {
 
     async track(awb) {
         try {
-            const response = await this.request({
+            const response = await this.withBreaker('READ', 'track', () => this.request({
                 method: 'get',
                 url: `/api/v1/track/${encodeURIComponent(awb)}`,
                 timeout: 20000
-            });
+            }));
+            if (response && response.success === false) return response;
 
             const data = response.data || {};
             const trackInfo = data.track;

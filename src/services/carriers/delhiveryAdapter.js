@@ -346,12 +346,13 @@ class DelhiveryAdapter extends BaseCarrier {
         });
 
         try {
-            const response = await rateLimitedRequest(() =>
-                axios.post(`${this.baseURL}/api/cmu/create.json`, requestPayload.toString(), {
+            const response = await this.withBreaker('MUTATE_UNKNOWN', 'createShipment', () =>
+                rateLimitedRequest(() => axios.post(`${this.baseURL}/api/cmu/create.json`, requestPayload.toString(), {
                     headers: { ...this.authHeaders(), 'Content-Type': 'application/x-www-form-urlencoded' },
                     timeout: 30000
-                })
+                }))
             );
+            if (response && response.success === false) return response;
 
             // HTTP 200 can still be a per-package failure — inspect the package
             const pkg = response.data?.packages?.[0];
@@ -443,10 +444,13 @@ class DelhiveryAdapter extends BaseCarrier {
                         });
                         
                         try {
-                            const retryResponse = await rateLimitedRequest(() => axios.post(`${this.baseURL}/api/cmu/create.json`, retryPayload.toString(), {
-                                headers: { ...this.authHeaders(), 'Content-Type': 'application/x-www-form-urlencoded' },
-                                timeout: 30000
-                            }));
+                            const retryResponse = await this.withBreaker('MUTATE_UNKNOWN', 'createShipment', () =>
+                                rateLimitedRequest(() => axios.post(`${this.baseURL}/api/cmu/create.json`, retryPayload.toString(), {
+                                    headers: { ...this.authHeaders(), 'Content-Type': 'application/x-www-form-urlencoded' },
+                                    timeout: 30000
+                                }))
+                            );
+                            if (retryResponse && retryResponse.success === false) return retryResponse;
                             
                             const retryPkg = retryResponse.data?.packages?.[0];
                             const retryAwb = retryPkg?.waybill ? String(retryPkg.waybill) : '';
@@ -509,16 +513,17 @@ class DelhiveryAdapter extends BaseCarrier {
     // Packing slip / label PDF link — omit pdf_size so the carrier returns its native label format
     async generateLabel(shipment) {
         try {
-            const response = await rateLimitedRequest(() =>
-                axios.get(`${this.baseURL}/api/p/packing_slip`, {
+            const response = await this.withBreaker('READ', 'generateLabel', () =>
+                rateLimitedRequest(() => axios.get(`${this.baseURL}/api/p/packing_slip`, {
                     headers: this.authHeaders(),
                     params: { wbns: shipment.awb, pdf: 'true' },
                     responseType: 'arraybuffer',
                     maxContentLength: 10 * 1024 * 1024,
                     signal: AbortSignal.timeout(25000),
                     timeout: 20000
-                })
+                }))
             );
+            if (response && response.success === false) return response;
 
             const buffer = Buffer.from(response.data);
             if (buffer.subarray(0, 1024).includes(Buffer.from('%PDF-'))) {
@@ -552,12 +557,13 @@ class DelhiveryAdapter extends BaseCarrier {
                 expected_package_count: 1
             };
 
-            const response = await rateLimitedRequest(() =>
-                axios.post(`${this.baseURL}/fm/request/new/`, payload, {
+            const response = await this.withBreaker('MUTATE_UNKNOWN', 'schedulePickup', () =>
+                rateLimitedRequest(() => axios.post(`${this.baseURL}/fm/request/new/`, payload, {
                     headers: { ...this.authHeaders(), 'Content-Type': 'application/json' },
                     timeout: 20000
-                })
+                }))
             );
+            if (response && response.success === false) return response;
 
             const pickupId = response.data?.pickup_id || response.data?.pr_exist_id || null;
             return this.ok({
@@ -616,13 +622,14 @@ class DelhiveryAdapter extends BaseCarrier {
     // Normalized tracking timeline (newest first)
     async track(awb) {
         try {
-            const response = await rateLimitedRequest(() =>
-                axios.get(`${this.baseURL}/api/v1/packages/json/`, {
+            const response = await this.withBreaker('READ', 'track', () =>
+                rateLimitedRequest(() => axios.get(`${this.baseURL}/api/v1/packages/json/`, {
                     headers: this.authHeaders(),
                     params: { waybill: awb },
                     timeout: 20000
-                })
+                }))
             );
+            if (response && response.success === false) return response;
 
             const shipmentData = response.data?.ShipmentData?.[0]?.Shipment;
             if (!shipmentData) return this.fail('No tracking data found for this AWB', response.data);

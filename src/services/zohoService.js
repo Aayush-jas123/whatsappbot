@@ -1,5 +1,6 @@
 const axios = require('axios');
 const { dbAdapter } = require('../database/db');
+const { getBreaker } = require('../utils/circuitBreaker');
 
 // ============================================================
 // ZOHO API CLIENT — OAuth2 + Books + Inventory
@@ -106,14 +107,15 @@ async function refreshAccessToken() {
         throw new Error('Zoho OAuth credentials not configured (ZOHO_CLIENT_ID, ZOHO_CLIENT_SECRET, ZOHO_REFRESH_TOKEN)');
     }
 
-    const res = await axios.post(ACCOUNTS_BASE(), new URLSearchParams({
-        client_id: clientId,
-        client_secret: clientSecret,
-        refresh_token: refreshToken,
-        grant_type: 'refresh_token'
-    }).toString(), {
-        headers: { 'Content-Type': 'application/x-www-form-urlencoded' }
-    });
+    const res = await getBreaker('zoho', 'MUTATE_UNKNOWN', 'refreshAccessToken', request => request())
+        .fire(() => axios.post(ACCOUNTS_BASE(), new URLSearchParams({
+            client_id: clientId,
+            client_secret: clientSecret,
+            refresh_token: refreshToken,
+            grant_type: 'refresh_token'
+        }).toString(), {
+            headers: { 'Content-Type': 'application/x-www-form-urlencoded' }
+        }));
 
     if (!res.data.access_token) {
         throw new Error('Zoho token refresh failed: no access_token in response');

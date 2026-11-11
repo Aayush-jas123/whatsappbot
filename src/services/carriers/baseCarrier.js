@@ -10,6 +10,8 @@
  *   { success: false, error: 'human readable message', raw: <carrier response> }
  */
 
+const { getBreaker, isBreakerOpen } = require('../../utils/circuitBreaker');
+
 class BaseCarrier {
     constructor(key, name) {
         this.key = key;   // machine key, e.g. 'delhivery'
@@ -71,6 +73,17 @@ class BaseCarrier {
 
     fail(error, raw = null) {
         return { success: false, error, raw };
+    }
+
+    async withBreaker(mutationClass, name, fn) {
+        try {
+            return await getBreaker(this.key, mutationClass, name, request => request()).fire(fn);
+        } catch (error) {
+            if (isBreakerOpen(error)) {
+                return this.fail(error.message, { code: 'CARRIER_UNAVAILABLE', notAttempted: true });
+            }
+            throw error;
+        }
     }
 
     // Normalize to a 10-digit Indian mobile number (carriers reject 91-prefixed)
