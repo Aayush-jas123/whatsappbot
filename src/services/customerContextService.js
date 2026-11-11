@@ -1,6 +1,7 @@
 const axios = require('axios');
 const { dbAdapter } = require('../database/db');
 const { cachedQuery } = require('../utils/cache');
+const { getBreaker } = require('../utils/circuitBreaker');
 
 // ============================================================
 // customerContextService — the Shoppers Hub "customer context"
@@ -22,11 +23,13 @@ async function fetchReturnsServerPipeline(windowDays) {
     const token = process.env.WHATSAPP_INTERNAL_TOKEN;
     if (!baseUrl) return { connected: false, reason: 'RETURNS_SERVER_URL not configured', requests: [] };
     try {
-        const res = await axios.get(`${baseUrl.replace(/\/$/, '')}/api/internal/inventory-open-requests`, {
-            params: { window: windowDays },
-            headers: { 'x-internal-token': token || '' },
-            timeout: 15000
-        });
+        const res = await getBreaker('internal', 'READ', 'returnsPipeline', request => request()).fire(() =>
+            axios.get(`${baseUrl.replace(/\/$/, '')}/api/internal/inventory-open-requests`, {
+                params: { window: windowDays },
+                headers: { 'x-internal-token': token || '' },
+                timeout: 15000
+            })
+        );
         if (!res.data?.success) return { connected: false, reason: res.data?.error || 'unexpected response', requests: [] };
         return { connected: true, requests: Array.isArray(res.data.requests) ? res.data.requests : [] };
     } catch (err) {
@@ -113,11 +116,13 @@ async function build(rawPhone) {
             const rsBase = process.env.RETURNS_SERVER_URL.replace(/\/$/, '');
             const rsToken = process.env.WHATSAPP_INTERNAL_TOKEN || '';
             const lookups = await Promise.all(lookupOrderIds.map(id =>
-                axios.get(`${rsBase}/api/internal/ai-data`, {
-                    params: { resource: 'requests', query: id, limit: 10 },
-                    headers: { 'x-internal-token': rsToken },
-                    timeout: 8000
-                }).catch(() => null)
+                getBreaker('internal', 'READ', 'returnsOrderLookup', request => request()).fire(() =>
+                    axios.get(`${rsBase}/api/internal/ai-data`, {
+                        params: { resource: 'requests', query: id, limit: 10 },
+                        headers: { 'x-internal-token': rsToken },
+                        timeout: 8000
+                    })
+                ).catch(() => null)
             ));
             for (const lk of lookups) {
                 const reqs = Array.isArray(lk?.data?.requests) ? lk.data.requests : [];

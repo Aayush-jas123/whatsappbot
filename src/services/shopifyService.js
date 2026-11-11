@@ -1,5 +1,6 @@
 const crypto = require('crypto');
 const axios = require('axios');
+const { getBreaker } = require('../utils/circuitBreaker');
 
 class ShopifyService {
     constructor() {
@@ -16,6 +17,11 @@ class ShopifyService {
      * and retries automatically on 429 with exponential backoff.
      */
     async _rateLimitedRequest(requestFn, maxRetries = 3) {
+        return getBreaker('shopify', 'MUTATE_IDEMPOTENT', 'fulfillment', request => request())
+            .fire(() => this._rateLimitedRequestInner(requestFn, maxRetries));
+    }
+
+    async _rateLimitedRequestInner(requestFn, maxRetries) {
         // Chain requests sequentially to enforce rate limit
         const previousCall = this._rateLimiter.queue;
         

@@ -202,7 +202,204 @@ function uninstallConsoleShim() {
     return true;
 }
 
+// ── Phase 5 M0: Breaker Logger Shim ──────────────────────────────────────────
+const PHASE5_LOG_LEVELS = { debug: 10, info: 20, warn: 30, error: 40 };
+
+function getPhase5LogLevel() {
+    const envLevel = String(process.env.LOG_LEVEL || '').trim().toLowerCase();
+    return PHASE5_LOG_LEVELS[envLevel] !== undefined ? envLevel : 'info';
+}
+
+function shouldPhase5Log(level) {
+    const current = getPhase5LogLevel();
+    return (PHASE5_LOG_LEVELS[level] || 0) >= (PHASE5_LOG_LEVELS[current] || 20);
+}
+
+/**
+ * Serialize an arbitrary value into a JSON-safe structure:
+ * - Cycle detection on active ancestor path (permits repeated/DAG object references)
+ * - Error instances with name, message, stack, and custom properties
+ * - BigInt converted to string
+ * - Handling of unusual objects (null prototype, symbols, functions, throwing proxies/getters)
+ * - Safe fallback if anything throws
+ */
+function toSafeValue(val, ancestors = new Set()) {
+    if (val === null || val === undefined) return val;
+    if (typeof val === 'bigint') return val.toString();
+    if (typeof val === 'symbol' || typeof val === 'function') return String(val);
+    if (typeof val !== 'object') return val;
+
+    if (ancestors.has(val)) {
+        return '[Circular]';
+    }
+
+    ancestors.add(val);
+    try {
+        if (val instanceof Error) {
+            const errObj = {
+                name: String(val.name || 'Error'),
+                message: String(val.message || ''),
+                stack: val.stack ? String(val.stack) : undefined
+            };
+            let keys;
+            try {
+                keys = Object.getOwnPropertyNames(val);
+            } catch (_) {
+                keys = [];
+            }
+            for (let i = 0; i < keys.length; i++) {
+                const k = keys[i];
+                if (k !== 'name' && k !== 'message' && k !== 'stack') {
+                    let childVal;
+                    try {
+                        childVal = val[k];
+                    } catch (_) {
+                        childVal = '[Unserializable]';
+                    }
+                    try {
+                        errObj[k] = toSafeValue(childVal, ancestors);
+                    } catch (_) {
+                        errObj[k] = '[Unserializable]';
+                    }
+                }
+            }
+            return errObj;
+        }
+
+        if (Array.isArray(val)) {
+            const arr = [];
+            for (let i = 0; i < val.length; i++) {
+                let itemVal;
+                try {
+                    itemVal = val[i];
+                } catch (_) {
+                    itemVal = '[Unserializable]';
+                }
+                try {
+                    arr.push(toSafeValue(itemVal, ancestors));
+                } catch (_) {
+                    arr.push('[Unserializable]');
+                }
+            }
+            return arr;
+        }
+
+        const out = {};
+        let keys;
+        try {
+            keys = Object.keys(val);
+        } catch (_) {
+            return '[Unserializable]';
+        }
+        for (let i = 0; i < keys.length; i++) {
+            const k = keys[i];
+            let childVal;
+            try {
+                childVal = val[k];
+            } catch (_) {
+                childVal = '[Unserializable]';
+            }
+            try {
+                out[k] = toSafeValue(childVal, ancestors);
+            } catch (_) {
+                out[k] = '[Unserializable]';
+            }
+        }
+        return out;
+    } finally {
+        ancestors.delete(val);
+    }
+}
+
+function safeJsonStringify(obj) {
+    try {
+        const safe = toSafeValue(obj);
+        return JSON.stringify(safe);
+    } catch (e) {
+        try {
+            return JSON.stringify({
+                ts: new Date().toISOString(),
+                level: 'error',
+                msg: 'Failed to serialize log entry',
+                serialization_error: String(e && e.message ? e.message : e)
+            });
+        } catch (_) {
+            return '{"level":"error","msg":"Failed to serialize log entry"}';
+        }
+    }
+}
+
+function writeJsonLog(level, msg, fields = {}) {
+    if (!shouldPhase5Log(level)) return;
+
+    let stringMsg;
+    if (typeof msg === 'string') {
+        stringMsg = msg;
+    } else if (msg instanceof Error) {
+        stringMsg = msg.message || msg.name || 'Error';
+    } else if (msg === null || msg === undefined) {
+        stringMsg = '';
+    } else {
+        try {
+            stringMsg = String(msg);
+        } catch (_) {
+            stringMsg = '[Unserializable message]';
+        }
+    }
+
+    const entry = {
+        ts: new Date().toISOString(),
+        level,
+        msg: stringMsg
+    };
+
+    if (fields && typeof fields === 'object') {
+        if (fields instanceof Error) {
+            entry.err = fields;
+        } else {
+            let keys;
+            try {
+                keys = Object.keys(fields);
+            } catch (_) {
+                entry.metadata = '[Unserializable]';
+            }
+
+            if (keys) {
+                for (let i = 0; i < keys.length; i++) {
+                    const k = keys[i];
+                    let val;
+                    try {
+                        val = fields[k];
+                    } catch (_) {
+                        val = '[Unserializable]';
+                    }
+
+                    // Inviolable reserved fields: ts, level, msg
+                    if (k === 'ts' || k === 'level' || k === 'msg') {
+                        entry[`field_${k}`] = val;
+                    } else {
+                        entry[k] = val;
+                    }
+                }
+            }
+        }
+    } else if (fields !== undefined && fields !== null) {
+        entry.extra = fields;
+    }
+
+    const line = safeJsonStringify(entry);
+    process.stdout.write(line + '\n');
+}
+
+const logger = {
+    debug: (msg, fields) => writeJsonLog('debug', msg, fields),
+    info: (msg, fields) => writeJsonLog('info', msg, fields),
+    warn: (msg, fields) => writeJsonLog('warn', msg, fields),
+    error: (msg, fields) => writeJsonLog('error', msg, fields)
+};
+
 module.exports = {
+    logger,
     createAppLogger,
     installConsoleShim,
     uninstallConsoleShim,

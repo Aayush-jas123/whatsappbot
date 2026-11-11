@@ -476,7 +476,10 @@ class ShiprocketAdapter extends BaseCarrier {
     // later. Parse the immediate response first; when it carries no AWB,
     // poll the order detail until one appears (or the budget runs out).
     async assignAwbAndAwait(headers, awbBody, srOrderId, channelOrderId) {
-        const awbRes = await axios.post(`${this.baseURL}/courier/assign/awb`, awbBody, { headers, timeout: 30000 });
+        const awbRes = await this.withBreaker('MUTATE_UNKNOWN', 'assignAwb', () =>
+            axios.post(`${this.baseURL}/courier/assign/awb`, awbBody, { headers, timeout: 30000 })
+        );
+        if (awbRes && awbRes.success === false) return awbRes;
 
         const awbData = awbRes.data?.response?.data || awbRes.data?.data || {};
         const immediate = awbData.awb_code || awbRes.data?.awb_code;
@@ -521,7 +524,7 @@ class ShiprocketAdapter extends BaseCarrier {
             const isCod = ctx.payment.mode === 'COD';
             const pickupPincode = await this.resolvePickupPincode();
 
-            const response = await axios.get(`${this.baseURL}/courier/serviceability/`, {
+            const response = await this.withBreaker('READ', 'checkServiceability', () => axios.get(`${this.baseURL}/courier/serviceability/`, {
                 headers,
                 params: {
                     pickup_postcode: pickupPincode,
@@ -531,7 +534,8 @@ class ShiprocketAdapter extends BaseCarrier {
                     declared_value: ctx.payment.declaredValue || 0
                 },
                 timeout: 20000
-            });
+            }));
+            if (response && response.success === false) return response;
 
             const couriers = response.data?.data?.available_courier_companies || [];
             if (couriers.length === 0) {
@@ -651,6 +655,7 @@ class ShiprocketAdapter extends BaseCarrier {
                 for (let attempt = 1; attempt <= 2; attempt++) {
                     try {
                         awbAssigned = await this.assignAwbAndAwait(headers, awbBody, srOrderId, synced.channel_order_id);
+                        if (awbAssigned && awbAssigned.success === false) return awbAssigned;
                         awbError = null;
                         break;
                     } catch (error) {
@@ -744,10 +749,10 @@ class ShiprocketAdapter extends BaseCarrier {
 
             let createRes;
             try {
-                createRes = await axios.post(`${this.baseURL}/orders/create`, { ...orderPayload, channel_id: channelId }, {
+                createRes = await this.withBreaker('MUTATE_UNKNOWN', 'createShipment', () => axios.post(`${this.baseURL}/orders/create`, { ...orderPayload, channel_id: channelId }, {
                     headers,
                     timeout: 30000
-                });
+                }));
             } catch (channelError) {
                 const httpStatus = channelError.response?.status;
                 // Extract field-level validation errors from the Shiprocket response
@@ -945,6 +950,7 @@ class ShiprocketAdapter extends BaseCarrier {
                         if (ctx.courierId && ctx.courierId !== 'auto') awbBody.courier_id = ctx.courierId;
                         try {
                             const awbAssigned = await this.assignAwbAndAwait(headers, awbBody, srOrderId, existing.channel_order_id);
+                            if (awbAssigned && awbAssigned.success === false) return awbAssigned;
                             if (awbAssigned?.awb) {
                                 console.log(`📦 Shiprocket: assigned AWB ${awbAssigned.awb} to existing order ${existing.channel_order_id}`);
                                 return this.ok({
@@ -986,6 +992,7 @@ class ShiprocketAdapter extends BaseCarrier {
                 );
             }
 
+            if (createRes && createRes.success === false) return createRes;
             const shipmentId = createRes.data?.shipment_id;
             const srOrderId = createRes.data?.order_id;
             if (!shipmentId) {
@@ -1001,6 +1008,7 @@ class ShiprocketAdapter extends BaseCarrier {
             let awbAssigned;
             try {
                 awbAssigned = await this.assignAwbAndAwait(headers, awbBody, String(srOrderId), ctx.orderId);
+                if (awbAssigned && awbAssigned.success === false) return awbAssigned;
             } catch (awbError) {
                 // Order exists but AWB failed — surface both facts so admin can retry from Shiprocket panel
                 return this.fail(
@@ -1033,9 +1041,10 @@ class ShiprocketAdapter extends BaseCarrier {
     async generateLabel(shipment) {
         try {
             const headers = await this.authHeaders();
-            const response = await axios.post(`${this.baseURL}/courier/generate/label`, {
+            const response = await this.withBreaker('READ', 'generateLabel', () => axios.post(`${this.baseURL}/courier/generate/label`, {
                 shipment_id: [Number(shipment.carrier_shipment_id)]
-            }, { headers, timeout: 30000 });
+            }, { headers, timeout: 30000 }));
+            if (response && response.success === false) return response;
 
             if (!response.data?.label_url) {
                 return this.fail(`Shiprocket label not ready: ${response.data?.response || response.data?.message || 'unknown'}`, response.data);
@@ -1052,10 +1061,11 @@ class ShiprocketAdapter extends BaseCarrier {
             const body = { shipment_id: [Number(shipment.carrier_shipment_id)] };
             if (pickupDate) body.pickup_date = [pickupDate];
 
-            const response = await axios.post(`${this.baseURL}/courier/generate/pickup`, body, {
+            const response = await this.withBreaker('MUTATE_UNKNOWN', 'schedulePickup', () => axios.post(`${this.baseURL}/courier/generate/pickup`, body, {
                 headers,
                 timeout: 30000
-            });
+            }));
+            if (response && response.success === false) return response;
 
             const data = response.data?.response || response.data;
             if (response.data?.pickup_status !== 1 && !data?.pickup_scheduled_date) {
@@ -1073,9 +1083,10 @@ class ShiprocketAdapter extends BaseCarrier {
     async generateManifest(shipment) {
         try {
             const headers = await this.authHeaders();
-            const response = await axios.post(`${this.baseURL}/manifests/generate`, {
+            const response = await this.withBreaker('MUTATE_IDEMPOTENT', 'generateManifest', () => axios.post(`${this.baseURL}/manifests/generate`, {
                 shipment_id: [Number(shipment.carrier_shipment_id)]
-            }, { headers, timeout: 30000 });
+            }, { headers, timeout: 30000 }));
+            if (response && response.success === false) return response;
 
             const manifestUrl = response.data?.manifest_url;
             if (!manifestUrl) {
@@ -1090,9 +1101,10 @@ class ShiprocketAdapter extends BaseCarrier {
     async generateInvoice(shipment) {
         try {
             const headers = await this.authHeaders();
-            const response = await axios.post(`${this.baseURL}/orders/print/invoice`, {
+            const response = await this.withBreaker('READ', 'generateInvoice', () => axios.post(`${this.baseURL}/orders/print/invoice`, {
                 ids: [Number(shipment.carrier_order_id)]
-            }, { headers, timeout: 30000 });
+            }, { headers, timeout: 30000 }));
+            if (response && response.success === false) return response;
 
             const invoiceUrl = response.data?.invoice_url;
             if (!invoiceUrl) {
@@ -1119,9 +1131,10 @@ class ShiprocketAdapter extends BaseCarrier {
 
         if (shipment.awb) {
             try {
-                const response = await axios.post(`${this.baseURL}/orders/cancel/shipment/awbs`, {
+                const response = await this.withBreaker('MUTATE_IDEMPOTENT', 'cancelShipment', () => axios.post(`${this.baseURL}/orders/cancel/shipment/awbs`, {
                     awbs: [String(shipment.awb)]
-                }, { headers, timeout: 30000 });
+                }, { headers, timeout: 30000 }));
+                if (response && response.success === false) return response;
                 awbCancel = { success: true, raw: response.data };
             } catch (error) {
                 awbCancel = { success: false, error: this.describeAxiosError(error), raw: error.response?.data };
@@ -1132,9 +1145,10 @@ class ShiprocketAdapter extends BaseCarrier {
         const carrierOrderId = Number(shipment.carrier_order_id);
         if (carrierOrderId) {
             try {
-                const response = await axios.post(`${this.baseURL}/orders/cancel`, {
+                const response = await this.withBreaker('MUTATE_IDEMPOTENT', 'cancelShipment', () => axios.post(`${this.baseURL}/orders/cancel`, {
                     ids: [carrierOrderId]
-                }, { headers, timeout: 30000 });
+                }, { headers, timeout: 30000 }));
+                if (response && response.success === false) return response;
                 orderCancel = { success: true, raw: response.data };
             } catch (error) {
                 orderCancel = { success: false, error: this.describeAxiosError(error), raw: error.response?.data };
@@ -1167,7 +1181,8 @@ class ShiprocketAdapter extends BaseCarrier {
 
     async track(awb) {
         try {
-            const trackingData = await shiprocketService.getTrackingByAWB(awb);
+            const trackingData = await this.withBreaker('READ', 'track', () => shiprocketService.getTrackingByAWB(awb));
+            if (trackingData && trackingData.success === false) return trackingData;
             if (!trackingData?.tracking_data) {
                 return this.fail('No tracking data found for this AWB', trackingData);
             }
