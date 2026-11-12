@@ -7912,7 +7912,7 @@ router.get('/inventory/manual', verifyToken, async (req, res) => {
 // POST /api/admin/inventory/bulk-in - Bulk inventory-in (add stock to existing quantities)
 router.post('/inventory/bulk-in', verifyToken, async (req, res) => {
     try {
-        const { items, reference, notes, performed_by } = req.body;
+        const { items, reference, notes, performed_by, sync_shopify } = req.body;
         
         if (!items || !Array.isArray(items) || items.length === 0) {
             return res.status(400).json({ success: false, error: 'items array is required' });
@@ -7996,6 +7996,15 @@ router.post('/inventory/bulk-in', verifyToken, async (req, res) => {
         const { invalidateCache } = require('../utils/cache');
         invalidateCache();
 
+        // Optional mirror to Shopify: queue a rate-limited delta push job (same
+        // pipeline the sync workbench uses). Non-blocking — the UI polls the job.
+        let shopifySync = null;
+        if (sync_shopify) {
+            shopifySync = await queueBulkShopifyPush(results.map(r => ({
+                sku_key: r.sku_key, product_name: r.product_name, size: r.size, delta: r.quantity_added,
+            })), reference || 'bulk_in', performed_by || 'hub_operator');
+        }
+
         res.json({
             success: true,
             message: `Bulk inventory-in completed for ${results.length} SKU(s)`,
@@ -8003,6 +8012,7 @@ router.post('/inventory/bulk-in', verifyToken, async (req, res) => {
             items: results,
             adjustment_records: adjustmentRecords,
             reference: reference || null,
+            shopify_sync: shopifySync,
             timestamp
         });
     } catch (error) {
@@ -8014,7 +8024,7 @@ router.post('/inventory/bulk-in', verifyToken, async (req, res) => {
 // POST /api/admin/inventory/bulk-out - Bulk inventory-out (subtract stock from existing quantities)
 router.post('/inventory/bulk-out', verifyToken, async (req, res) => {
     try {
-        const { items, reference, notes, performed_by } = req.body;
+        const { items, reference, notes, performed_by, sync_shopify } = req.body;
 
         if (!items || !Array.isArray(items) || items.length === 0) {
             return res.status(400).json({ success: false, error: 'items array is required' });
@@ -8068,6 +8078,13 @@ router.post('/inventory/bulk-out', verifyToken, async (req, res) => {
         const { invalidateCache } = require('../utils/cache');
         invalidateCache();
 
+        let shopifySync = null;
+        if (sync_shopify) {
+            shopifySync = await queueBulkShopifyPush(results.map(r => ({
+                sku_key: r.sku_key, product_name: r.product_name, size: r.size, delta: -r.quantity_removed,
+            })), reference || 'bulk_out', performed_by || 'hub_operator');
+        }
+
         res.json({
             success: true,
             message: `Bulk inventory-out completed for ${results.length} SKU(s)`,
@@ -8075,6 +8092,7 @@ router.post('/inventory/bulk-out', verifyToken, async (req, res) => {
             items: results,
             adjustment_records: adjustmentRecords,
             reference: reference || null,
+            shopify_sync: shopifySync,
             timestamp
         });
     } catch (error) {
@@ -8181,6 +8199,168 @@ router.post('/inventory/sync-from-shopify', verifyToken, async (req, res) => {
     } catch (error) {
         console.error('Shopify sync error:', error);
         res.status(500).json({ success: false, error: 'Failed to sync from Shopify: ' + error.message });
+    }
+});
+
+// ── SHOPIFY ⇄ STOCK ROOM two-way sync workbench ──
+// Pull: Shopify-side bulk edits land here (adds + quantity alignment) via
+// batched SQL. Push: hub quantities (or Bulk In/Out deltas) are written to
+// Shopify through a rate-limited background job the UI polls for progress.
+
+// Shared by bulk-in/bulk-out when sync_shopify is requested. Never throws —
+// a Shopify mirror failure must not fail the local bulk operation.
+async function queueBulkShopifyPush(deltas, reference, performedBy) {
+    try {
+        const sync = require('../services/shopifyInventorySync');
+        const shopifyService = require('../services/shopifyService');
+        const active = sync.getActivePushJob();
+        if (active) return { queued: false, alreadyRunning: true, jobId: active.id };
+        const catalog = await shopifyService.getProductCatalog(false);
+        const { job, unmatched } = await sync.startDeltaPushJob({
+            client: shopifyService, db: dbAdapter, catalog, deltas,
+            reference: `${reference}_shopify_push`, performedBy,
+        });
+        return { queued: job.total > 0, jobId: job.id, total: job.total, unmatched };
+    } catch (e) {
+        console.error('[Bulk Shopify push] queue failed:', e.message);
+        return { queued: false, error: e.message };
+    }
+}
+
+// POST /api/admin/inventory/shopify-sync/plan - read-only comparison preview
+router.post('/inventory/shopify-sync/plan', verifyToken, async (req, res) => {
+    try {
+        const direction = req.body?.direction === 'push' ? 'push' : 'pull';
+        const mode = ['match', 'fill_zero', 'new_only'].includes(req.body?.mode) ? req.body.mode : 'match';
+        const force = req.body?.force === true;
+        const sync = require('../services/shopifyInventorySync');
+        const shopifyService = require('../services/shopifyService');
+
+        const catalog = await shopifyService.getProductCatalog(force);
+        if (!catalog || catalog.length === 0) {
+            return res.status(400).json({ success: false, error: 'Shopify catalog is empty — check Shopify credentials' });
+        }
+        const hubRows = await dbAdapter.query('SELECT product_name, category, size, sku_key, quantity, reorder_level, updated_at FROM manual_inventory');
+
+        let plan;
+        if (direction === 'push') {
+            // Real Shopify-side totals from InventoryLevel (not the 10-min cache) so
+            // the preview deltas match what the push will start from
+            const index = sync.indexCatalog(catalog);
+            const iids = [...index.byKey.values()].map(e => e.variant.inventory_item_id).filter(Boolean);
+            let totals = new Map();
+            try {
+                totals = (await shopifyService.getInventoryLevels(iids)).totals;
+            } catch (e) {
+                console.warn('[ShopifySync] level read failed, falling back to catalog cache:', e.message);
+            }
+            plan = sync.buildPushPlan(catalog, hubRows, totals);
+        } else {
+            plan = sync.buildPullPlan(catalog, hubRows, { mode });
+        }
+        res.json({ success: true, plan });
+    } catch (error) {
+        console.error('Shopify sync plan error:', error);
+        res.status(500).json({ success: false, error: 'Failed to build sync plan: ' + error.message });
+    }
+});
+
+// POST /api/admin/inventory/shopify-sync/pull/apply - apply selected pull rows
+router.post('/inventory/shopify-sync/pull/apply', verifyToken, async (req, res) => {
+    try {
+        const rows = req.body?.rows;
+        if (!Array.isArray(rows) || rows.length === 0) {
+            return res.status(400).json({ success: false, error: 'rows array is required' });
+        }
+        if (rows.length > 2000) {
+            return res.status(400).json({ success: false, error: 'Too many rows in one apply (max 2000) — trim the selection' });
+        }
+        const sync = require('../services/shopifyInventorySync');
+        const result = await sync.applyPullPlan(dbAdapter, rows, {
+            performedBy: req.admin?.username || 'hub_operator',
+            reference: req.body?.reference || 'shopify_pull',
+        });
+        invalidateCache();
+
+        // fire-and-forget run audit row; the pull itself is already committed
+        const timestamp = new Date().toISOString();
+        dbAdapter.query(
+            `INSERT INTO shopify_inventory_sync_runs
+                (direction, mode, status, skus_total, skus_applied, skus_failed, units_delta, detail, reference, performed_by, started_at, finished_at, created_at)
+             VALUES ('pull', $1, 'done', $2, $3, $4, $5, $6, $7, $8, $9, $9, $9)`,
+            [req.body?.mode || 'match', rows.length, result.added + result.updated, result.failures.length,
+             result.unitsDelta, JSON.stringify(result.failures.slice(0, 100)),
+             req.body?.reference || 'shopify_pull', req.admin?.username || 'hub_operator', timestamp]
+        ).catch(e => console.warn('[ShopifySync] pull run persist failed:', e.message));
+
+        res.json({ success: true, ...result, timestamp });
+    } catch (error) {
+        console.error('Shopify pull apply error:', error);
+        res.status(500).json({ success: false, error: 'Failed to apply Shopify pull: ' + error.message });
+    }
+});
+
+// POST /api/admin/inventory/shopify-sync/push/start - queue a background push job
+router.post('/inventory/shopify-sync/push/start', verifyToken, async (req, res) => {
+    try {
+        const sync = require('../services/shopifyInventorySync');
+        const shopifyService = require('../services/shopifyService');
+        const active = sync.getActivePushJob();
+        if (active) {
+            return res.status(409).json({
+                success: false, error: 'A Shopify push is already running', jobId: active.id,
+                progress: sync.jobSnapshot(active),
+            });
+        }
+        const catalog = await shopifyService.getProductCatalog(req.body?.force === true);
+        if (!catalog || catalog.length === 0) {
+            return res.status(400).json({ success: false, error: 'Shopify catalog is empty — check Shopify credentials' });
+        }
+        const skuKeys = Array.isArray(req.body?.sku_keys) && req.body.sku_keys.length ? req.body.sku_keys : null;
+        const hubRows = skuKeys
+            ? await dbAdapter.query('SELECT product_name, size, sku_key, quantity FROM manual_inventory WHERE sku_key = ANY($1::text[])', [skuKeys])
+            : await dbAdapter.query('SELECT product_name, size, sku_key, quantity FROM manual_inventory');
+        const { job, unmatched } = await sync.startAbsolutePushJob({
+            client: shopifyService, db: dbAdapter, catalog, hubRows,
+            selectedSkuKeys: skuKeys,
+            reference: req.body?.reference || 'shopify_push',
+            performedBy: req.admin?.username || 'hub_operator',
+        });
+        res.json({ success: true, jobId: job.id, total: job.total, skippedEqual: job.skipped, unmatched, status: job.status });
+    } catch (error) {
+        console.error('Shopify push start error:', error);
+        res.status(500).json({ success: false, error: 'Failed to start Shopify push: ' + error.message });
+    }
+});
+
+// GET /api/admin/inventory/shopify-sync/jobs/:id - job progress for polling
+router.get('/inventory/shopify-sync/jobs/:id', verifyToken, async (req, res) => {
+    const sync = require('../services/shopifyInventorySync');
+    const job = sync.getJob(req.params.id);
+    if (!job) return res.status(404).json({ success: false, error: 'Job not found (it may have been pruned after completion)' });
+    res.json({ success: true, job: sync.jobSnapshot(job) });
+});
+
+// POST /api/admin/inventory/shopify-sync/jobs/:id/cancel
+router.post('/inventory/shopify-sync/jobs/:id/cancel', verifyToken, async (req, res) => {
+    const sync = require('../services/shopifyInventorySync');
+    const job = sync.cancelJob(req.params.id);
+    if (!job) return res.status(404).json({ success: false, error: 'Running job not found' });
+    res.json({ success: true, message: 'Cancellation requested — finishes the current SKU then stops' });
+});
+
+// GET /api/admin/inventory/shopify-sync/runs - sync history
+router.get('/inventory/shopify-sync/runs', verifyToken, async (req, res) => {
+    try {
+        const limit = Math.min(parseInt(req.query.limit) || 20, 100);
+        const runs = await dbAdapter.query(
+            'SELECT id, direction, mode, status, skus_total, skus_applied, skus_failed, units_delta, reference, performed_by, started_at, finished_at FROM shopify_inventory_sync_runs ORDER BY id DESC LIMIT $1',
+            [limit]
+        );
+        res.json({ success: true, runs });
+    } catch (error) {
+        console.error('Shopify sync runs error:', error);
+        res.status(500).json({ success: false, error: 'Failed to fetch sync history' });
     }
 });
 

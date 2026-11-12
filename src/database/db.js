@@ -702,6 +702,15 @@ async function initializeAbandonedCartsTable() {
       )
     `);
 
+    // Schema-drift repair: the table was created before the wamid columns
+    // existed in some environments (and the standalone SQL migration was never
+    // applied), which made findByWamid() throw "column does not exist" on
+    // every 131049 status webhook — so delivery_blocked was never set and the
+    // cron kept re-messaging blocked numbers. ALTER runs every boot, same
+    // pattern as the other addColumnIfNotExists calls in this file.
+    await addColumnIfNotExists('abandoned_carts', 'first_reminder_wamid', 'TEXT');
+    await addColumnIfNotExists('abandoned_carts', 'second_reminder_wamid', 'TEXT');
+
     // Create indexes for abandoned_carts
     await pool.query('CREATE INDEX IF NOT EXISTS idx_abandoned_carts_status ON abandoned_carts(status)');
     await pool.query('CREATE INDEX IF NOT EXISTS idx_abandoned_carts_customer_phone ON abandoned_carts(customer_phone)');
@@ -709,6 +718,8 @@ async function initializeAbandonedCartsTable() {
     await pool.query('CREATE INDEX IF NOT EXISTS idx_abandoned_carts_created_at ON abandoned_carts(created_at)');
     await pool.query('CREATE INDEX IF NOT EXISTS idx_abandoned_carts_status_created ON abandoned_carts(status, created_at)');
     await pool.query('CREATE INDEX IF NOT EXISTS idx_abandoned_carts_checkout_id ON abandoned_carts(checkout_id)');
+    await pool.query('CREATE INDEX IF NOT EXISTS idx_abandoned_carts_first_wamid ON abandoned_carts(first_reminder_wamid)');
+    await pool.query('CREATE INDEX IF NOT EXISTS idx_abandoned_carts_second_wamid ON abandoned_carts(second_reminder_wamid)');
 
     console.log('✅ Abandoned carts table initialized');
   } catch (error) {
@@ -1070,6 +1081,27 @@ async function initializeManualInventoryTables() {
     `);
     await pool.query('CREATE INDEX IF NOT EXISTS idx_inv_adjustments_sku ON inventory_adjustments(sku_key, created_at DESC)');
     await pool.query('CREATE INDEX IF NOT EXISTS idx_inv_adjustments_type ON inventory_adjustments(adjustment_type, created_at DESC)');
+
+    // Shopify ⇄ Stock Room sync run audit (workbench pulls/pushes + bulk mirrors)
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS shopify_inventory_sync_runs (
+        id SERIAL PRIMARY KEY,
+        direction VARCHAR(12) NOT NULL,
+        mode VARCHAR(12),
+        status VARCHAR(12) NOT NULL DEFAULT 'running',
+        skus_total INTEGER DEFAULT 0,
+        skus_applied INTEGER DEFAULT 0,
+        skus_failed INTEGER DEFAULT 0,
+        units_delta INTEGER DEFAULT 0,
+        detail JSONB,
+        reference VARCHAR(120),
+        performed_by VARCHAR(100),
+        started_at TIMESTAMP,
+        finished_at TIMESTAMP,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+      )
+    `);
+    await pool.query('CREATE INDEX IF NOT EXISTS idx_shopify_sync_runs_created ON shopify_inventory_sync_runs(id DESC)');
 
     console.log('✅ Manual inventory tables initialized');
   } catch (error) {

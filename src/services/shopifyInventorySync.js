@@ -1,0 +1,513 @@
+// ============================================================================
+// SHOPIFY ⇄ STOCK ROOM INVENTORY SYNC
+// Pure plan builders + a rate-limited background job runner for the Shoppers
+// Hub sync workbench:
+//   • Pull  — Shopify bulk edits land in manual_inventory (adds + quantity
+//             updates), applied as batched SQL, no per-SKU round trips.
+//   • Push  — hub quantities (or Bulk In/Out deltas) written to Shopify via
+//             inventory_levels/adjust.json, one item per call through the
+//             shared 2 req/sec limiter, cancellable, progress-polled.
+// All Shopify/DB access goes through `deps` so the math is unit-testable
+// offline (test/testShopifyInventorySync.js).
+// ============================================================================
+
+'use strict';
+
+// Only one push-family job may run at a time — parallel bulk runs stampeded
+// carrier/Zoho APIs before; the limiter serializes anyway, so nothing is lost.
+const MAX_JOBS_KEPT = 30;
+const MAX_RESULTS_KEPT = 1000;
+
+/* ── shared key conventions (identical to sync-from-shopify) ── */
+function normKey(s) {
+    return String(s || '').toLowerCase().trim().replace(/\s+/g, '-');
+}
+
+function variantSkuKey(handle, variantTitle) {
+    const h = String(handle || '').toLowerCase();
+    const vt = variantTitle && variantTitle !== 'Default Title' ? variantTitle : '';
+    return vt ? `${h}-${vt}`.toLowerCase().replace(/\s+/g, '-') : h;
+}
+
+function inferCategory(productType) {
+    const t = String(productType || '').toUpperCase();
+    if (t.includes('SWEAT') || t.includes('HOODIE')) return 'SWEAT';
+    if (t.includes('T-SHIRT') || t.includes('TEE')) return 'T-SHIRT';
+    if (t.includes('PANT') || t.includes('SHORT') || t.includes('LOWER')) return 'LOWER';
+    if (t.includes('BUNDLE') || t.includes('SET')) return 'BUNDLE';
+    return null;
+}
+
+/* ── catalog indexing ── */
+// Map hub sku_key → {product, variant}. Secondary index on the variant's own
+// SKU code rescues rows that were keyed differently (sheet imports).
+function indexCatalog(catalog) {
+    const byKey = new Map();
+    const bySku = new Map();
+    for (const product of catalog || []) {
+        for (const variant of product.variants || []) {
+            const entry = { product, variant, skuKey: variantSkuKey(product.handle, variant.title) };
+            byKey.set(entry.skuKey, entry);
+            const sku = normKey(variant.sku);
+            if (sku && !bySku.has(sku)) bySku.set(sku, entry);
+        }
+    }
+    return { byKey, bySku };
+}
+
+function matchHubRow(index, hubRow) {
+    const direct = index.byKey.get(normKey(hubRow.sku_key));
+    if (direct) return { entry: direct, via: 'key' };
+    const viaSku = index.bySku.get(normKey(hubRow.sku_key));
+    if (viaSku) return { entry: viaSku, via: 'sku' };
+    return null;
+}
+
+/* ── pull plan: Shopify → hub ── */
+// modes: 'match' (align hub to Shopify everywhere) | 'fill_zero' (adopt only
+// where hub is 0) | 'new_only' (import products missing from hub).
+function buildPullPlan(catalog, hubRows, opts = {}) {
+    const mode = opts.mode || 'match';
+    const index = indexCatalog(catalog);
+    const rows = [];
+    // Pass 1 — resolve every hub row to a catalog variant first (exact key,
+    // then variant-SKU fallback), so a via-SKU match can never also emit an
+    // "add" row for the same variant.
+    const matchByCatalogKey = new Map(); // catalog skuKey → {hub, via}
+    const unmatchedHub = [];
+    for (const hub of hubRows || []) {
+        const key = normKey(hub.sku_key);
+        const direct = index.byKey.get(key);
+        if (direct) { matchByCatalogKey.set(direct.skuKey, { hub, via: 'key' }); continue; }
+        const viaSku = index.bySku.get(key);
+        if (viaSku) { matchByCatalogKey.set(viaSku.skuKey, { hub, via: 'sku' }); continue; }
+        unmatchedHub.push(hub);
+    }
+
+    // Pass 2 — every catalog variant becomes add / update / fill / equal / skip
+    const consumed = new Set();
+    for (const [skuKey, { product, variant }] of index.byKey) {
+        const shopifyQty = Number(variant.inventory) || 0;
+        const base = {
+            sku_key: skuKey,
+            product_name: product.title,
+            size: variant.title || 'FREE',
+            category: inferCategory(product.product_type),
+            shopify_qty: shopifyQty,
+        };
+        const m = matchByCatalogKey.get(skuKey);
+        if (!m) {
+            rows.push({ ...base, hub_qty: null, delta: null, action: 'add' });
+            continue;
+        }
+        consumed.add(m.hub.sku_key);
+        const hub = m.hub;
+        const hubQty = Number(hub.quantity) || 0;
+        const delta = shopifyQty - hubQty;
+        const row = {
+            ...base,
+            sku_key: hub.sku_key, // keep the hub's own key — apply updates in place
+            product_name: hub.product_name, size: hub.size, category: hub.category,
+            hub_qty: hubQty, delta,
+        };
+        if (delta === 0) row.action = 'equal';
+        else if (mode === 'new_only') row.action = 'out_of_scope';
+        else if (mode === 'fill_zero' && hubQty !== 0) row.action = 'out_of_scope';
+        else row.action = hubQty === 0 ? 'fill' : 'update';
+        if (m.via === 'sku') row.matched_via = 'sku';
+        rows.push(row);
+    }
+
+    // Hub rows with no Shopify counterpart at all (discontinued or hand-made keys)
+    const hubOnly = unmatchedHub
+        .filter(hub => !consumed.has(hub.sku_key))
+        .map(hub => ({
+            sku_key: hub.sku_key, product_name: hub.product_name, size: hub.size,
+            category: hub.category, hub_qty: Number(hub.quantity) || 0, action: 'hub_only',
+        }));
+
+    const counts = { add: 0, fill: 0, update: 0, equal: 0, out_of_scope: 0, hub_only: hubOnly.length };
+    for (const r of rows) counts[r.action] = (counts[r.action] || 0) + 1;
+    const diffRows = rows.filter(r => r.action === 'add' || r.action === 'fill' || r.action === 'update');
+    return {
+        direction: 'pull',
+        mode,
+        generatedAt: new Date().toISOString(),
+        rows: rows.sort((a, b) => String(a.product_name).localeCompare(String(b.product_name))),
+        hubOnly,
+        stats: {
+            ...counts,
+            diff_rows: diffRows.length,
+            units_hub: rows.reduce((s, r) => s + (r.hub_qty || 0), 0),
+            units_shopify: rows.reduce((s, r) => s + (r.shopify_qty || 0), 0),
+            net_delta: diffRows.reduce((s, r) => s + (r.action === 'add' ? r.shopify_qty : r.delta), 0),
+        },
+    };
+}
+
+/* ── push plan: hub → Shopify ── */
+// totals: Map inventory_item_id → summed available across locations. When an
+// item has no levels row, falls back to the catalog's computed inventory.
+function buildPushPlan(catalog, hubRows, totals) {
+    const index = indexCatalog(catalog);
+    const rows = [];
+    let matched = 0;
+    for (const hub of hubRows || []) {
+        const m = matchHubRow(index, hub);
+        if (!m) {
+            rows.push({ sku_key: hub.sku_key, product_name: hub.product_name, size: hub.size,
+                hub_qty: Number(hub.quantity) || 0, shopify_qty: null, delta: null, action: 'no_match' });
+            continue;
+        }
+        matched++;
+        const { entry } = m;
+        const iid = entry.variant.inventory_item_id;
+        if (!iid) {
+            rows.push({ sku_key: hub.sku_key, product_name: hub.product_name, size: hub.size,
+                hub_qty: Number(hub.quantity) || 0, shopify_qty: null, delta: null, action: 'no_inv_item' });
+            continue;
+        }
+        const shopifyQty = totals && totals.has(iid) ? (totals.get(iid) || 0) : (Number(entry.variant.inventory) || 0);
+        const hubQty = Number(hub.quantity) || 0;
+        const delta = hubQty - shopifyQty;
+        rows.push({
+            sku_key: hub.sku_key, product_name: hub.product_name, size: hub.size,
+            inventory_item_id: iid, variant_id: entry.variant.id, hub_qty: hubQty,
+            shopify_qty: shopifyQty, delta, matched_via: m.via,
+            action: delta === 0 ? 'equal' : delta > 0 ? 'increase' : 'decrease',
+        });
+    }
+    const counts = { increase: 0, decrease: 0, equal: 0, no_match: 0, no_inv_item: 0 };
+    for (const r of rows) counts[r.action] = (counts[r.action] || 0) + 1;
+    return {
+        direction: 'push',
+        generatedAt: new Date().toISOString(),
+        rows: rows.sort((a, b) => String(a.product_name).localeCompare(String(b.product_name))),
+        stats: {
+            ...counts,
+            matched,
+            units_hub: rows.reduce((s, r) => s + (r.hub_qty || 0), 0),
+            units_shopify: rows.reduce((s, r) => s + (r.shopify_qty || 0), 0),
+            net_delta: rows.reduce((s, r) => s + (r.action === 'increase' || r.action === 'decrease' ? r.delta : 0), 0),
+        },
+    };
+}
+
+/* ── pull apply: batched SQL, no per-SKU round trips ── */
+// selected: plan rows with action add|fill|update the user checked.
+// Existing-vs-new is re-checked live so a row added between plan and apply
+// doesn't throw a duplicate-key error.
+async function applyPullPlan(db, selected, opts = {}) {
+    const rows = (selected || []).filter(r => ['add', 'fill', 'update'].includes(r.action) && Number.isFinite(Number(r.shopify_qty)));
+    if (rows.length === 0) return { added: 0, updated: 0, skipped: 0, unitsDelta: 0, failures: [] };
+
+    const performedBy = opts.performedBy || 'admin';
+    const reference = opts.reference || 'shopify_pull';
+    const notes = opts.notes || 'Shopify sync — pulled from live catalog';
+    const timestamp = new Date().toISOString();
+    const failures = [];
+
+    const keys = rows.map(r => r.sku_key);
+    const existingRes = await db.query(
+        'SELECT sku_key, quantity FROM manual_inventory WHERE sku_key = ANY($1::text[])', [keys]
+    );
+    const existing = new Map(existingRes.map(r => [r.sku_key, Number(r.quantity) || 0]));
+
+    const adds = rows.filter(r => !existing.has(r.sku_key));
+    const updates = rows.filter(r => existing.has(r.sku_key));
+
+    // 1) inserts, chunked so the parameter list stays bounded
+    const INSERT_CHUNK = 200;
+    for (let i = 0; i < adds.length; i += INSERT_CHUNK) {
+        const chunk = adds.slice(i, i + INSERT_CHUNK);
+        const values = [];
+        const params = [];
+        for (const r of chunk) {
+            values.push(`($${params.length + 1}, $${params.length + 2}, $${params.length + 3}, $${params.length + 4}, $${params.length + 5}, 0, $${params.length + 6})`);
+            params.push(r.product_name, r.category || null, r.size || 'FREE', r.sku_key, Number(r.shopify_qty), timestamp);
+        }
+        try {
+            await db.query(
+                `INSERT INTO manual_inventory (product_name, category, size, sku_key, quantity, reorder_level, updated_at)
+                 VALUES ${values.join(',')} ON CONFLICT (sku_key) DO NOTHING`, params
+            );
+        } catch (e) {
+            chunk.forEach(r => failures.push({ sku_key: r.sku_key, error: e.message }));
+        }
+    }
+
+    // 2) quantity updates, single statement via UNNEST
+    if (updates.length > 0) {
+        try {
+            await db.query(
+                `UPDATE manual_inventory m
+                    SET quantity = s.qty, updated_at = $3
+                  FROM (SELECT UNNEST($1::text[]) AS sku_key, UNNEST($2::int[]) AS qty) s
+                 WHERE m.sku_key = s.sku_key`,
+                [updates.map(r => r.sku_key), updates.map(r => Number(r.shopify_qty)), timestamp]
+            );
+        } catch (e) {
+            updates.forEach(r => failures.push({ sku_key: r.sku_key, error: e.message }));
+        }
+    }
+
+    // 3) adjustment ledger, chunked multi-row insert
+    const failedSet = new Set(failures.map(f => f.sku_key));
+    const LOG_CHUNK = 200;
+    const ledger = [
+        ...adds.filter(r => !failedSet.has(r.sku_key)).map(r => ({
+            r, before: 0, after: Number(r.shopify_qty) })),
+        ...updates.filter(r => !failedSet.has(r.sku_key)).map(r => ({
+            r, before: existing.get(r.sku_key), after: Number(r.shopify_qty) })),
+    ];
+    for (let i = 0; i < ledger.length; i += LOG_CHUNK) {
+        const chunk = ledger.slice(i, i + LOG_CHUNK);
+        const values = [];
+        const params = [];
+        for (const { r, before, after } of chunk) {
+            values.push(`($${params.length + 1}, $${params.length + 2}, $${params.length + 3}, 'shopify_pull', $${params.length + 4}, $${params.length + 5}, $${params.length + 6}, $${params.length + 7}, $${params.length + 8}, $${params.length + 9}, $${params.length + 10})`);
+            params.push(r.sku_key, r.product_name, r.size || 'FREE', after - before, before, after, reference, notes, performedBy, timestamp);
+        }
+        try {
+            await db.query(
+                `INSERT INTO inventory_adjustments
+                    (sku_key, product_name, size, adjustment_type, quantity_change, quantity_before, quantity_after, reference, notes, performed_by, created_at)
+                 VALUES ${values.join(',')}`, params
+            );
+        } catch (e) {
+            console.error('[ShopifyInventorySync] adjustment ledger insert failed:', e.message);
+        }
+    }
+
+    const unitsDelta = ledger.reduce((s, { before, after }) => s + (after - before), 0);
+    return {
+        added: adds.filter(r => !failedSet.has(r.sku_key)).length,
+        updated: updates.filter(r => !failedSet.has(r.sku_key)).length,
+        skipped: rows.length - ledger.length,
+        unitsDelta,
+        failures,
+    };
+}
+
+/* ── push job runner ── */
+const _jobs = new Map();
+let _jobSeq = 0;
+
+function _pruneJobs() {
+    while (_jobs.size > MAX_JOBS_KEPT) {
+        // evict the oldest FINISHED job; never evict active history-first
+        const evict = [..._jobs.values()].find(j => j.status !== 'running');
+        if (!evict) break;
+        _jobs.delete(evict.id);
+    }
+}
+
+function getJob(id) {
+    return _jobs.get(String(id)) || null;
+}
+
+function getActivePushJob() {
+    for (const job of _jobs.values()) {
+        if (job.kind === 'push' && job.status === 'running') return job;
+    }
+    return null;
+}
+
+function cancelJob(id) {
+    const job = _jobs.get(String(id));
+    if (!job || job.status !== 'running') return null;
+    job.cancelRequested = true;
+    return job;
+}
+
+function jobSnapshot(job) {
+    return {
+        id: job.id, kind: job.kind, direction: job.direction, status: job.status,
+        reference: job.reference, performedBy: job.performedBy,
+        total: job.total, done: job.done, succeeded: job.succeeded, failed: job.failed,
+        unitsDelta: job.unitsDelta, cancelRequested: job.cancelRequested,
+        error: job.error, createdAt: job.createdAt, finishedAt: job.finishedAt,
+        results: job.results.slice(-200), // tail sample for the UI; full set in the run row
+    };
+}
+
+async function _persistRunStart(db, job) {
+    if (!db) return null;
+    try {
+        const res = await db.query(
+            `INSERT INTO shopify_inventory_sync_runs
+                (direction, mode, status, skus_total, reference, performed_by, started_at, created_at)
+             VALUES ($1, $2, 'running', $3, $4, $5, $6, $6)
+             ON CONFLICT DO NOTHING
+             RETURNING id`,
+            [job.direction, job.mode || 'delta', job.total, job.reference, job.performedBy, job.createdAt]
+        );
+        return res && res[0] ? res[0].id : null;
+    } catch (e) {
+        console.warn('[ShopifyInventorySync] run start persist failed:', e.message);
+        return null;
+    }
+}
+
+async function _persistRunFinish(db, job) {
+    if (!db) return;
+    try {
+        await db.query(
+            `UPDATE shopify_inventory_sync_runs
+                SET status = $2, skus_applied = $3, skus_failed = $4, units_delta = $5,
+                    detail = $6, finished_at = $7
+              WHERE id = $1`,
+            [job.runId, job.status, job.succeeded, job.failed, job.unitsDelta,
+             JSON.stringify(job.results.slice(0, 500)), job.finishedAt || new Date().toISOString()]
+        );
+    } catch (e) {
+        console.warn('[ShopifyInventorySync] run finish persist failed:', e.message);
+    }
+}
+
+// tasks: [{sku_key, product_name, size, inventory_item_id, delta, target?}]
+// delta mode sends task.delta; absolute mode carries target (hub qty) and the
+// delta is recomputed against the fresh level total at write time, so plan
+// drift between preview and execution is corrected instead of pushed.
+// Location choice per item: the location holding the most available (so a
+// decrease never strands more than one location in the negative); fall back
+// to the store's first location for fresh items.
+async function runPushJob({ client, db, tasks, reference, performedBy, mode, direction }) {
+    const work = (tasks || []).filter(t => t && t.inventory_item_id && Number(t.delta) !== 0);
+    const skipped = (tasks || []).length - work.length;
+
+    const job = {
+        id: `swp_${Date.now()}_${++_jobSeq}`,
+        kind: 'push', direction: direction || 'push', mode: mode || 'delta',
+        status: work.length === 0 ? 'done' : 'running',
+        reference: reference || 'shopify_push', performedBy: performedBy || 'admin',
+        total: work.length, done: 0, succeeded: 0, failed: 0, skipped,
+        unitsDelta: 0, results: [], cancelRequested: false,
+        error: null, createdAt: new Date().toISOString(), finishedAt: null, runId: null,
+    };
+    _jobs.set(job.id, job);
+    _pruneJobs();
+
+    job.runId = await _persistRunStart(db, job);
+    if (work.length === 0) {
+        job.finishedAt = new Date().toISOString();
+        await _persistRunFinish(db, job);
+        return job;
+    }
+
+    // async loop — the route must not wait on it
+    (async () => {
+        try {
+            const iids = [...new Set(work.map(t => t.inventory_item_id))];
+            let levelsById = new Map();
+            let defaultLocationId = null;
+            try {
+                const levels = await client.getInventoryLevels(iids);
+                levelsById = levels.byId;
+            } catch (e) {
+                console.warn('[ShopifyInventorySync] level read failed, using default location:', e.message);
+            }
+            try {
+                const locations = await client.getLocations();
+                defaultLocationId = locations[0] ? locations[0].id : null;
+            } catch (e) {
+                console.warn('[ShopifyInventorySync] locations read failed:', e.message);
+            }
+
+            for (const task of work) {
+                if (job.cancelRequested) break;
+                const breakdown = levelsById.get(task.inventory_item_id) || [];
+                const currentTotal = breakdown.reduce((s, l) => s + (Number(l.available) || 0), 0);
+                let delta = Number(task.delta);
+                if (Number.isFinite(Number(task.target))) delta = Number(task.target) - currentTotal;
+                if (delta === 0) { job.skipped++; job.done++; continue; }
+                const target = breakdown.length
+                    ? breakdown.reduce((max, l) => (l.available > max.available ? l : max), breakdown[0]).locationId
+                    : defaultLocationId;
+                let rec;
+                if (!target) {
+                    rec = { sku_key: task.sku_key, product_name: task.product_name, size: task.size,
+                        delta, ok: false, error: 'No inventory location available' };
+                } else {
+                    const res = await client.adjustInventoryLevel({
+                        inventoryItemId: task.inventory_item_id, locationId: target,
+                        availableDelta: delta,
+                    });
+                    rec = { sku_key: task.sku_key, product_name: task.product_name, size: task.size,
+                        delta, locationId: target,
+                        ok: res.success, availableAfterChange: res.availableAfterChange, error: res.error || null };
+                }
+                job.results.push(rec);
+                if (job.results.length > MAX_RESULTS_KEPT) job.results.splice(0, job.results.length - MAX_RESULTS_KEPT);
+                if (rec.ok) { job.succeeded++; job.unitsDelta += delta; } else { job.failed++; }
+                job.done++;
+            }
+            job.status = job.cancelRequested ? 'cancelled' : (job.error ? 'failed' : 'done');
+        } catch (e) {
+            job.status = 'failed';
+            job.error = e.message;
+        } finally {
+            job.finishedAt = new Date().toISOString();
+            await _persistRunFinish(db, job);
+        }
+    })();
+
+    return job;
+}
+
+// Absolute push: align Shopify totals to hub quantities for the given rows.
+// Reads Shopify levels fresh at start so plan drift since preview is corrected.
+async function startAbsolutePushJob({ client, db, catalog, hubRows, selectedSkuKeys, reference, performedBy }) {
+    const index = indexCatalog(catalog);
+    const wanted = selectedSkuKeys && selectedSkuKeys.length
+        ? new Set(selectedSkuKeys.map(normKey))
+        : null;
+    const tasks = [];
+    const unmatched = [];
+    for (const hub of hubRows || []) {
+        if (wanted && !wanted.has(normKey(hub.sku_key))) continue;
+        const m = matchHubRow(index, hub);
+        if (!m || !m.entry.variant.inventory_item_id) { unmatched.push(hub.sku_key); continue; }
+        tasks.push({
+            sku_key: hub.sku_key, product_name: hub.product_name, size: hub.size,
+            inventory_item_id: m.entry.variant.inventory_item_id,
+            // absolute jobs must not be pre-filtered on the stale catalog
+            // delta; the real delta is recomputed from fresh levels via target
+            delta: 1,
+            target: Number(hub.quantity) || 0,
+        });
+    }
+    const job = await runPushJob({ client, db, tasks, reference, performedBy, mode: 'absolute', direction: 'push' });
+    return { job, unmatched };
+}
+
+// Delta push: apply known deltas (Bulk In/Out) onto Shopify directly.
+async function startDeltaPushJob({ client, db, catalog, deltas, reference, performedBy }) {
+    const index = indexCatalog(catalog);
+    const tasks = [];
+    const unmatched = [];
+    for (const d of deltas || []) {
+        const m = matchHubRow(index, { sku_key: d.sku_key });
+        if (!m || !m.entry.variant.inventory_item_id) { unmatched.push(d.sku_key); continue; }
+        tasks.push({
+            sku_key: d.sku_key, product_name: d.product_name, size: d.size,
+            inventory_item_id: m.entry.variant.inventory_item_id, delta: Number(d.delta) || 0,
+        });
+    }
+    const job = await runPushJob({ client, db, tasks, reference, performedBy, mode: 'delta', direction: 'push_delta' });
+    return { job, unmatched };
+}
+
+function lazyDefaults() {
+    return {
+        client: require('./shopifyService'),
+        db: require('../database/db').dbAdapter,
+    };
+}
+
+module.exports = {
+    normKey, variantSkuKey, inferCategory, indexCatalog, matchHubRow,
+    buildPullPlan, buildPushPlan, applyPullPlan,
+    runPushJob, startAbsolutePushJob, startDeltaPushJob,
+    getJob, getActivePushJob, cancelJob, jobSnapshot, lazyDefaults,
+};

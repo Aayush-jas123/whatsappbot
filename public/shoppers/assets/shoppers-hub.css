@@ -6652,3 +6652,63 @@ tr.ict-detail-row td { background: rgba(255,255,255,0.02); padding: 1rem 1.1rem;
 @media (max-width: 620px) {
     .so-export-grid { grid-template-columns: 1fr; }
 }
+
+/* ── Shopify Sync Workbench (Stock Room) ── */
+.sw-modal { max-width: 1040px; }
+.sw-tabs { display: flex; gap: 0.25rem; padding: 0.75rem 1.5rem 0; border-bottom: 1px solid rgba(255,255,255,0.08); }
+.sw-tab {
+    background: none; border: none; border-bottom: 2px solid transparent; cursor: pointer;
+    color: rgba(255,255,255,0.5); padding: 0.6rem 1rem; font-size: 0.82rem; font-weight: 600;
+    font-family: 'Inter', sans-serif; letter-spacing: 0.2px;
+}
+.sw-tab:hover { color: #fff; }
+.sw-tab.active { color: #fff; border-bottom-color: #238636; }
+.sw-body { padding: 1.25rem 1.5rem 0; overflow-y: auto; flex: 1; display: flex; flex-direction: column; gap: 0.9rem; }
+.sw-controls { display: flex; align-items: center; gap: 0.6rem; flex-wrap: wrap; }
+.sw-mode-select { width: auto; min-width: 220px; }
+.sw-force { display: flex; align-items: center; gap: 0.4rem; font-size: 0.75rem; color: rgba(255,255,255,0.6); cursor: pointer; }
+.sw-warn {
+    flex: 1; min-width: 240px; font-size: 0.75rem; color: #ffd479;
+    background: rgba(255,180,40,0.07); border: 1px solid rgba(255,180,40,0.25);
+    border-radius: 6px; padding: 0.45rem 0.7rem;
+}
+.sw-recompute-btn { background: #fff; color: #000; font-weight: 600; }
+.sw-recompute-btn:disabled { opacity: 0.5; cursor: not-allowed; }
+.sw-stats {
+    display: flex; gap: 1.1rem; flex-wrap: wrap; font-size: 0.75rem;
+    color: rgba(255,255,255,0.65); font-variant-numeric: tabular-nums;
+}
+.sw-result { border-radius: 8px; padding: 0.6rem 0.9rem; font-size: 0.8rem; }
+.sw-result-ok { background: rgba(46,160,67,0.1); border: 1px solid rgba(46,160,67,0.35); color: #7ee787; }
+.sw-result-warn { background: rgba(255,180,40,0.07); border: 1px solid rgba(255,180,40,0.3); color: #ffd479; }
+.sw-result-error { background: rgba(224,36,36,0.08); border: 1px solid rgba(224,36,36,0.35); color: #ff7b72; }
+.sw-filters { display: flex; align-items: center; gap: 0.4rem; flex-wrap: wrap; }
+.sw-search { width: 220px; margin-left: auto; }
+.sw-table-wrap { max-height: 44vh; overflow-y: auto; border: 1px solid rgba(255,255,255,0.08); border-radius: 10px; }
+.sw-row-up { background: rgba(46,160,67,0.045); }
+.sw-row-down { background: rgba(224,36,36,0.045); }
+.sw-job {
+    background: rgba(255,255,255,0.04); border: 1px solid rgba(255,255,255,0.1);
+    border-radius: 10px; padding: 0.8rem 1rem; display: flex; flex-direction: column; gap: 0.5rem;
+}
+.sw-job-head { display: flex; align-items: center; gap: 0.9rem; flex-wrap: wrap; font-size: 0.78rem; color: rgba(255,255,255,0.75); justify-content: space-between; }
+.sw-job-fails { font-size: 0.72rem; color: #ff7b72; line-height: 1.6; }
+.sw-progress { height: 6px; border-radius: 4px; background: rgba(255,255,255,0.08); overflow: hidden; }
+.sw-progress-fill { height: 100%; background: linear-gradient(90deg, #1a7f37, #2ea043); border-radius: 4px; transition: width 0.5s ease; }
+.sw-footer {
+    display: flex; justify-content: flex-end; gap: 0.75rem;
+    padding: 1rem 0 1.25rem; position: sticky; bottom: 0;
+}
+.sw-apply-btn { background: linear-gradient(135deg, #1a7f37, #238636); color: #fff; font-weight: 600; border: none; }
+.sw-push-btn { background: linear-gradient(135deg, #9e6a03, #bb8009); color: #fff; font-weight: 600; border: none; }
+.sw-apply-btn:disabled, .sw-push-btn:disabled, .sw-recompute-btn:disabled { opacity: 0.45; cursor: not-allowed; }
+.sr-bulk-shopify-toggle {
+    display: flex; align-items: center; gap: 0.5rem; margin-top: 0.9rem;
+    font-size: 0.78rem; color: rgba(255,255,255,0.7); cursor: pointer;
+}
+.sr-bulk-shopify-toggle input { accent-color: #238636; }
+@media (max-width: 720px) {
+    .sw-modal { width: 96%; max-height: 92vh; }
+    .sw-search { width: 100%; }
+    .sw-table-wrap { max-height: 38vh; }
+}

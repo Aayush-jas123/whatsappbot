@@ -396,7 +396,7 @@ class ShopifyService {
         try {
             // 1) Fetch products with variants (includes inventory_item_id per variant)
             let rawProducts = [];
-            let apiUrl = `${baseUrl}/products.json?limit=250&status=active&fields=id,title,handle,image,created_at,variants`;
+            let apiUrl = `${baseUrl}/products.json?limit=250&status=active&fields=id,title,handle,product_type,image,created_at,variants`;
 
             while (apiUrl && rawProducts.length < 2000) {
                 const response = await http.get(apiUrl);
@@ -446,6 +446,7 @@ class ShopifyService {
                 id: p.id,
                 title: p.title,
                 handle: p.handle || null,
+                product_type: p.product_type || null,
                 image: p.image?.src || null,
                 created_at: p.created_at || null,
                 variants: (p.variants || []).map(v => {
@@ -460,6 +461,8 @@ class ShopifyService {
                         price: parseFloat(v.price) || 0,
                         compare_at_price: v.compare_at_price ? parseFloat(v.compare_at_price) : null,
                         sku: v.sku || '',
+                        // Required by the Stock Room ⇄ Shopify sync to write levels
+                        inventory_item_id: v.inventory_item_id || null,
                         inventory: stock,
                         available: v.inventory_policy === 'continue' || stock > 0
                     };
@@ -482,6 +485,96 @@ class ShopifyService {
             console.error('❌ Error fetching Shopify product catalog:', error.message);
             // Serve stale cache rather than failing the picker outright
             return this._catalogCache || [];
+        }
+    }
+
+    // ==========================================
+    // INVENTORY LEVEL READ / WRITE (Stock Room sync)
+    // ==========================================
+
+    /**
+     * Active stock locations (id, name). Cached 1h — locations change rarely.
+     * Requires read_inventory; the first location is treated as the default.
+     */
+    async getLocations(forceRefresh = false) {
+        if (!forceRefresh && this._locationsCache && (Date.now() - this._locationsCacheAt) < 60 * 60 * 1000) {
+            return this._locationsCache;
+        }
+        const cfg = this._restConfig();
+        if (!cfg) throw new Error('Shopify credentials not configured');
+        const res = await this._rateLimitedRequest(() =>
+            axios.get(`${cfg.base}/locations.json?limit=50&fields=id,name`, { headers: cfg.headers, timeout: 15000 })
+        );
+        const locations = (res.data?.locations || []).map(l => ({ id: l.id, name: l.name || '' }));
+        this._locationsCache = locations;
+        this._locationsCacheAt = Date.now();
+        return locations;
+    }
+
+    /**
+     * Per-location inventory levels for the given inventory item IDs.
+     * Batched 100 IDs per call (Shopify limit). Returns Map<iid, [{locationId, available}]>
+     * and the summed available per item — the real Shopify-side stock for sync.
+     */
+    async getInventoryLevels(inventoryItemIds) {
+        const byId = new Map();
+        const totals = new Map();
+        const ids = (inventoryItemIds || []).filter(Boolean);
+        if (ids.length === 0) return { byId, totals };
+
+        const cfg = this._restConfig();
+        if (!cfg) throw new Error('Shopify credentials not configured');
+        const http = this._shopifyAxios(cfg.base);
+
+        for (let i = 0; i < ids.length; i += 100) {
+            const batch = ids.slice(i, i + 100);
+            const levels = [];
+            let pageUrl = `${cfg.base}/inventory_levels.json?inventory_item_ids=${batch.join(',')}&limit=1000`;
+            while (pageUrl) {
+                const res = await this._rateLimitedRequest(() => http.get(pageUrl, { headers: cfg.headers }));
+                levels.push(...(res.data?.inventory_levels || []));
+                const linkHeader = res.headers?.link || '';
+                const nextMatch = linkHeader.match(/<([^>]+)>;\s*rel="next"/);
+                pageUrl = nextMatch ? nextMatch[1] : null;
+            }
+            for (const level of levels) {
+                const iid = level.inventory_item_id;
+                if (!byId.has(iid)) byId.set(iid, []);
+                byId.get(iid).push({ locationId: level.location_id, available: level.available || 0 });
+                totals.set(iid, (totals.get(iid) || 0) + (level.available || 0));
+            }
+        }
+        return { byId, totals };
+    }
+
+    /**
+     * Adjust one inventory level by a signed delta on one location.
+     * Uses REST inventory_levels/adjust.json (2024-01) through the shared
+     * rate limiter, so bulk pushes queue at ~1.8 calls/sec and retry on 429.
+     * Returns { success, availableAfterChange?, error? } — never throws.
+     */
+    async adjustInventoryLevel({ inventoryItemId, locationId, availableDelta }) {
+        const result = { success: false, availableAfterChange: null, error: null };
+        const cfg = this._restConfig();
+        if (!cfg) { result.error = 'Shopify credentials not configured'; return result; }
+        if (!inventoryItemId || !locationId || !Number.isFinite(availableDelta) || availableDelta === 0) {
+            result.error = 'inventoryItemId, locationId and a non-zero availableDelta are required';
+            return result;
+        }
+        try {
+            const res = await this._rateLimitedRequest(() =>
+                axios.post(`${cfg.base}/inventory_levels/adjust.json`, {
+                    location_id: Number(locationId),
+                    inventory_item_id: Number(inventoryItemId),
+                    available: Number(availableDelta)
+                }, { headers: cfg.headers, timeout: 15000 })
+            );
+            result.success = true;
+            result.availableAfterChange = res.data?.inventory_level?.available ?? null;
+            return result;
+        } catch (error) {
+            result.error = this._shopifyErrorMsg(error);
+            return result;
         }
     }
 
