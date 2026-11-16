@@ -463,6 +463,14 @@
       +   '<div class="desk-context-col" id="DeskContextCol">' + contextColHtml() + '</div>'
       + '</div>';
 
+    // Fixed app shell: panes scroll internally, so land the thread on the
+    // newest message and the detail/rail regions on top when a ticket opens.
+    var th = $('DeskThread');
+    if (th) th.scrollTop = th.scrollHeight;
+    el.scrollTop = 0;
+    var cc = $('DeskContextCol');
+    if (cc) cc.scrollTop = 0;
+
     if (window.innerWidth < 980) {
       var b = $('DeskBack');
       if (b) b.style.display = 'inline-flex';
