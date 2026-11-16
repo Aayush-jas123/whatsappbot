@@ -922,6 +922,15 @@ button, input, select, textarea {
   scrollbar-width: thin;
   scrollbar-color: var(--desk-border-strong) transparent;
 }
+/* Rail cards keep their natural height so the rail is what overflows.
+   Flex items shrink by default, and a card whose own overflow is not
+   `visible` (the order/customer cards use hidden for the collapse
+   animation) loses its automatic min-height floor entirely — the three
+   cards were squeezed into the rail, clipping Order History to ~114px of
+   ~775px content while the rail reported nothing to scroll. */
+.desk-context-col > * {
+  flex-shrink: 0;
+}
 
 /* ---------- Customer Info Card (Collapsible Animation) ---------- */
 .desk-customer-info-card {
@@ -1637,6 +1646,12 @@ button, input, select, textarea {
   padding: 20px 22px;
   flex: 1;
   min-height: 0;
+  /* The thread has a 180px floor and the issue block cannot shrink, so on a
+     short viewport the card's minimum content exceeds its column: without
+     this the tail painted past the card border (measured 119px of spill).
+     Scrolling the card keeps the composer reachable instead of overflowing. */
+  overflow-x: hidden;
+  overflow-y: auto;
 }
 .desk-thread-wrap {
   margin-top: 14px;
