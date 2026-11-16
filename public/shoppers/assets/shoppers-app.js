@@ -321,9 +321,10 @@ document.addEventListener('DOMContentLoaded', async () => {
         setupModalEvents();
         setupChatEvents();
         // Deep link: /shoppers/?search=<order id> pre-fills the search box and
-        // then auto-opens that exact order's detail card, so a support-desk
-        // order click lands straight on the single order (the first fetch is
-        // already server-filtered on order_id — no extra roundtrip).
+        // then focuses the exact order's card (scroll + brief highlight), so a
+        // support-desk order click lands straight on that single order without
+        // opening any editor. The first fetch is already server-filtered on
+        // order_id — no extra roundtrip.
         const searchParam = (urlParams.get('search') || '').trim();
         if (searchParam) {
             const searchEl = document.getElementById('searchInput');
@@ -335,9 +336,9 @@ document.addEventListener('DOMContentLoaded', async () => {
         if (hubHasPerm('shoppers')) fetchItemRequests();
         if (hubHasPerm('shoppers')) {
             // Awaited (unlike the fire-and-forget panels above) only because a
-            // deep link needs the filtered rows in hand before auto-opening.
+            // deep link needs the filtered rows in hand before focusing.
             await fetchShoppersData();
-            if (searchParam && hubHasPerm('edit_orders')) autoOpenOrderDetail(searchParam);
+            if (searchParam) autoFocusOrderCard(searchParam);
         }
         console.log('✅ Dashboard Initialized Successfully');
     } catch (e) {
@@ -2919,18 +2920,19 @@ function renderCards(shoppers, total, append = false) {
     }
 }
 
-// Open one order's detail card straight from the already-loaded rows: used
-// by the ?search= deep link after the filtered fetch renders. Falls back to
-// the filtered grid silently when there is no exact order-id match.
-function autoOpenOrderDetail(orderNum) {
+// Focus one order's card in the already-rendered grid: used by the ?search=
+// deep link after the filtered fetch renders. Scrolls the exact order-id match
+// into view and pulses a highlight; silently no-ops when there is no match.
+function autoFocusOrderCard(orderNum) {
     const want = String(orderNum || '').replace(/\D/g, '');
     if (!want) return;
     const row = allLoadedShoppers.find(s => String(s.order_id || '').replace(/\D/g, '') === want);
     if (!row) return;
-    openEditModal(row.id, encodeURIComponent(row.name || ''), row.phone || '', row.order_id || '',
-        encodeURIComponent(row.address || ''), encodeURIComponent(row.items_json || ''),
-        encodeURIComponent(row.customer_message || ''), row.last_response_at || '',
-        encodeURIComponent(row.payment_method || ''), row.order_total || 0);
+    const card = document.getElementById(`card-${row.id}`);
+    if (!card) return;
+    card.scrollIntoView({ behavior: 'smooth', block: 'center' });
+    card.classList.add('deep-link-focus');
+    setTimeout(() => card.classList.remove('deep-link-focus'), 4000);
 }
 
 function openEditModal(id, nameEnc, phone, orderId, addressEnc, itemsEnc, messageEnc, msgTime, paymentEnc, orderTotal) {
