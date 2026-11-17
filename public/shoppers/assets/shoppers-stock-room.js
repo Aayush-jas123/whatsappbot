@@ -705,10 +705,6 @@
             return;
         }
         if (e.target.id === 'swMode') { SW.pull.mode = e.target.value; SW.pull.plan = null; swFetchPlan('pull', SW.pull.force); }
-        if (e.target.id === 'swBulkShopify') {
-            SR.bulkPushShopify = !!e.target.checked;
-            localStorage.setItem('srBulkPushShopify', SR.bulkPushShopify ? '1' : '0');
-        }
     });
 
     document.addEventListener('input', (e) => {
@@ -1264,6 +1260,7 @@
         else if (id === 'srStatusFilter') { SR.statusFilter = e.target.value; applyFiltersAndRender(); }
         else if (id === 'srBulkRef') { SR.bulkReference = e.target.value; }
         else if (id === 'srBulkNotes') { SR.bulkNotes = e.target.value; }
+        else if (id === 'srBulkShopify') { SR.bulkPushShopify = e.target.checked; localStorage.setItem('srBulkPushShopify', SR.bulkPushShopify ? '1' : '0'); }
     });
 
     /* ── tab integration (memory smart) ── */
