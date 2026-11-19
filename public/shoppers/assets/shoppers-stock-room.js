@@ -34,6 +34,7 @@
         page: 0,
         pageSize: 25,
         bulkItems: [],
+        bulkSearch: '',       // survives modal re-renders so the results list isn't lost
         bulkReference: '',
         bulkNotes: '',
         bulkOutMode: false,   // false = Bulk In (add), true = Bulk Out (subtract)
@@ -750,32 +751,62 @@
 
     /* ── bulk inventory-in ── */
     function addToBulk(skuKey) {
-        const item = SR.inventory.find(i => i.sku_key === skuKey);
+        const item = stockRow(skuKey);
         if (!item) return;
         const existing = SR.bulkItems.find(b => b.sku_key === skuKey);
         if (existing) { existing.qty += 1; }
         else { SR.bulkItems.push({ sku_key: item.sku_key, product_name: item.product_name, size: item.size, category: item.category, qty: 1 }); }
-        renderBulkModal();
+        renderBulkModal(true);
     }
 
-    function removeFromBulk(skuKey) { SR.bulkItems = SR.bulkItems.filter(b => b.sku_key !== skuKey); renderBulkModal(); }
+    function removeFromBulk(skuKey) { SR.bulkItems = SR.bulkItems.filter(b => b.sku_key !== skuKey); renderBulkModal(false); }
 
-    function updateBulkQty(skuKey, qty) {
+    // sku_key can carry spaces and brackets, so match on the dataset rather than building a selector
+    function bulkCell(attr, dataKey, skuKey) {
+        return [...document.querySelectorAll(attr)].find(el => el.dataset[dataKey] === skuKey) || null;
+    }
+
+    function bulkQtyInput(skuKey) { return bulkCell('[data-sr-bulk-qty]', 'srBulkQty', skuKey); }
+
+    // CURRENT must come from the full snapshot, never SR.inventory — that is the toolbar-filtered
+    // subset, so any SKU the operator had filtered out would read back as 0 in stock.
+    function stockRow(skuKey) {
+        return (SR.allInventory || []).find(i => i.sku_key === skuKey) || null;
+    }
+
+    function updateBulkQty(skuKey, qty, commit = true) {
         const item = SR.bulkItems.find(b => b.sku_key === skuKey);
-        if (item) {
-            let q = Math.max(0, parseInt(qty) || 0);
+        if (!item) return;
+        const n = parseInt(String(qty).trim(), 10);
+        if (Number.isNaN(n)) {
+            // "", "-" or "e" mid-typing — hold position until the field commits
+            if (!commit) return;
+            item.qty = 1;
+        } else {
+            let q = Math.max(0, n);
             // In Bulk Out mode, cap at current stock
             if (SR.bulkOutMode) {
-                const current = SR.inventory.find(i => i.sku_key === skuKey);
-                const maxQty = current ? current.quantity : 0;
-                q = Math.min(q, maxQty);
+                const current = stockRow(skuKey);
+                q = Math.min(q, current ? current.quantity : 0);
             }
             item.qty = q;
-            if (item.qty === 0) removeFromBulk(skuKey); else renderBulkModal();
         }
+        // Committing never drops the row — 0 or a cleared field snaps back to 1, removal is the × button's job
+        if (commit && item.qty < 1) item.qty = 1;
+        refreshBulkDerived();
+        if (commit) { const input = bulkQtyInput(skuKey); if (input) input.value = item.qty; }
     }
 
-    function openBulkModal(outMode = false) { SR.bulkItems = []; SR.bulkReference = ''; SR.bulkNotes = ''; SR.bulkOutMode = !!outMode; renderBulkModal(); updateBulkModalChrome(); const m = document.getElementById('srBulkModal'); if (m) m.style.display = 'flex'; }
+    function openBulkModal(outMode = false) { SR.bulkItems = []; SR.bulkSearch = ''; SR.bulkReference = ''; SR.bulkNotes = ''; SR.bulkOutMode = !!outMode; renderBulkModal(true); updateBulkModalChrome(); const m = document.getElementById('srBulkModal'); if (m) m.style.display = 'flex'; refreshBulkSnapshot(); }
+
+    // Stock Room caches its snapshot across tab switches (memory smart), so CURRENT would otherwise
+    // show whatever the DB said when the tab first opened. Re-fetch and repaint the cells in place.
+    function refreshBulkSnapshot() {
+        return loadInventory(true).then(() => {
+            refreshBulkDerived();
+            if (SR.bulkSearch) handleBulkSearch(SR.bulkSearch);
+        });
+    }
     function closeBulkModal() { const m = document.getElementById('srBulkModal'); if (m) m.style.display = 'none'; }
 
     function updateBulkModalChrome() {
@@ -794,7 +825,7 @@
         }
     }
 
-    function renderBulkModal() {
+    function renderBulkModal(focusSearch) {
         const modal = document.getElementById('srBulkModal');
         if (!modal) return;
         const totalItems = SR.bulkItems.length;
@@ -805,13 +836,13 @@
 
         modal.querySelector('.sr-bulk-body').innerHTML = `
             <div class="sr-bulk-search">
-                <input type="text" id="srBulkSearch" placeholder="Search SKU or product name..." class="sr-bulk-search-input" autocomplete="off">
+                <input type="text" id="srBulkSearch" placeholder="Search SKU or product name..." class="sr-bulk-search-input" autocomplete="off" value="${esc(SR.bulkSearch)}">
                 <div id="srBulkSearchResults" class="sr-bulk-search-results"></div>
             </div>
             <div class="sr-bulk-selected">
                 <div class="sr-bulk-selected-header">
                     <h4>Selected SKUs (${totalItems})</h4>
-                    <span class="sr-bulk-total-qty">Total units: ${num(totalQty)}</span>
+                    <span class="sr-bulk-total-qty" id="srBulkTotalQty">Total units: ${num(totalQty)}</span>
                 </div>
                 ${totalItems === 0 ? `
                     <div class="sr-bulk-empty">
@@ -825,17 +856,17 @@
                         <thead><tr><th>Product</th><th>Size</th><th>Current</th><th>${qtyLabel}</th><th>Projected</th><th></th></tr></thead>
                         <tbody>
                             ${SR.bulkItems.map(b => {
-                                const current = SR.inventory.find(i => i.sku_key === b.sku_key);
+                                const current = stockRow(b.sku_key);
                                 const curQty = current ? current.quantity : 0;
                                 const proj = isOut ? curQty - b.qty : curQty + b.qty;
-                                const projClass = proj <= 0 ? 'sr-bulk-projected sr-zero' : proj <= (current?.reorder_level || 0) ? 'sr-bulk-projected sr-reorder' : '';
-                                const maxHint = isOut ? `<span class="sr-bulk-max" title="Max: ${curQty}">max ${curQty}</span>` : '';
+                                const projClass = proj <= 0 ? 'sr-bulk-projected sr-zero' : proj <= (current?.reorder_level || 0) ? 'sr-bulk-projected sr-reorder' : 'sr-bulk-projected';
+                                const maxHint = isOut ? `<span class="sr-bulk-max" data-sr-bulk-maxh="${esc(b.sku_key)}" title="Max: ${curQty}">max ${curQty}</span>` : '';
                                 return `<tr>
                                     <td class="sr-bulk-product">${esc(b.product_name)}</td>
                                     <td class="sr-bulk-size">${esc(b.size)}</td>
-                                    <td class="sr-bulk-current">${num(curQty)}</td>
+                                    <td class="sr-bulk-current" data-sr-bulk-cur="${esc(b.sku_key)}">${num(curQty)}</td>
                                     <td><input type="number" min="1" ${isOut ? `max="${curQty}"` : ''} value="${b.qty}" class="sr-bulk-qty-input" data-sr-bulk-qty="${esc(b.sku_key)}">${maxHint}</td>
-                                    <td class="${projClass}">${num(proj)}</td>
+                                    <td class="${projClass}" data-sr-bulk-proj="${esc(b.sku_key)}">${num(proj)}</td>
                                     <td><button class="sr-bulk-remove" data-sr="bulk-remove" data-sku="${esc(b.sku_key)}" title="Remove">&times;</button></td>
                                 </tr>`;
                             }).join('')}
@@ -859,7 +890,39 @@
             </div>`;
 
         const searchInput = modal.querySelector('#srBulkSearch');
-        if (searchInput) { searchInput.addEventListener('input', (e) => handleBulkSearch(e.target.value)); searchInput.focus(); }
+        if (searchInput) {
+            searchInput.addEventListener('input', (e) => { SR.bulkSearch = e.target.value; handleBulkSearch(e.target.value); });
+            if (SR.bulkSearch) handleBulkSearch(SR.bulkSearch); // repaint results after a row add/remove
+            if (focusSearch) searchInput.focus();
+        }
+    }
+
+    // Patch only the derived cells in place. A full renderBulkModal() per keystroke rebuilds
+    // the table, destroys the focused input and pulls focus back into the search box.
+    function refreshBulkDerived() {
+        const modal = document.getElementById('srBulkModal');
+        if (!modal) return;
+        const isOut = SR.bulkOutMode;
+        const totalEl = modal.querySelector('#srBulkTotalQty');
+        if (totalEl) totalEl.textContent = `Total units: ${num(SR.bulkItems.reduce((s, b) => s + b.qty, 0))}`;
+        modal.querySelectorAll('[data-sr-bulk-proj]').forEach(td => {
+            const skuKey = td.dataset.srBulkProj;
+            const bulk = SR.bulkItems.find(b => b.sku_key === skuKey);
+            if (!bulk) return;
+            const current = stockRow(skuKey);
+            const curQty = current ? current.quantity : 0;
+            const curCell = bulkCell('[data-sr-bulk-cur]', 'srBulkCur', skuKey);
+            if (curCell) curCell.textContent = num(curQty);
+            if (isOut) {
+                const hint = bulkCell('[data-sr-bulk-maxh]', 'srBulkMaxh', skuKey);
+                if (hint) { hint.title = `Max: ${curQty}`; hint.textContent = `max ${curQty}`; }
+                const input = bulkQtyInput(skuKey);
+                if (input) input.setAttribute('max', curQty);
+            }
+            const proj = isOut ? curQty - bulk.qty : curQty + bulk.qty;
+            td.className = proj <= 0 ? 'sr-bulk-projected sr-zero' : proj <= (current?.reorder_level || 0) ? 'sr-bulk-projected sr-reorder' : 'sr-bulk-projected';
+            td.textContent = num(proj);
+        });
     }
 
     function handleBulkSearch(query) {
@@ -867,7 +930,7 @@
         if (!container) return;
         if (!query || query.length < 2) { container.innerHTML = ''; return; }
         const q = query.toLowerCase();
-        const matches = SR.inventory.filter(i =>
+        const matches = (SR.allInventory || []).filter(i =>
             !SR.bulkItems.find(b => b.sku_key === i.sku_key) &&
             (i.product_name.toLowerCase().includes(q) || i.sku_key.toLowerCase().includes(q) || i.size.toLowerCase().includes(q))
         ).slice(0, 15);
@@ -1243,23 +1306,34 @@
         const view = document.getElementById('inventoryView');
         if (!view || view.style.display === 'none') return;
 
-        // Bulk qty input
+        // Bulk qty input — typing only patches the derived cells, never re-renders (that steals focus)
         const qtyInput = e.target.closest('[data-sr-bulk-qty]');
         if (qtyInput) {
             const sku = qtyInput.dataset.srBulkQty;
-            if (sku) updateBulkQty(sku, qtyInput.value);
+            if (sku) updateBulkQty(sku, qtyInput.value, false);
+            return;
         }
+
+        // Sync the meta fields as they are typed so a row add/remove re-render can't wipe them
+        if (e.target.id === 'srBulkRef') { SR.bulkReference = e.target.value; }
+        else if (e.target.id === 'srBulkNotes') { SR.bulkNotes = e.target.value; }
     });
 
     document.addEventListener('change', (e) => {
         const view = document.getElementById('inventoryView');
         if (!view || view.style.display === 'none') return;
 
+        // Bulk qty commit (blur or spinner) — clamp and write the normalised number back into the field
+        const qtyInput = e.target.closest('[data-sr-bulk-qty]');
+        if (qtyInput) {
+            const sku = qtyInput.dataset.srBulkQty;
+            if (sku) updateBulkQty(sku, qtyInput.value, true);
+            return;
+        }
+
         const id = e.target.id;
         if (id === 'srCategoryFilter') { SR.categoryFilter = e.target.value; applyFiltersAndRender(); }
         else if (id === 'srStatusFilter') { SR.statusFilter = e.target.value; applyFiltersAndRender(); }
-        else if (id === 'srBulkRef') { SR.bulkReference = e.target.value; }
-        else if (id === 'srBulkNotes') { SR.bulkNotes = e.target.value; }
         else if (id === 'srBulkShopify') { SR.bulkPushShopify = e.target.checked; localStorage.setItem('srBulkPushShopify', SR.bulkPushShopify ? '1' : '0'); }
     });
 
