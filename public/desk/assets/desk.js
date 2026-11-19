@@ -417,6 +417,21 @@
       fBadge = '<span class="desk-pill-badge ' + stgClass + '">' + esc(stgLabel) + '</span>';
     }
 
+    // 4. Portal pill: which support portal works this ticket. Filled = the
+    // portal stamped on the row; outlined = a shift portal claiming it by
+    // created time (visible in that portal, but portal_id is still NULL);
+    // dashed = nobody has picked it up yet.
+    var portalBadge = '';
+    if (t.portal) {
+      var assigned = t.portal.via === 'assigned';
+      portalBadge = '<span class="desk-pill-badge ' + (assigned ? 'pill-portal' : 'pill-portal-shift')
+        + '" title="' + esc(assigned ? 'Assigned to the ' + t.portal.name + ' portal'
+          : t.portal.name + ' shows this ticket through its shift window \u2014 not stamped yet')
+        + '">' + esc(t.portal.name) + '</span>';
+    } else {
+      portalBadge = '<span class="desk-pill-badge pill-portal-none" title="No portal has this ticket \u2014 assign it from Settings \u203a Distribution">No portal</span>';
+    }
+
     return '<div class="desk-row' + sel + '" data-id="' + t.id + '" onclick="DESK.select(' + t.id + ')">'
       + '<div class="desk-row-line desk-row-top">'
       +   '<div class="desk-row-top-left">'
@@ -433,6 +448,7 @@
       +     typeBadge
       +     slaBadge
       +     fBadge
+      +     portalBadge
       +   '</div>'
       + '</div>'
       + '</div>';
@@ -553,6 +569,16 @@
 
     var statusPill = '<span class="desk-pill ' + esc(t.status) + '"><span class="desk-status-indicator"></span>' + esc(t.status) + '</span>';
 
+    // Same three states as the queue pill, spelled out: stamped owner, shift
+    // claim, or still waiting for distribution.
+    var pt = t.portal;
+    var portalHtml = pt
+      ? '<span class="desk-pill-badge ' + (pt.via === 'assigned' ? 'pill-portal' : 'pill-portal-shift') + '">' + esc(pt.name) + '</span>'
+        + (pt.via !== 'assigned'
+          ? ' <span class="desk-portal-note">claimed by shift window, not stamped</span>'
+          : (pt.active === false ? ' <span class="desk-portal-note">portal is switched off</span>' : ''))
+      : '<span class="desk-portal-note">Unassigned \u2014 distribute from Settings \u203a Distribution</span>';
+
     var ticketNum = t.ticket_number ? (String(t.ticket_number).charAt(0) === '#' ? t.ticket_number : '#' + t.ticket_number) : ('#' + t.id);
 
     return '<div class="desk-unified-head">'
@@ -572,6 +598,7 @@
       + '<div class="desk-unified-head-meta">'
       +   '<div class="desk-meta-item"><span class="lbl">Category</span><span class="val"><strong>' + esc(t.reason_label || t.reason || 'General') + '</strong> &rsaquo; ' + esc(t.sub_label || t.sub || 'Inquiry') + '</span></div>'
       +   '<div class="desk-meta-item"><span class="lbl">Assigned Team</span><span class="val">' + esc(t.team && S.settings.teams[t.team] ? S.settings.teams[t.team] : (t.team || 'Unassigned')) + '</span></div>'
+      +   '<div class="desk-meta-item"><span class="lbl">Support portal</span><span class="val">' + portalHtml + '</span></div>'
       +   '<div class="desk-meta-item"><span class="lbl">Created</span><span class="val">' + fmtTime(t.created_at) + '</span></div>'
       +   '<div class="desk-meta-item"><span class="lbl">Updated</span><span class="val">' + fmtTime(t.updated_at) + '</span></div>'
       + '</div>'
@@ -2325,10 +2352,13 @@
     var all = S.portals || [];
     var dynamic = all.filter(function (p) { return p.type !== 'manual'; });
     var pr = S.settings.portalRouting || {};
+    // The server routes when the setting row has never been saved, so an absent
+    // value reads as ON here too — otherwise the box lies about live traffic.
+    var apOn = pr.enabled !== false;
     var html = roNote();
     html += '<div class="desk-set-sec">Auto-pilot for new tickets</div>'
-      + '<div class="desk-set-sub">When on, every ticket raised from the website drops straight into the live shift portal with the fewest open tickets (caps respected, IST windows). Unmatched tickets stay unassigned for manual distribution.</div>'
-      + '<label class="desk-check"><input type="checkbox" id="ApEnabled"' + (pr.enabled ? ' checked' : '') + dis() + '> Route new tickets automatically</label>'
+      + '<div class="desk-set-sub">On by default. Every new website ticket is stamped with the live shift portal that has the fewest open tickets (caps respected, IST windows) \u2014 the same way WhatsApp and widget tickets are handed out. Only manual portals and tickets raised outside every window stay unassigned for manual distribution.</div>'
+      + '<label class="desk-check"><input type="checkbox" id="ApEnabled"' + (apOn ? ' checked' : '') + dis() + '> Route new tickets automatically</label>'
       + '<div style="margin-top:8px"><button class="desk-btn" onclick="DESK.saveAutopilot()"' + (isAdmin() ? '' : ' disabled') + '>Save auto-pilot</button></div>';
     html += '<div class="desk-set-sec">Create portals &amp; distribute open tickets</div><div class="desk-form-grid">'
       + '<div><label>Mode</label><select id="DistMode" onchange="DESK.distMode()"><option value="round_robin">Round robin \u2014 N new portals</option><option value="workload_balanced">Least load \u2014 N new portals</option><option value="shift_based">By shift windows</option><option value="filter_based">Filtered slice \u2014 round robin</option></select></div>'

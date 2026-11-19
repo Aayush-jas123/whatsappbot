@@ -780,34 +780,112 @@ async function openTicketForOrder(orderId) {
     return rows[0] || null;
 }
 
-// ---------- auto-routing (desk "portal_routing" setting) ----------
-// When enabled in Desk settings, a freshly created ticket is dropped straight
-// into the active shift portal carrying the fewest open tickets (oldest
-// portal wins ties), respecting each portal's max_tickets cap. Portals with no
-// shift window are treated as always-on. Shift windows are matched in IST, the
-// same timezone the Command dashboard analytics use. Never throws — routing
-// must not break ticket creation.
+// Minutes-of-day in IST (UTC+5:30, no DST) — the clock every portal window is
+// written against, whatever zone the server itself runs in.
 function istMinutesOf(dateLike) {
     const d = new Date(dateLike);
     if (isNaN(d)) return null;
-    const ist = new Date(d.getTime() + 5.5 * 60 * 60 * 1000); // UTC+5:30
+    const ist = new Date(d.getTime() + 5.5 * 60 * 60 * 1000);
     return ist.getUTCHours() * 60 + ist.getUTCMinutes();
 }
 
-function shiftWindowCovers(mins, start, end) {
-    if (!start || !end) return true; // no window = always active
+// [start, end) is a minutes-of-day window, overnight-aware. `whenMissing` says
+// what a portal with no window means: always-on when routing a new ticket,
+// never-claiming when describing where an existing one already lives.
+function windowCovers(mins, start, end, whenMissing) {
+    if (!start || !end) return !!whenMissing;
     const [sh, sm] = String(start).split(':').map(Number);
     const [eh, em] = String(end).split(':').map(Number);
-    if ([sh, sm, eh, em].some(n => !Number.isFinite(n))) return true;
+    if ([sh, sm, eh, em].some(n => !Number.isFinite(n))) return !!whenMissing;
+    // Unknown ticket time: routing keeps the portal eligible (it was already
+    // before this helper existed), display refuses to claim an owner.
+    if (mins == null) return !!whenMissing;
     const s = sh * 60 + sm, e = eh * 60 + em;
     // Overnight windows (e.g. 17:00-01:00) wrap around midnight
     return s <= e ? (mins >= s && mins < e) : (mins >= s || mins < e);
 }
 
+// Wall-clock minutes-of-day where the portal windows are configured (IST unless
+// the portal says otherwise). Intl handles real zones; a bad name falls back to
+// the fixed +5:30 offset the routing path already uses.
+function minutesInZone(dateLike, tz) {
+    const d = new Date(dateLike);
+    if (isNaN(d)) return null;
+    try {
+        const s = new Intl.DateTimeFormat('en-GB', { timeZone: tz || 'Asia/Kolkata', hour: '2-digit', minute: '2-digit', hour12: false }).format(d);
+        const [h, m] = String(s).split(':').map(Number);
+        return Number.isFinite(h) && Number.isFinite(m) ? (h % 24) * 60 + m : null;
+    } catch (e) {
+        return istMinutesOf(d);
+    }
+}
+
+function parsePortalConfig(raw) {
+    let config = raw;
+    if (typeof config === 'string') { try { config = JSON.parse(config); } catch (e) { config = null; } }
+    return config && typeof config === 'object' ? config : null;
+}
+
+// ---------- portal attribution (what the desk pill reads) ----------
+// Mirrors portalRoutes.getPortalTickets() exactly, so the label on a desk row
+// is the same claim the portal itself makes: an explicit portal_id wins,
+// otherwise a time_based portal picks the ticket up whenever its created_at
+// falls inside the portal's window. A 'shift' claim is only a view — the row
+// still has no owner until something stamps portal_id — which is why the desk
+// renders the two differently.
+async function getPortalIndex() {
+    const rows = await dbAdapter.query('SELECT id, name, type, is_active, config FROM support_portals ORDER BY id ASC');
+    const byId = {};
+    const shift = [];
+    rows.forEach(p => {
+        const config = parsePortalConfig(p.config);
+        const active = p.is_active !== false;
+        byId[p.id] = { id: p.id, name: p.name, type: p.type, active };
+        if (p.type === 'time_based' && active && config && config.time_start && config.time_end) {
+            shift.push({ id: p.id, name: p.name, config });
+        }
+    });
+    return { byId, shift };
+}
+
+function describePortal(ticket, index) {
+    if (!ticket || !index) return null;
+    if (ticket.portal_id) {
+        const known = index.byId[ticket.portal_id];
+        return {
+            id: ticket.portal_id,
+            name: known ? known.name : ('Portal #' + ticket.portal_id),
+            type: known ? known.type : null,
+            active: known ? known.active : false,
+            via: 'assigned'
+        };
+    }
+    const minsOf = tz => minutesInZone(ticket.created_at, tz);
+    for (const p of index.shift) {
+        // Same timezone the portal's own SQL uses, so the pill can never name a
+        // portal that would not actually list the ticket.
+        if (windowCovers(minsOf(p.config.timezone), p.config.time_start, p.config.time_end, false)) {
+            return { id: p.id, name: p.name, type: 'time_based', active: true, via: 'shift' };
+        }
+    }
+    return null;
+}
+
+// ---------- auto-routing (desk "portal_routing" setting) ----------
+// Unless an admin has switched it off, a freshly created ticket is dropped
+// straight into the active shift portal carrying the fewest open tickets
+// (oldest portal wins ties), respecting each portal's max_tickets cap. Portals
+// with no shift window are treated as always-on. Shift windows are matched in
+// IST, the same timezone the Command dashboard analytics use. Never throws —
+// routing must not break ticket creation.
 async function autoRouteTicket(created) {
     try {
         const cfg = await getSetting('portal_routing');
-        if (!cfg || cfg.enabled !== true) return created;
+        // Absent means never-saved, not switched off. The WhatsApp and widget
+        // lanes assign through portalAssignment on every ticket with no toggle
+        // at all, so an unset value has to route too or the storefront lane
+        // quietly stops producing portal owners.
+        if (cfg && cfg.enabled !== true) return created;
         const portals = await dbAdapter.query(
             "SELECT id, name, type, config, shift_start, shift_end, max_tickets FROM support_portals WHERE is_active = true AND type IN ('time_based', 'auto')"
         );
@@ -816,12 +894,10 @@ async function autoRouteTicket(created) {
         const candidates = portals.filter(p => {
             let start = p.shift_start, end = p.shift_end;
             if (p.type === 'time_based') {
-                try {
-                    const c = p.config ? (typeof p.config === 'string' ? JSON.parse(p.config) : p.config) : {};
-                    if (c.time_start || c.time_end) { start = c.time_start; end = c.time_end; }
-                } catch { /* fall back to the shift columns */ }
+                const c = parsePortalConfig(p.config);
+                if (c && (c.time_start || c.time_end)) { start = c.time_start; end = c.time_end; }
             }
-            return mins == null || shiftWindowCovers(mins, start, end);
+            return windowCovers(mins, start, end, true);
         });
         if (!candidates.length) return created;
         const ids = candidates.map(p => p.id);
@@ -844,6 +920,10 @@ async function autoRouteTicket(created) {
         const thread = Array.isArray(created.thread) ? created.thread : [];
         thread.push({ kind: 'event', text: 'Auto-routed to ' + best.name + ' (shift portal, least load)', at: Date.now() });
         const updated = await updateTicket(created.id, { portal_id: best.id, thread });
+        // Keep the portal's running load counter honest: the round-robin engine
+        // in utils/portalAssignment reads assigned_count for its capacity check,
+        // and every other write path recomputes it from live tickets.
+        await dbAdapter.run('UPDATE support_portals SET assigned_count = assigned_count + 1 WHERE id = ?', [best.id]);
         return updated || created;
     } catch (e) {
         console.warn('[Support] auto-route skipped:', e.message);
@@ -955,7 +1035,7 @@ const QUEUE_COLS = [
     'id', 'ticket_number', 'order_id', 'reason', 'reason_label', 'sub', 'sub_label',
     'status', 'priority', 'team', 'created_at', 'updated_at', 'last_customer_at',
     'resolution_type', 'resolution_label', 'resolution_at', 'csat', 'reopen_count',
-    'thread', 'customer_name', 'customer_phone', 'channel', 'source', 'has_images'
+    'thread', 'customer_name', 'customer_phone', 'channel', 'source', 'has_images', 'portal_id'
 ].join(', ');
 
 // The desk's default "website" lane is the storefront Help & Tickets (accounts)
@@ -1075,5 +1155,6 @@ module.exports = {
     contextFor, normOrderId, attachItemImages,
     isWhitelisted, listWhitelist, addWhitelist, removeWhitelist,
     listTicketsByPhone, countTicketsByPhone, getTicket, getTicketByNumber, openTicketForOrder,
-    createTicket, updateTicket, listTicketImages, deskQueryTickets, deskStatsAgg, publicTicket, customerTicket
+    createTicket, updateTicket, listTicketImages, deskQueryTickets, deskStatsAgg, publicTicket, customerTicket,
+    getPortalIndex, describePortal
 };

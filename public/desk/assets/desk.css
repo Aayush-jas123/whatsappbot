@@ -643,6 +643,41 @@ button, input, select, textarea {
   border: 1px solid var(--desk-border);
 }
 
+/* --- PORTAL ATTRIBUTION (three weights, three meanings) ---
+   Solid fill: the portal stamped on the ticket row, i.e. its owner.
+   Dotted rule: a shift portal claims it by created time only, so the row is
+   still unowned and another distribution run can move it.
+   Dashed rule: no portal shows this ticket anywhere. */
+.pill-portal {
+  background: var(--desk-fill);
+  color: var(--desk-ink) !important;
+  border: 1px solid var(--desk-border-strong);
+  max-width: 130px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.pill-portal-shift {
+  background: #FFFFFF;
+  color: var(--desk-sub) !important;
+  border: 1px dotted var(--desk-border-strong);
+  max-width: 130px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.pill-portal-none {
+  background: #FFFFFF;
+  color: var(--desk-hint) !important;
+  border: 1px dashed var(--desk-border);
+}
+.desk-portal-note {
+  font-size: 10px;
+  font-weight: 600;
+  color: var(--desk-muted);
+  letter-spacing: .01em;
+}
+
 /* Generic desk-tag & desk-pill base */
 .desk-tag {
   font-size: 9.5px;

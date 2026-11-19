@@ -198,21 +198,27 @@ router.get('/tickets', async (req, res) => {
 
         // Enrich queue rows with cached order context
         const orderIds = [...new Set(rows.map(t => t.order_id).filter(Boolean))];
-        const cache = await Support.cacheRowsFor(orderIds);
+        const [cache, portalIndex, slaCfg] = await Promise.all([
+            Support.cacheRowsFor(orderIds),
+            // One cheap read for the whole page: which portal owns or claims each
+            // row. Resolved with the same rule the portal surfaces use.
+            Support.getPortalIndex(),
+            Support.getSetting('sla')
+        ]);
         const orderMap = {};
         cache.forEach(r => { orderMap[r.order_id] = r; });
 
-        const slaCfg = (await Support.getSetting('sla')) || {};
         res.json({
             tickets: rows.map(t => ({
                 ...publicTicket(t),
                 customer_name: t.customer_name, customer_phone: t.customer_phone,
                 channel: t.channel, has_images: t.has_images,
+                portal: Support.describePortal(t, portalIndex),
                 order: orderMap[t.order_id] ? {
                     stage: orderMap[t.order_id].stage, payment: orderMap[t.order_id].payment,
                     courier: orderMap[t.order_id].courier, awb: orderMap[t.order_id].awb, total: orderMap[t.order_id].total
                 } : null,
-                sla: Support.slaOf(t, slaCfg),
+                sla: Support.slaOf(t, slaCfg || {}),
                 isRequest: !!Support.REQUESTS[t.reason + '/' + t.sub]
             }))
         });
@@ -229,13 +235,14 @@ router.get('/tickets/:id', async (req, res) => {
     try {
         const t = await Support.getTicket(req.params.id);
         if (!t) return res.status(404).json({ error: 'Ticket not found' });
-        const [images, settings] = await Promise.all([
+        const [images, settings, portalIndex] = await Promise.all([
             Support.listTicketImages(t.id),
-            Support.getAllSettings()
+            Support.getAllSettings(),
+            Support.getPortalIndex()
         ]);
         const key = t.reason + '/' + t.sub;
         res.json({
-            ticket: { ...t, images },
+            ticket: { ...t, images, portal: Support.describePortal(t, portalIndex) },
             sla: Support.slaOf(t, settings.sla || {}),
             requestKey: Support.REQUESTS[key] ? key : null,
             requestLabel: Support.REQUESTS[key] || null,
