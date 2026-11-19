@@ -751,7 +751,7 @@
 
     /* ── bulk inventory-in ── */
     function addToBulk(skuKey) {
-        const item = SR.inventory.find(i => i.sku_key === skuKey);
+        const item = stockRow(skuKey);
         if (!item) return;
         const existing = SR.bulkItems.find(b => b.sku_key === skuKey);
         if (existing) { existing.qty += 1; }
@@ -762,8 +762,16 @@
     function removeFromBulk(skuKey) { SR.bulkItems = SR.bulkItems.filter(b => b.sku_key !== skuKey); renderBulkModal(false); }
 
     // sku_key can carry spaces and brackets, so match on the dataset rather than building a selector
-    function bulkQtyInput(skuKey) {
-        return [...document.querySelectorAll('[data-sr-bulk-qty]')].find(el => el.dataset.srBulkQty === skuKey) || null;
+    function bulkCell(attr, dataKey, skuKey) {
+        return [...document.querySelectorAll(attr)].find(el => el.dataset[dataKey] === skuKey) || null;
+    }
+
+    function bulkQtyInput(skuKey) { return bulkCell('[data-sr-bulk-qty]', 'srBulkQty', skuKey); }
+
+    // CURRENT must come from the full snapshot, never SR.inventory — that is the toolbar-filtered
+    // subset, so any SKU the operator had filtered out would read back as 0 in stock.
+    function stockRow(skuKey) {
+        return (SR.allInventory || []).find(i => i.sku_key === skuKey) || null;
     }
 
     function updateBulkQty(skuKey, qty, commit = true) {
@@ -778,7 +786,7 @@
             let q = Math.max(0, n);
             // In Bulk Out mode, cap at current stock
             if (SR.bulkOutMode) {
-                const current = SR.inventory.find(i => i.sku_key === skuKey);
+                const current = stockRow(skuKey);
                 q = Math.min(q, current ? current.quantity : 0);
             }
             item.qty = q;
@@ -789,7 +797,16 @@
         if (commit) { const input = bulkQtyInput(skuKey); if (input) input.value = item.qty; }
     }
 
-    function openBulkModal(outMode = false) { SR.bulkItems = []; SR.bulkSearch = ''; SR.bulkReference = ''; SR.bulkNotes = ''; SR.bulkOutMode = !!outMode; renderBulkModal(true); updateBulkModalChrome(); const m = document.getElementById('srBulkModal'); if (m) m.style.display = 'flex'; }
+    function openBulkModal(outMode = false) { SR.bulkItems = []; SR.bulkSearch = ''; SR.bulkReference = ''; SR.bulkNotes = ''; SR.bulkOutMode = !!outMode; renderBulkModal(true); updateBulkModalChrome(); const m = document.getElementById('srBulkModal'); if (m) m.style.display = 'flex'; refreshBulkSnapshot(); }
+
+    // Stock Room caches its snapshot across tab switches (memory smart), so CURRENT would otherwise
+    // show whatever the DB said when the tab first opened. Re-fetch and repaint the cells in place.
+    function refreshBulkSnapshot() {
+        return loadInventory(true).then(() => {
+            refreshBulkDerived();
+            if (SR.bulkSearch) handleBulkSearch(SR.bulkSearch);
+        });
+    }
     function closeBulkModal() { const m = document.getElementById('srBulkModal'); if (m) m.style.display = 'none'; }
 
     function updateBulkModalChrome() {
@@ -839,15 +856,15 @@
                         <thead><tr><th>Product</th><th>Size</th><th>Current</th><th>${qtyLabel}</th><th>Projected</th><th></th></tr></thead>
                         <tbody>
                             ${SR.bulkItems.map(b => {
-                                const current = SR.inventory.find(i => i.sku_key === b.sku_key);
+                                const current = stockRow(b.sku_key);
                                 const curQty = current ? current.quantity : 0;
                                 const proj = isOut ? curQty - b.qty : curQty + b.qty;
                                 const projClass = proj <= 0 ? 'sr-bulk-projected sr-zero' : proj <= (current?.reorder_level || 0) ? 'sr-bulk-projected sr-reorder' : 'sr-bulk-projected';
-                                const maxHint = isOut ? `<span class="sr-bulk-max" title="Max: ${curQty}">max ${curQty}</span>` : '';
+                                const maxHint = isOut ? `<span class="sr-bulk-max" data-sr-bulk-maxh="${esc(b.sku_key)}" title="Max: ${curQty}">max ${curQty}</span>` : '';
                                 return `<tr>
                                     <td class="sr-bulk-product">${esc(b.product_name)}</td>
                                     <td class="sr-bulk-size">${esc(b.size)}</td>
-                                    <td class="sr-bulk-current">${num(curQty)}</td>
+                                    <td class="sr-bulk-current" data-sr-bulk-cur="${esc(b.sku_key)}">${num(curQty)}</td>
                                     <td><input type="number" min="1" ${isOut ? `max="${curQty}"` : ''} value="${b.qty}" class="sr-bulk-qty-input" data-sr-bulk-qty="${esc(b.sku_key)}">${maxHint}</td>
                                     <td class="${projClass}" data-sr-bulk-proj="${esc(b.sku_key)}">${num(proj)}</td>
                                     <td><button class="sr-bulk-remove" data-sr="bulk-remove" data-sku="${esc(b.sku_key)}" title="Remove">&times;</button></td>
@@ -892,8 +909,16 @@
             const skuKey = td.dataset.srBulkProj;
             const bulk = SR.bulkItems.find(b => b.sku_key === skuKey);
             if (!bulk) return;
-            const current = SR.inventory.find(i => i.sku_key === skuKey);
+            const current = stockRow(skuKey);
             const curQty = current ? current.quantity : 0;
+            const curCell = bulkCell('[data-sr-bulk-cur]', 'srBulkCur', skuKey);
+            if (curCell) curCell.textContent = num(curQty);
+            if (isOut) {
+                const hint = bulkCell('[data-sr-bulk-maxh]', 'srBulkMaxh', skuKey);
+                if (hint) { hint.title = `Max: ${curQty}`; hint.textContent = `max ${curQty}`; }
+                const input = bulkQtyInput(skuKey);
+                if (input) input.setAttribute('max', curQty);
+            }
             const proj = isOut ? curQty - bulk.qty : curQty + bulk.qty;
             td.className = proj <= 0 ? 'sr-bulk-projected sr-zero' : proj <= (current?.reorder_level || 0) ? 'sr-bulk-projected sr-reorder' : 'sr-bulk-projected';
             td.textContent = num(proj);
@@ -905,7 +930,7 @@
         if (!container) return;
         if (!query || query.length < 2) { container.innerHTML = ''; return; }
         const q = query.toLowerCase();
-        const matches = SR.inventory.filter(i =>
+        const matches = (SR.allInventory || []).filter(i =>
             !SR.bulkItems.find(b => b.sku_key === i.sku_key) &&
             (i.product_name.toLowerCase().includes(q) || i.sku_key.toLowerCase().includes(q) || i.size.toLowerCase().includes(q))
         ).slice(0, 15);
