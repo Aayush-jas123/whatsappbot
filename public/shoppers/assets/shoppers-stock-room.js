@@ -34,7 +34,7 @@
         page: 0,
         pageSize: 25,
         bulkItems: [],
-        bulkSearch: '',       // survives modal re-renders so the results list isn't lost
+        bulkSearch: '',       // retained so a rebuild does not discard the operator's query
         bulkReference: '',
         bulkNotes: '',
         bulkOutMode: false,   // false = Bulk In (add), true = Bulk Out (subtract)
@@ -802,10 +802,9 @@
     // Stock Room caches its snapshot across tab switches (memory smart), so CURRENT would otherwise
     // show whatever the DB said when the tab first opened. Re-fetch and repaint the cells in place.
     function refreshBulkSnapshot() {
-        return loadInventory(true).then(() => {
-            refreshBulkDerived();
-            if (SR.bulkSearch) handleBulkSearch(SR.bulkSearch);
-        });
+        // Derived cells only — repainting the results panel here would make it reappear over the
+        // table on its own. It is recomputed from the fresh snapshot whenever it is reopened.
+        return loadInventory(true).then(refreshBulkDerived);
     }
     function closeBulkModal() { const m = document.getElementById('srBulkModal'); if (m) m.style.display = 'none'; }
 
@@ -892,7 +891,12 @@
         const searchInput = modal.querySelector('#srBulkSearch');
         if (searchInput) {
             searchInput.addEventListener('input', (e) => { SR.bulkSearch = e.target.value; handleBulkSearch(e.target.value); });
-            if (SR.bulkSearch) handleBulkSearch(SR.bulkSearch); // repaint results after a row add/remove
+            // The results panel floats over the Selected SKUs table, so a rebuild leaves it closed.
+            // Bound to click rather than focus so the programmatic focus() below does not reopen it.
+            searchInput.addEventListener('click', () => handleBulkSearch(SR.bulkSearch));
+            searchInput.addEventListener('keydown', (e) => {
+                if (e.key === 'Escape') { handleBulkSearch(''); searchInput.blur(); }
+            });
             if (focusSearch) searchInput.focus();
         }
     }
@@ -1335,6 +1339,20 @@
         if (id === 'srCategoryFilter') { SR.categoryFilter = e.target.value; applyFiltersAndRender(); }
         else if (id === 'srStatusFilter') { SR.statusFilter = e.target.value; applyFiltersAndRender(); }
         else if (id === 'srBulkShopify') { SR.bulkPushShopify = e.target.checked; localStorage.setItem('srBulkPushShopify', SR.bulkPushShopify ? '1' : '0'); }
+    });
+
+    // The results panel floats over the Selected SKUs table, so it must go away when the operator
+    // interacts with anything outside the search box. mousedown on a result is inside the box, so
+    // it is not cleared before the click that selects it lands.
+    document.addEventListener('mousedown', (e) => {
+        const view = document.getElementById('inventoryView');
+        if (!view || view.style.display === 'none') return;
+        const modal = document.getElementById('srBulkModal');
+        if (!modal || modal.style.display === 'none') return;
+        if (!e.target.closest) return;
+        if (e.target.closest('.sr-bulk-search')) return;
+        const container = document.getElementById('srBulkSearchResults');
+        if (container) container.innerHTML = '';
     });
 
     /* ── tab integration (memory smart) ── */

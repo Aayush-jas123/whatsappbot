@@ -5032,8 +5032,8 @@ tr.ict-detail-row td { background: rgba(255,255,255,0.02); padding: 1rem 1.1rem;
 .sr-bulk-search-input:focus { border-color: rgba(255,255,255,0.3); }
 .sr-bulk-search-results {
     position: absolute; top: 100%; left: 0; right: 0; z-index: 10;
-    background: #1a1a1a; border: 1px solid rgba(255,255,255,0.1); border-radius: 0 0 8px 8px;
-    max-height: 200px; overflow-y: auto;
+    background: #1a1a1a; border: 1px solid rgba(255,255,255,0.1); border-top: none; border-radius: 0 0 8px 8px;
+    max-height: 200px; overflow-y: auto; box-shadow: 0 12px 28px rgba(0,0,0,0.55);
 }
 .sr-search-result {
     display: flex; justify-content: space-between; align-items: center;
