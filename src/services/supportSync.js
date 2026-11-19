@@ -2,6 +2,7 @@ const crypto = require('crypto');
 const axios = require('axios');
 const { dbAdapter } = require('../database/db');
 const { getBreaker } = require('../utils/circuitBreaker');
+const SupportAccess = require('./supportAccessService');
 
 // ============================================================
 // SupportSync — keeps support_order_cache fresh from Shopify.
@@ -243,14 +244,11 @@ async function upsertOrder(order, phone, force = false) {
 // ---------- whitelist gate for the webhook firehose ----------
 // orders/updated fires for every order in the shop while the whitelist holds a
 // handful of phones, so the list is kept in memory (60s) to keep non-whitelisted
-// webhooks at zero database reads.
-let wlCache = null;
+// webhooks at zero database reads. The snapshot now lives in supportAccessService
+// so the customer gate, the theme probe and this filter all read one list — three
+// copies drifting apart was how revocations used to look like they had not landed.
 async function isWhitelistedCached(phone) {
-    if (!wlCache || Date.now() - wlCache.ts > 60 * 1000) {
-        const rows = await dbAdapter.query('SELECT phone FROM support_whitelist');
-        wlCache = { set: new Set(rows.map(r => r.phone)), ts: Date.now() };
-    }
-    return wlCache.set.has(phone);
+    return SupportAccess.isWhitelistedCached(phone);
 }
 
 // ---------- webhook entry ----------

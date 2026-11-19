@@ -2631,6 +2631,195 @@ input, textarea { caret-color: var(--desk-ink); }
 .desk-ci-row .ci-val { font-variant-numeric: tabular-nums; }
 .desk-ci-panel { gap: 12px; }
 
+/* ---------- 11. Access console (settings › Access) ---------- */
+/* A small operations screen: chips for state, cards for audiences, a ledger
+   for the list itself. An active segment is marked with ink weight and an
+   inset rule — never a hue — so the monochrome scale keeps holding. */
+.desk-acc-warn {
+  background: var(--desk-card-sub);
+  border: 1px solid var(--desk-border-strong);
+  border-left: 3px solid var(--desk-ink);
+  border-radius: var(--radius-sm);
+  padding: 9px 12px;
+  font-size: 12px;
+  line-height: 1.5;
+  color: var(--desk-sub);
+  margin-bottom: 6px;
+}
+.desk-acc-warn code { font-family: var(--mono); font-size: 11px; }
+.desk-acc-modehint { font-size: 12px; color: var(--desk-muted); margin: -2px 0 10px; }
+.desk-chip-go { cursor: pointer; transition: border-color .15s ease, background .15s ease; }
+.desk-chip-go:hover { border-color: var(--desk-ink); background: #fff; }
+.desk-acc-status { font-size: 11px; color: var(--desk-muted); align-self: center; margin-left: auto; }
+
+/* Grant controls: the one row every bulk path (card, selection, paste) reads. */
+.desk-acc-opts {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: flex-end;
+  gap: 12px;
+  background: var(--desk-card-sub);
+  border: 1px solid var(--desk-border);
+  border-radius: var(--radius-sm);
+  padding: 10px 12px;
+  margin: 4px 0 14px;
+}
+.desk-acc-field {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  font-size: 10.5px;
+  text-transform: uppercase;
+  letter-spacing: .05em;
+  color: var(--desk-muted);
+}
+.desk-acc-field.grow { flex: 1 1 200px; min-width: 170px; }
+.desk-acc-field input,
+.desk-acc-field select {
+  padding: 7px 9px;
+  border: 1px solid var(--desk-border);
+  border-radius: 8px;
+  font-size: 12.5px;
+  text-transform: none;
+  letter-spacing: 0;
+  background: #fff;
+  color: var(--desk-ink);
+  font-family: inherit;
+}
+.desk-acc-field input[type="number"] { width: 96px; }
+.desk-acc-field em {
+  font-style: normal;
+  font-size: 10.5px;
+  text-transform: none;
+  letter-spacing: 0;
+  color: var(--desk-hint);
+}
+
+/* Audience cards */
+.desk-acc-cards {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(216px, 1fr));
+  gap: 9px;
+}
+.desk-acc-card {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  border: 1px solid var(--desk-border);
+  border-radius: var(--radius-sm);
+  background: var(--desk-card);
+  padding: 10px 11px;
+}
+.desk-acc-card.on { border-color: var(--desk-ink); box-shadow: inset 3px 0 0 var(--desk-ink); }
+.desk-acc-card .t { font-size: 12.5px; font-weight: 700; line-height: 1.3; }
+.desk-acc-card .n { font-size: 20px; font-weight: 800; line-height: 1; font-variant-numeric: tabular-nums; }
+.desk-acc-card .n em {
+  font-style: normal;
+  font-size: 10px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: .05em;
+  color: var(--desk-muted);
+  margin-left: 5px;
+}
+.desk-acc-card .h { font-size: 11.5px; color: var(--desk-muted); line-height: 1.45; flex: 1; }
+.desk-acc-card .a { display: flex; flex-wrap: wrap; gap: 4px; }
+.desk-acc-card .a .desk-btn-plain { padding: 3px 7px; font-size: 11px; }
+
+/* Preview and roster share one frame */
+.desk-acc-preview {
+  border: 1px solid var(--desk-border);
+  border-radius: var(--radius-sm);
+  background: var(--desk-card);
+  padding: 11px 12px;
+  margin-bottom: 6px;
+}
+.desk-acc-phead { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; }
+.desk-acc-phead > div:first-child { display: flex; align-items: baseline; gap: 8px; margin-right: auto; }
+.desk-acc-phead b { font-size: 13px; }
+.desk-acc-phead span { font-size: 11.5px; color: var(--desk-muted); }
+.desk-acc-phead .a { display: flex; gap: 6px; flex-wrap: wrap; }
+.desk-acc-filter { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin: 10px 0; }
+.desk-acc-filter .desk-input,
+.desk-acc-filter select {
+  padding: 6px 9px;
+  border: 1px solid var(--desk-border);
+  border-radius: 8px;
+  font-size: 12.5px;
+  background: #fff;
+  font-family: inherit;
+  margin-bottom: 0;
+}
+.desk-acc-filter .desk-input { max-width: 200px; }
+.desk-acc-bar {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-wrap: wrap;
+  background: var(--desk-card-sub);
+  border-top: 1px solid var(--desk-border);
+  border-bottom: 1px solid var(--desk-border);
+  padding: 7px 9px;
+  margin: 4px 0 8px;
+}
+.desk-acc-bar > span { font-size: 11.5px; color: var(--desk-muted); margin-right: 4px; }
+.desk-acc-bar b { color: var(--desk-ink); font-variant-numeric: tabular-nums; }
+.desk-acc-pager {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 10px;
+  font-size: 11.5px;
+  color: var(--desk-muted);
+  margin-top: 8px;
+}
+.desk-acc-views { display: inline-flex; gap: 4px; flex-wrap: wrap; margin-left: auto; }
+.desk-acc-clean { display: flex; gap: 6px; flex-wrap: wrap; }
+.desk-acc-import {
+  width: 100%;
+  min-height: 76px;
+  padding: 9px 11px;
+  border: 1px solid var(--desk-border);
+  border-radius: 9px;
+  font-family: var(--mono);
+  font-size: 12px;
+  line-height: 1.5;
+  resize: vertical;
+}
+.desk-acc-import::placeholder { color: var(--desk-hint); }
+.desk-acc-flags {
+  display: block;
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: .05em;
+  color: var(--desk-hint);
+}
+.desk-acc-on, .desk-acc-off { font-size: 11px; white-space: nowrap; }
+.desk-acc-on { font-weight: 800; border-bottom: 1px solid var(--desk-ink); }
+.desk-acc-off { color: var(--desk-hint); }
+
+/* Policy rows: switch left, rule and rationale right, hairline between. */
+.desk-acc-toggle {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  padding: 9px 2px;
+  border-bottom: 1px solid var(--hair);
+  font-size: 12.5px;
+  cursor: pointer;
+}
+.desk-acc-toggle input { width: 15px; height: 15px; margin: 2px 0 0; flex: 0 0 auto; accent-color: var(--desk-ink); }
+.desk-acc-toggle b { display: block; font-weight: 700; }
+.desk-acc-toggle em {
+  display: block;
+  font-style: normal;
+  font-size: 11.5px;
+  color: var(--desk-muted);
+  line-height: 1.45;
+  margin-top: 2px;
+}
+.desk-acc-toggle:hover em { color: var(--desk-sub); }
+
 /* Below the split breakpoint the workspace stacks; return to normal
    document flow so nothing collapses inside the fixed shell */
 @media (max-width: 1240px) {

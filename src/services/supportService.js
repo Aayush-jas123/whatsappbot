@@ -94,7 +94,10 @@ function normalizePhone(raw) {
     if (d.length === 10) d = '91' + d;
     if (d.length === 11 && d.startsWith('0')) d = '91' + d.slice(1);
     if (d.length === 12 && d.startsWith('91')) return d;
-    if (d.length > 12 && d.startsWith('0091')) return d.slice(4);
+    // '0091XXXXXXXXXX' is the international-dialling spelling of the same
+    // number, so strip the 00 and keep the canonical 91-prefix. Returning the
+    // bare 10 digits here would fail every ^91[0-9]{10}$ check downstream.
+    if (d.length > 12 && d.startsWith('0091')) return '91' + d.slice(4);
     return d;
 }
 
@@ -889,6 +892,14 @@ async function createTicket(payload) {
         ticketValues(data)
     );
     const created = rows[0];
+    // The desk's Access policy can pull the writer onto the whitelist automatically.
+    // Required lazily because supportAccessService loads this module, and fired
+    // without awaiting: a customer must never see a failed ticket because a policy
+    // row could not be written.
+    if (created) {
+        require('./supportAccessService').maybeAutoGrant(created.customer_phone, created.channel)
+            .catch(e => console.warn('[Support] auto-grant skipped:', e.message));
+    }
     // Attach images
     if (created && (payload.images || []).length) {
         for (const url of payload.images) {

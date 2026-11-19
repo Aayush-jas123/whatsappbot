@@ -4,6 +4,7 @@ const router = express.Router();
 const multer = require('multer');
 const Support = require('../services/supportService');
 const SupportSync = require('../services/supportSync');
+const SupportAccess = require('../services/supportAccessService');
 const cloudinary = require('../services/cloudinaryService');
 
 // ============================================================
@@ -12,9 +13,10 @@ const cloudinary = require('../services/cloudinaryService');
 //
 // Auth model: the theme injects the signed-in customer's phone
 // server-side (Liquid), the JS echoes it on every request as
-// X-Customer-Phone, and access additionally requires the phone to
-// be on support_whitelist (managed from the desk). No password,
-// no session — the storefront account is the identity provider.
+// X-Customer-Phone, and access is then decided by the desk's Access
+// tab (supportAccessService): the support_whitelist rows plus the
+// access policy mode. No password, no session — the storefront
+// account is the identity provider.
 // ============================================================
 
 // Uploads go to Cloudinary; disk storage keeps big files off the heap
@@ -36,13 +38,15 @@ async function verifyCustomerPhone(req, res, next) {
         if (!raw) return res.status(401).json({ error: 'Phone required' });
         const phone = Support.normalizePhone(raw);
         if (!phone || phone.length < 10) return res.status(401).json({ error: 'Invalid phone' });
-        // 60s in-memory whitelist snapshot (same one the webhooks use) — every
+        // 60s in-memory access snapshot (shared with the order webhooks) — every
         // customer request used to pay a DB round trip here, which dominates
         // latency when the Render pool is cold. Revocations take up to 60s.
-        if (!(await SupportSync.isWhitelistedCached(phone))) {
-            return res.status(403).json({ error: 'Support access not enabled' });
+        const access = await SupportAccess.checkAccess(phone);
+        if (!access.allowed) {
+            return res.status(403).json({ error: 'Support access not enabled', via: access.via });
         }
         req.customerPhone = phone;
+        req.customerAccess = access;
         next();
     } catch (error) {
         console.error('[Support] customer auth error:', error.message);
@@ -50,33 +54,47 @@ async function verifyCustomerPhone(req, res, next) {
     }
 }
 
+// Read-only grants (access level "view") may look at orders and their existing
+// tickets but must not start new conversations. Runs after verifyCustomerPhone.
+function requireFullAccess(req, res, next) {
+    if ((req.customerAccess && req.customerAccess.level) === 'view') {
+        return res.status(403).json({ error: 'This account has read-only support access' });
+    }
+    next();
+}
+
 // Thread is trimmed for the customer view; the desk reads the full row
 const publicTicket = Support.publicTicket;
 
-// ── Whitelist gate (no auth — the phone comes from Liquid injection) ──
-// Tells the theme whether to render the Help & Tickets tab at all.
+// ── Access gate (no auth — the phone comes from Liquid injection) ──
+// Tells the theme whether to render the Help & Tickets tab at all, and at what
+// level, so the storefront can hide the "raise a ticket" affordances for
+// read-only accounts instead of letting them hit a 403.
 router.get('/whitelist-check', async (req, res) => {
     try {
         const phone = Support.normalizePhone(req.query.phone || '');
         if (!phone) return res.json({ allowed: false });
-        if (!(await SupportSync.isWhitelistedCached(phone))) return res.json({ allowed: false });
+        const access = await SupportAccess.checkAccess(phone);
+        if (!access.allowed) return res.json({ allowed: false, level: null, via: access.via });
 
         const cached = verifiedCustomers.get(phone);
         if (cached && Date.now() - cached.ts < VERIFY_TTL) {
-            return res.json({ allowed: true, name: cached.name, email: cached.email });
+            return res.json({ allowed: true, level: access.level, name: cached.name, email: cached.email });
         }
         try {
             const data = await SupportSync.shopifyREST(`customers.json?phone=${encodeURIComponent('+' + phone)}&limit=1`);
             const c = data.customers && data.customers[0];
-            if (!c) return res.json({ allowed: false });
+            // In "open" mode a phone we cannot match to a Shopify customer still
+            // has no account to read orders from, so the tab would be useless.
+            if (!c) return res.json({ allowed: false, level: null, via: 'no-storefront-account' });
             const profile = { name: [c.first_name, c.last_name].filter(Boolean).join(' '), email: c.email, ts: Date.now() };
             verifiedCustomers.set(phone, profile);
             if (verifiedCustomers.size > 500) verifiedCustomers.delete(verifiedCustomers.keys().next().value);
-            res.json({ allowed: true, name: profile.name, email: profile.email });
+            res.json({ allowed: true, level: access.level, name: profile.name, email: profile.email });
         } catch (shopErr) {
-            // Shopify lookup failed — the whitelist remains the access decision
+            // Shopify lookup failed — the access decision from the list stands
             console.warn('[Support] Shopify verify skipped:', shopErr.message);
-            res.json({ allowed: true });
+            res.json({ allowed: true, level: access.level });
         }
     } catch (error) {
         console.error('[Support] whitelist-check error:', error.message);
@@ -191,7 +209,7 @@ router.get('/tickets/:id', verifyCustomerPhone, async (req, res) => {
 });
 
 // ── Create ticket ──
-router.post('/tickets', verifyCustomerPhone, async (req, res) => {
+router.post('/tickets', verifyCustomerPhone, requireFullAccess, async (req, res) => {
     try {
         const b = req.body || {};
         if (!b.orderId || !b.reason || !b.sub) {
@@ -249,7 +267,7 @@ router.post('/tickets', verifyCustomerPhone, async (req, res) => {
 });
 
 // ── Customer reply ──
-router.post('/tickets/:id/messages', verifyCustomerPhone, async (req, res) => {
+router.post('/tickets/:id/messages', verifyCustomerPhone, requireFullAccess, async (req, res) => {
     try {
         const t = await Support.getTicket(req.params.id);
         if (!t || t.customer_phone !== req.customerPhone) {
@@ -298,7 +316,7 @@ router.patch('/tickets/:id/csat', verifyCustomerPhone, async (req, res) => {
 });
 
 // ── Reopen (within 7 days of resolution, once) ──
-router.post('/tickets/:id/reopen', verifyCustomerPhone, async (req, res) => {
+router.post('/tickets/:id/reopen', verifyCustomerPhone, requireFullAccess, async (req, res) => {
     try {
         const t = await Support.getTicket(req.params.id);
         if (!t || t.customer_phone !== req.customerPhone) {
@@ -327,7 +345,7 @@ router.post('/tickets/:id/reopen', verifyCustomerPhone, async (req, res) => {
 });
 
 // ── Image upload (Cloudinary) — returns URLs the create call references ──
-router.post('/upload', verifyCustomerPhone, upload.array('images', 3), async (req, res) => {
+router.post('/upload', verifyCustomerPhone, requireFullAccess, upload.array('images', 3), async (req, res) => {
     try {
         const urls = [];
         for (const file of (req.files || [])) {

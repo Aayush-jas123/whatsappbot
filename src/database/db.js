@@ -669,6 +669,26 @@ async function initializeSupportPortalsTable() {
     // Follow-Up view: filter by status, sort by scheduled reminder time
     await pool.query('CREATE INDEX IF NOT EXISTS idx_support_tickets_follow_up ON support_tickets(status, follow_up_at)');
 
+    // ── Support desk Access tab: whitelist grants carry their own metadata ──
+    // The phone stays the only gate the storefront Help & Tickets tab has, so
+    // each grant also records how it was made, what it allows and when it lapses.
+    // All three are optional for the gate itself (accessService probes for them
+    // and degrades to the legacy shape), which is why ADD COLUMN runs here rather
+    // than depending on the hand-run migration landing first.
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS support_whitelist (
+        id SERIAL PRIMARY KEY,
+        phone VARCHAR(50) UNIQUE NOT NULL,
+        added_by VARCHAR(100),
+        note TEXT,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+      )
+    `);
+    await addColumnIfNotExists('support_whitelist', 'expires_at', 'TIMESTAMP');
+    await addColumnIfNotExists('support_whitelist', 'access_level', "VARCHAR(20) DEFAULT 'full'");
+    await addColumnIfNotExists('support_whitelist', 'source', "VARCHAR(40) DEFAULT 'manual'");
+    await pool.query('CREATE INDEX IF NOT EXISTS idx_support_whitelist_expires ON support_whitelist(expires_at) WHERE expires_at IS NOT NULL');
+
     // Add advanced distribution columns to support_portals
     const portalColumns = [
       { name: 'max_tickets', type: 'INTEGER' },

@@ -3,7 +3,8 @@
    Login → KPI bar → queue (left) → full ticket context (right).
    Admin settings modal: SLA, teams, canned responses, resolution
    templates, cost config, portals & shifts, ticket distribution,
-   portal analytics, whitelist, order sync.
+   portal analytics, the access console (segments, bulk grants,
+   policy), order sync.
    The portal tabs mirror the Support Command dashboard via the
    /api/admin/support-portals engine; mutations stay master-admin
    only (server-enforced), regular agents see a read-only view.
@@ -43,6 +44,20 @@
     loginsWide: null,     // days -> wider-window login-stats payloads (30/90)
     loginWindow: 7,       // days shown in the Logins tab (1 | 7 | 30 | 90)
     shifts: [],           // in-progress shift editor rows (Distribution tab)
+    // Access tab console (settings modal). One cached overview payload drives
+    // the summary chips, the segment cards and the policy form; the two row
+    // sets are the segment preview and the roster.
+    access: null,
+    accessSection: 'segments',   // segments | roster | policy
+    accessSegment: 'active_tickets',
+    accessRows: null,     // preview rows (loaded for accessRowsFor)
+    accessRowsFor: '',
+    accessOffset: 0,
+    accessSel: {},        // phone -> true, shared by preview and roster
+    accessFilter: { q: '', roster: '', limit: 200 },
+    accessList: null,     // roster rows
+    accessListError: '',
+    accessListFilter: { q: '', dormant: false, view: '' },
     mobileShow: 'queue'   // queue | detail (small screens)
   };
 
@@ -1276,13 +1291,7 @@
     } else if (S.modal.tab === 'logins') {
       html += '<div id="LoginsBody">' + (S.logins ? loginsHtml() : '<div class="desk-loading"><span class="desk-spin"></span>Loading login activity\u2026</div>') + '</div>';
     } else if (S.modal.tab === 'whitelist') {
-      html += '<div class="desk-set-sub">Only these phone numbers see the Help &amp; Tickets tab in the customer account. Add the number with country code (e.g. 919876543210).</div>'
-        + '<div class="row" style="display:flex;gap:8px;margin-bottom:14px">'
-        + '<input id="WlPhone" class="desk-input" placeholder="919876543210" style="flex:0 0 200px;margin-bottom:0">'
-        + '<input id="WlNote" class="desk-input" placeholder="Note (optional)" style="flex:1;margin-bottom:0">'
-        + '<button class="desk-btn" onclick="DESK.addWl()">Add</button></div>'
-        + '<div id="WlList"><div class="desk-loading"><span class="desk-spin"></span>Loading\u2026</div></div>';
-      loadWhitelist();
+      html += '<div id="AccRoot">' + accessHtml() + '</div>';
     }
     el.innerHTML = html;
     // Post-render hooks for the async portal tabs (fill containers by id).
@@ -1290,6 +1299,7 @@
     if (S.modal.tab === 'distribute') loadDistributeTab();
     if (S.modal.tab === 'panalytics' && !S.analytics) loadAnalytics();
     if (S.modal.tab === 'logins' && !S.logins) loadLoginsTab();
+    if (S.modal.tab === 'whitelist') loadAccessTab();
   }
 
   // ---------- Logins tab (website account logins, via the returns server) ----------
@@ -1371,19 +1381,664 @@
   function cf(id, label, val) {
     return '<div><label>' + label + '</label><input id="Cf' + id + '" type="number" step="any" value="' + (val != null ? val : '') + '"></div>';
   }
-  function loadWhitelist() {
-    api('/api/support/admin/whitelist').then(function (d) {
-      var el = $('WlList');
-      if (!el) return;
-      el.innerHTML = (d.whitelist || []).map(function (w) {
-        return '<div class="desk-set-item"><div class="row">'
-          + '<input type="text" value="+' + esc(w.phone) + '" disabled style="max-width:160px;font-family:monospace">'
-          + '<input type="text" value="' + esc(w.note || '') + '" disabled placeholder="">'
-          + '<button class="desk-btn-plain" onclick="DESK.delWl(\'' + esc(w.phone) + '\')">Remove</button>'
-          + '</div></div>';
-      }).join('') || '<div class="desk-set-sub">No phones whitelisted yet.</div>';
-    }).catch(function (e) { toast(e.message, true); });
+  // ============================================================
+  // Access console — who gets the storefront Help & Tickets tab.
+  //
+  // Three sections over one engine (/api/support/admin/access/*):
+  //   Segments    audience definitions (live tickets, order stages,
+  //               buyer value, roster hygiene), each previewable and
+  //               grantable in one click.
+  //   Access list the roster itself: selection, level and expiry edits
+  //               in bulk, paste import, cleanup sweeps, CSV export.
+  //   Policy      the switches around both, including the global mode.
+  // Counts, previews and bulk writes all come from the same segment id
+  // server-side, so a card can never disagree with what it grants.
+  // ============================================================
+  var ACC_SECTIONS = [['segments', 'Segments'], ['roster', 'Access list'], ['policy', 'Policy']];
+  var ACC_MODES = [
+    ['whitelist', 'Whitelist only', 'Only numbers on the access list see Help &amp; Tickets. The safe default.'],
+    ['open', 'Open to everyone', 'Any customer with a storefront account gets in without being listed. The list still decides access level, and order caching still follows it.'],
+    ['closed', 'Closed', 'Nobody sees the tab, listed or not. This is the emergency switch.']
+  ];
+  var ACC_TOGGLES = [
+    ['syncOnGrant', 'Pull their orders when granting', 'After a number is added, sync its Shopify orders straight away so the desk has context. Slows large grants down.'],
+    ['verifyBeforeGrant', 'Skip numbers we have never seen', 'Bulk grants ignore phones that appear in no ticket, no order and no shopper record.'],
+    ['autoGrantNewTickets', 'Auto-grant when a ticket lands', 'Anyone who writes in is added to the list themselves, so an answer is always deliverable.'],
+    ['agentMayGrant', 'Desk agents may change the list', 'Turn off and only the master admin can grant, revoke or clean up access.'],
+    ['webhookCacheFollowsList', 'Order cache follows the list', 'Shopify webhooks only store orders for listed numbers. Leave on unless the cache must cover everyone.']
+  ];
+
+  function accNum(n) { return (Number(n) || 0).toLocaleString('en-IN'); }
+  function accSeg(id) {
+    var segs = (S.access && S.access.segments) || [];
+    for (var i = 0; i < segs.length; i++) { if (segs[i].id === id) return segs[i]; }
+    return null;
   }
+  function accExt() { return Boolean(S.access && !S.access.schemaLimited); }
+  // Grants honour policy.agentMayGrant server-side; mirror it here so the
+  // buttons read as disabled instead of throwing a 403 toast on click.
+  function grantDis() {
+    var p = (S.access && S.access.policy) || {};
+    if (isAdmin() || p.agentMayGrant !== false) return '';
+    return ' disabled title="Access changes are restricted to the master admin (see Access \u203a Policy)"';
+  }
+  function adminOnly() { return isAdmin() ? '' : ' disabled title="Master admin only"'; }
+  function accSelected() { return Object.keys(S.accessSel); }
+  function accNeedSel() {
+    var sel = accSelected();
+    if (!sel.length) toast('Tick some numbers first', true);
+    return sel.length ? sel : null;
+  }
+  function accChip(n, l, seg) {
+    return '<div class="desk-chip desk-chip-go" title="Open this segment" onclick="DESK.accJump(\'' + seg + '\')"><b>'
+      + accNum(n) + '</b><span>' + l + '</span></div>';
+  }
+
+  function accessHtml() {
+    if (!S.access) return '<div class="desk-loading"><span class="desk-spin"></span>Loading access console\u2026</div>';
+    var p = S.access.policy || {}, c = S.access.counts || {};
+    var mode = p.mode || 'whitelist';
+    var modeDef = null;
+    ACC_MODES.forEach(function (m) { if (m[0] === mode) modeDef = m; });
+    var html = '<div class="desk-set-sub">This list is the only gate on the Help &amp; Tickets tab inside the customer account. Numbers are stored with the country code (91XXXXXXXXXX).</div>';
+    if (!accExt()) {
+      html += '<div class="desk-acc-warn">Access levels and expiry dates are unavailable until the extra <code>support_whitelist</code> columns exist \u2014 they are added on the next boot, or paste <code>supabase_migration_support_access_controls.sql</code>. Granting and revoking work either way.</div>';
+    }
+    html += '<div class="desk-set-sec">Who is allowed in</div>'
+      + '<div class="desk-chips">' + ACC_MODES.map(function (m) {
+        return '<button class="desk-mode' + (mode === m[0] ? ' active' : '') + '"' + adminOnly()
+          + ' onclick="DESK.setAccessMode(\'' + m[0] + '\')">' + m[1] + '</button>';
+      }).join('') + '</div>'
+      + '<div class="desk-acc-modehint">' + (modeDef ? modeDef[2] : '') + '</div>';
+    html += '<div class="desk-chips">'
+      + accChip(c.granted, 'On the list', 'granted')
+      + accChip(c.active_tickets, 'With a live ticket', 'active_tickets')
+      + accChip(c.ungranted_known, 'Known, no access', 'ungranted_known')
+      + accChip(c.live_orders, 'Order in flight', 'live_orders')
+      + accChip(c.granted_expired, 'Expired', 'granted_expired')
+      + accChip(c.granted_dormant, 'Dormant', 'granted_dormant')
+      + accChip(c.granted_invalid, 'Unmatched numbers', 'granted_invalid')
+      + '</div>';
+    html += '<div class="desk-chips" id="AccNav">' + ACC_SECTIONS.map(function (x) {
+      return '<button class="desk-mode' + (S.accessSection === x[0] ? ' active' : '') + '" onclick="DESK.setAccessSection(\'' + x[0] + '\')">' + x[1] + '</button>';
+    }).join('') + '<button class="desk-mode" title="Reload counts" onclick="DESK.reloadAccess()">\u21bb</button>'
+      + '<span class="desk-acc-status" id="AccStatus"></span></div>';
+    html += '<div id="AccessBody">' + accessBodyHtml() + '</div>';
+    return html;
+  }
+
+  function accessBodyHtml() {
+    if (S.accessSection === 'roster') return accessRosterHtml();
+    if (S.accessSection === 'policy') return accessPolicyHtml();
+    return accessSegmentsHtml();
+  }
+
+  // ---------- Segments: cards + preview table ----------
+  function accessSegmentsHtml() {
+    var byGroup = {};
+    ((S.access && S.access.segments) || []).forEach(function (s) {
+      (byGroup[s.group] = byGroup[s.group] || []).push(s);
+    });
+    var html = accOptsBar() + '<div id="AccPreview">' + accPreviewHtml() + '</div>';
+    Object.keys(byGroup).forEach(function (g) {
+      html += '<div class="desk-set-sec">' + esc(g) + '</div><div class="desk-acc-cards">'
+        + byGroup[g].map(accSegCard).join('') + '</div>';
+    });
+    return html;
+  }
+
+  function accSegCard(s) {
+    var on = S.accessSegment === s.id;
+    return '<div class="desk-acc-card' + (on ? ' on' : '') + '">'
+      + '<div class="t">' + esc(s.label) + '</div>'
+      + '<div class="n">' + accNum(s.count) + '<em>customers</em></div>'
+      + '<div class="h">' + esc(s.hint || '') + '</div>'
+      + '<div class="a">'
+      + '<button class="desk-btn-plain" onclick="DESK.accJump(\'' + s.id + '\')">Preview</button>'
+      + '<button class="desk-btn-plain"' + (s.count ? grantDis() : ' disabled title="Nobody in this segment"')
+      + ' onclick="DESK.accGrantSegment(\'' + s.id + '\')">Allow all</button>'
+      + (isAdmin() && s.id !== 'granted' ? '<button class="desk-btn-plain" onclick="DESK.accAllowOnly(\'' + s.id + '\')">Allow only these</button>' : '')
+      + '</div></div>';
+  }
+
+  // Level / expiry / note / sync controls shared by every bulk path, so a
+  // grant from a card, a selection or a paste always carries the same shape.
+  function accOptsBar() {
+    var p = (S.access && S.access.policy) || {};
+    return '<div class="desk-acc-opts">'
+      + '<label class="desk-acc-field"><span>Access level</span><select id="AccLevel"' + (accExt() ? '' : ' disabled title="Needs the extra whitelist columns"') + '>'
+      + '<option value="full"' + (p.defaultLevel === 'view' ? '' : ' selected') + '>Full \u2014 can raise tickets</option>'
+      + '<option value="view"' + (p.defaultLevel === 'view' ? ' selected' : '') + '>Read-only \u2014 can only look</option></select></label>'
+      + '<label class="desk-acc-field"><span>Expires after</span><input id="AccDays" type="number" min="0" step="1" value="' + (p.defaultDays || 0) + '"><em>days (0 = never)</em></label>'
+      + '<label class="desk-acc-field grow"><span>Note</span><input id="AccNote" type="text" placeholder="why these were added"></label>'
+      + '<label class="desk-check"><input id="AccSync" type="checkbox"' + (p.syncOnGrant === false ? '' : ' checked') + '> Pull their orders now</label>'
+      + '<button class="desk-btn"' + grantDis() + ' onclick="DESK.accAddOne()">Add one number</button>'
+      + '</div>';
+  }
+
+  function accOpts() {
+    return {
+      level: ($('AccLevel') || {}).value || 'full',
+      days: Number(($('AccDays') || {}).value) || 0,
+      note: (($('AccNote') || {}).value || '').trim() || null,
+      sync: !!($('AccSync') || {}).checked
+    };
+  }
+
+  function accPreviewHtml() {
+    var seg = accSeg(S.accessSegment);
+    if (!seg) return '<div class="desk-set-sub">Pick a segment below to preview it.</div>';
+    var stale = S.accessRowsFor !== seg.id;
+    var rows = stale ? [] : (S.accessRows || []);
+    var html = '<div class="desk-acc-preview">'
+      + '<div class="desk-acc-phead"><div><b>' + esc(seg.label) + '</b><span>' + accNum(seg.count)
+      + ' customers match</span></div><div class="a">'
+      + '<button class="desk-btn"' + (seg.count ? grantDis() : ' disabled') + ' onclick="DESK.accGrantSegment(\'' + seg.id + '\')">Allow all of them</button>'
+      + (isAdmin() && seg.id !== 'granted' ? '<button class="desk-btn-plain" onclick="DESK.accAllowOnly(\'' + seg.id + '\')">Replace the whole list with these</button>' : '')
+      + '</div></div>'
+      + '<div class="desk-acc-filter">'
+      + '<input id="AccQ" class="desk-input" placeholder="Search digits" value="' + esc(S.accessFilter.q) + '">'
+      + '<select id="AccRoster">'
+      + '<option value=""' + (S.accessFilter.roster ? '' : ' selected') + '>Everyone in the segment</option>'
+      + '<option value="ungranted"' + (S.accessFilter.roster === 'ungranted' ? ' selected' : '') + '>Only those without access</option>'
+      + '<option value="granted"' + (S.accessFilter.roster === 'granted' ? ' selected' : '') + '>Only those already allowed</option>'
+      + '</select>'
+      + '<button class="desk-btn-plain" onclick="DESK.accApplyFilter()">Apply</button>'
+      + '<button class="desk-btn-plain" onclick="DESK.accJump(\'' + seg.id + '\', true)">\u21bb</button>'
+      + '</div>';
+    if (stale) {
+      html += '<div class="desk-loading"><span class="desk-spin"></span>Loading ' + esc(seg.label) + '\u2026</div></div>';
+      return html;
+    }
+    html += accSelBar();
+    if (!rows.length) {
+      html += '<div class="desk-set-sub">Nobody in this segment matches the current filters.</div>';
+    } else {
+      html += '<div class="desk-tblwrap"><table class="desk-tbl"><tr><th></th><th>Phone</th><th>Customer</th>'
+        + '<th class="num">Live</th><th class="num">Tickets</th><th class="num">Orders</th><th>Last activity</th><th>Access</th></tr>';
+      rows.forEach(function (r) {
+        html += '<tr><td><input type="checkbox" data-ph="' + esc(r.phone) + '"' + (S.accessSel[r.phone] ? ' checked' : '')
+          + ' onchange="DESK.accPick(\'' + esc(r.phone) + '\', this.checked)"></td>'
+          + '<td style="font-family:monospace">' + esc(r.phone) + '</td>'
+          + '<td>' + esc(r.name || '\u2013') + '</td>'
+          + '<td class="num">' + (r.openTickets || 0) + '</td>'
+          + '<td class="num">' + (r.totalTickets || 0) + '</td>'
+          + '<td class="num">' + (r.orders || 0) + '</td>'
+          + '<td>' + fmtTime(r.lastActivity) + '</td>'
+          + '<td>' + (r.granted
+            ? '<span class="desk-acc-on">' + (r.level === 'view' ? 'Read-only' : 'Allowed') + '</span>'
+            : '<span class="desk-acc-off">No access</span>') + '</td></tr>';
+      });
+      html += '</table></div>' + accPager(rows.length);
+    }
+    html += '</div>';
+    return html;
+  }
+
+  function accPager(shown) {
+    var lim = Number(S.accessFilter.limit) || 200;
+    return '<div class="desk-acc-pager">'
+      + '<button class="desk-btn-plain"' + (S.accessOffset > 0 ? '' : ' disabled') + ' onclick="DESK.accPage(-1)">Previous</button>'
+      + '<span>' + accNum(S.accessOffset + 1) + '\u2013' + accNum(S.accessOffset + shown) + ' of at least '
+      + accNum(S.accessOffset + shown + (shown === lim ? 1 : 0)) + '</span>'
+      + '<button class="desk-btn-plain"' + (shown === lim ? '' : ' disabled') + ' onclick="DESK.accPage(1)">Next</button>'
+      + '</div>';
+  }
+
+  // Selection toolbar: rendered in both sections over whatever is on screen.
+  function accSelBar() {
+    return '<div class="desk-acc-bar"><span>Selected <b id="AccSelN">' + accSelected().length + '</b></span>'
+      + '<button class="desk-btn-plain"' + grantDis() + ' onclick="DESK.accPickAll(true)">Select all shown</button>'
+      + '<button class="desk-btn-plain" onclick="DESK.accClearSel()">Clear</button>'
+      + '<button class="desk-btn"' + grantDis() + ' onclick="DESK.accSelGrant()">Allow selected</button>'
+      + '<button class="desk-btn-plain danger"' + grantDis() + ' onclick="DESK.accSelRevoke()">Revoke selected</button>'
+      + '<button class="desk-btn-plain"' + (accExt() ? grantDis() : ' disabled title="Needs the extra whitelist columns"') + ' onclick="DESK.accSelLevel(\'view\')">Make read-only</button>'
+      + '<button class="desk-btn-plain"' + (accExt() ? grantDis() : ' disabled') + ' onclick="DESK.accSelLevel(\'full\')">Make full access</button>'
+      + '<button class="desk-btn-plain"' + (accExt() ? grantDis() : ' disabled') + ' onclick="DESK.accSelExpiry()">Set expiry\u2026</button>'
+      + '<button class="desk-btn-plain" onclick="DESK.accSelResync()">Re-sync orders</button>'
+      + '<button class="desk-btn-plain" onclick="DESK.accExport()">Export CSV</button>'
+      + '</div>';
+  }
+
+  // ---------- Access list (the roster) ----------
+  var ACC_LIST_VIEWS = [['', 'Everyone'], ['view-only', 'Read-only'], ['expired', 'Expired'],
+    ['unknown', 'No history'], ['invalid', 'Bad format']];
+
+  function accessRosterHtml() {
+    var c = (S.access && S.access.counts) || {};
+    var html = accOptsBar()
+      + '<div class="desk-acc-filter">'
+      + '<input id="AccRq" class="desk-input" placeholder="Filter number, name or note" value="' + esc(S.accessListFilter.q) + '"'
+      + ' onkeydown="if(event.key===\'Enter\'){DESK.accListSearch();}">'
+      + '<button class="desk-btn-plain" onclick="DESK.accListSearch()">Filter</button>'
+      + '<label class="desk-check"><input type="checkbox"' + (S.accessListFilter.dormant ? ' checked' : '')
+      + ' onchange="DESK.accListDormant(this.checked)"> Only dormant</label>'
+      + '<button class="desk-btn-plain" onclick="DESK.loadAccessRoster(true)">Reload</button>'
+      + '<span class="desk-acc-views">' + ACC_LIST_VIEWS.map(function (v) {
+        return '<button class="desk-mode' + ((S.accessListFilter.view || '') === v[0] ? ' active' : '')
+          + '" onclick="DESK.accListView(\'' + v[0] + '\')">' + v[1] + '</button>';
+      }).join('') + '</span></div>';
+    html += '<div class="desk-set-sec">Maintenance</div><div class="desk-acc-clean">'
+      + '<button class="desk-btn-plain"' + grantDis() + ' onclick="DESK.accCleanup(\'expired\')">Remove expired' + (c.granted_expired ? ' (' + accNum(c.granted_expired) + ')' : '') + '</button>'
+      + '<button class="desk-btn-plain"' + grantDis() + ' onclick="DESK.accCleanup(\'invalid\')">Remove bad numbers' + (c.granted_invalid ? ' (' + accNum(c.granted_invalid) + ')' : '') + '</button>'
+      + '<button class="desk-btn-plain"' + grantDis() + ' onclick="DESK.accCleanup(\'dormant\')">Remove dormant' + (c.granted_dormant ? ' (' + accNum(c.granted_dormant) + ')' : '') + '</button>'
+      + '<button class="desk-btn-plain"' + grantDis() + ' onclick="DESK.accCleanup(\'unknown\')">Remove unmatched</button>'
+      + '<button class="desk-btn-plain"' + grantDis() + ' onclick="DESK.accCleanup(\'duplicates\')">Merge duplicate spellings</button>'
+      + (isAdmin() ? '<button class="desk-btn-plain danger" onclick="DESK.accClearAll()">Revoke everyone</button>' : '')
+      + '</div>';
+    html += '<div class="desk-set-sec">Add a batch by pasting numbers</div>'
+      + '<textarea id="AccImport" class="desk-acc-import" placeholder="9876543210, +91 98765 43210, 919876543210 \u2014 a whole column from a sheet works. The level, expiry and note above are applied to all of them."></textarea>'
+      + '<div style="margin-top:8px"><button class="desk-btn"' + grantDis() + ' onclick="DESK.accImport()">Import and allow</button></div>';
+    html += '<div id="AccRosterTable">' + accRosterTableHtml() + '</div>';
+    return html;
+  }
+
+  function accListFiltered() {
+    var rows = S.accessList || [];
+    var f = S.accessListFilter;
+    var digits = String(f.q || '').replace(/\D/g, '');
+    var text = String(f.q || '').trim().toLowerCase();
+    return rows.filter(function (r) {
+      if (f.view && (r.flags || []).indexOf(f.view) === -1) return false;
+      if (digits) return String(r.phone).indexOf(digits) !== -1;
+      if (text) return (String(r.name || '') + ' ' + String(r.note || '')).toLowerCase().indexOf(text) !== -1;
+      return true;
+    });
+  }
+
+  function accRosterTableHtml() {
+    if (S.accessList === null) return '<div class="desk-loading"><span class="desk-spin"></span>Loading the access list\u2026</div>';
+    if (S.accessListError) return '<div class="desk-set-sub">' + esc(S.accessListError) + '</div>';
+    var rows = accListFiltered();
+    var html = accSelBar();
+    if (!rows.length) return html + '<div class="desk-set-sub">Nobody on the access list matches this filter.</div>';
+    html += '<div class="desk-tblwrap"><table class="desk-tbl"><tr><th></th><th>Phone</th><th>Customer</th><th>Level</th>'
+      + '<th>Source</th><th>Expires</th><th class="num">Live</th><th class="num">Orders</th><th>Last activity</th><th>Note</th><th class="acts"></th></tr>';
+    rows.forEach(function (r) {
+      html += '<tr><td><input type="checkbox" data-ph="' + esc(r.phone) + '"' + (S.accessSel[r.phone] ? ' checked' : '')
+        + ' onchange="DESK.accPick(\'' + esc(r.phone) + '\', this.checked)"></td>'
+        + '<td style="font-family:monospace">' + esc(r.phone)
+        + ((r.flags && r.flags.length) ? '<span class="desk-acc-flags">' + esc(r.flags.join(' \u00b7 ')) + '</span>' : '') + '</td>'
+        + '<td>' + esc(r.name || '\u2013') + '</td>'
+        + '<td>' + (r.level === 'view' ? 'Read-only' : 'Full') + '</td>'
+        + '<td>' + esc(r.source || 'manual') + '</td>'
+        + '<td>' + (r.expiresAt ? fmtTime(r.expiresAt) : '\u2013') + '</td>'
+        + '<td class="num">' + (r.openTickets || 0) + '</td>'
+        + '<td class="num">' + (r.orders || 0) + '</td>'
+        + '<td>' + fmtTime(r.lastActivity) + '</td>'
+        + '<td>' + esc(r.note || '') + '</td>'
+        + '<td class="acts"><button class="desk-btn-plain danger"' + grantDis()
+        + ' onclick="DESK.accRevokeOne(\'' + esc(r.phone) + '\')">Remove</button></td></tr>';
+    });
+    return html + '</table></div>';
+  }
+
+  function accVisibleRows() {
+    return S.accessSection === 'roster' ? accListFiltered() : (S.accessRows || []);
+  }
+
+  // ---------- Policy ----------
+  function accessPolicyHtml() {
+    var p = (S.access && S.access.policy) || {};
+    var html = isAdmin() ? '' : '<div class="desk-ro-note">Read-only \u2014 the access policy is reserved for the master admin.</div>';
+    html += '<div class="desk-set-sub">Everything here applies to the next grant, plus the two dormancy/auto-grant windows used by the segments. Changes land within a minute for everyone already signed in.</div>';
+    html += '<div class="desk-form-grid">'
+      + '<div><label>Default access level</label><select id="ApDefaultLevel">'
+      + '<option value="full"' + (p.defaultLevel === 'view' ? '' : ' selected') + '>Full \u2014 can raise tickets</option>'
+      + '<option value="view"' + (p.defaultLevel === 'view' ? ' selected' : '') + '>Read-only</option></select></div>'
+      + '<div><label>Default length (days, 0 = never)</label><input id="ApDefaultDays" type="number" min="0" value="' + (p.defaultDays || 0) + '"></div>'
+      + '<div><label>Dormancy window (days)</label><input id="ApDormantDays" type="number" min="0" value="' + (p.dormantRevokeDays || 0) + '"></div>'
+      + '<div><label>Auto-grant channel</label><select id="ApAutoGrantChannel">'
+      + '<option value="website"' + (p.autoGrantChannel === 'any' ? '' : ' selected') + '>Website tickets only</option>'
+      + '<option value="any"' + (p.autoGrantChannel === 'any' ? ' selected' : '') + '>Tickets from any channel</option></select></div>'
+      + '</div>';
+    html += '<div class="desk-set-sec">Rules</div>';
+    ACC_TOGGLES.forEach(function (t) {
+      html += '<label class="desk-acc-toggle"><input id="Ap' + t[0] + '" type="checkbox"' + (p[t[0]] === false ? '' : ' checked')
+        + (isAdmin() ? '' : ' disabled') + '><span><b>' + t[1] + '</b><em>' + t[2] + '</em></span></label>';
+    });
+    html += '<div style="margin-top:14px"><button class="desk-btn"' + adminOnly() + ' onclick="DESK.saveAccessPolicy()">Save policy</button></div>';
+    return html;
+  }
+
+  // ---------- loaders ----------
+  function paintAccess() {
+    var el = $('AccRoot');
+    if (el && S.modal && S.modal.tab === 'whitelist') el.innerHTML = accessHtml();
+  }
+  function accFill() {
+    if (!S.access) return;
+    if (S.accessSection === 'roster') loadAccessRoster();
+    else if (S.accessSection === 'segments') loadAccPreview(S.accessRowsFor !== S.accessSegment);
+  }
+  function loadAccessTab() {
+    if (S.access) { accFill(); refreshAccessCounts(); return; }
+    api('/api/support/admin/access/overview').then(function (d) {
+      S.access = d;
+      paintAccess();
+      accFill();
+    }).catch(function (e) {
+      var el = $('AccRoot');
+      if (el) el.innerHTML = '<div class="desk-set-sub">' + esc(e.message) + '</div>';
+    });
+  }
+  // Re-opening the tab repaints from cache instantly, then corrects the numbers
+  // in the background: another agent may have granted or cleaned up meanwhile.
+  function refreshAccessCounts() {
+    api('/api/support/admin/access/overview').then(function (d) {
+      if (!S.modal || S.modal.tab !== 'whitelist') return;
+      var act = document.activeElement;
+      // never stomp on a half-typed search or filter
+      if (act && /^Acc|^Ap/.test(String(act.id || ''))) return;
+      S.access = d;
+      // The policy form is all inputs, so a silent repaint would throw away
+      // unsaved edits; it refreshes on the next real navigation instead.
+      if (S.accessSection !== 'policy') paintAccess();
+    }).catch(function () {});
+  }
+  function reloadAccess() {
+    S.access = null; S.accessList = null; S.accessRows = null; S.accessRowsFor = '';
+    paintAccess();
+    loadAccessTab();
+  }
+  function setAccessSection(sec) { S.accessSection = sec; paintAccess(); accFill(); }
+  function accJump(id) {
+    S.accessSection = 'segments';
+    S.accessSegment = id;
+    S.accessOffset = 0;
+    paintAccess();
+    loadAccPreview(true);
+  }
+  function accApplyFilter() {
+    S.accessFilter.q = (($('AccQ') || {}).value || '').trim();
+    S.accessFilter.roster = ($('AccRoster') || {}).value || '';
+    S.accessOffset = 0;
+    loadAccPreview(true);
+  }
+  function accPage(dir) {
+    var lim = Number(S.accessFilter.limit) || 200;
+    S.accessOffset = Math.max(0, (Number(S.accessOffset) || 0) + dir * lim);
+    loadAccPreview(true);
+  }
+  function loadAccPreview(force) {
+    var host = $('AccPreview');
+    if (!host || !S.access) return;
+    if (!force && S.accessRowsFor === S.accessSegment) { host.innerHTML = accPreviewHtml(); return; }
+    var seg = accSeg(S.accessSegment);
+    host.innerHTML = '<div class="desk-acc-preview"><div class="desk-acc-phead"><div><b>' + esc(seg ? seg.label : S.accessSegment)
+      + '</b><span>' + accNum(seg ? seg.count : 0) + ' customers match</span></div></div>'
+      + '<div class="desk-loading"><span class="desk-spin"></span>Loading\u2026</div></div>';
+    var f = S.accessFilter;
+    var want = S.accessSegment;
+    var url = '/api/support/admin/access/candidates?segment=' + encodeURIComponent(want)
+      + '&limit=' + (Number(f.limit) || 200) + '&offset=' + (Number(S.accessOffset) || 0)
+      + (f.q ? '&q=' + encodeURIComponent(f.q) : '')
+      + (f.roster ? '&roster=' + encodeURIComponent(f.roster) : '');
+    api(url).then(function (d) {
+      if (S.accessSegment !== want) return;   // a newer preview won the race
+      S.accessRows = d.rows || [];
+      S.accessRowsFor = want;
+      var h = $('AccPreview');
+      if (h && S.modal && S.modal.tab === 'whitelist' && S.accessSection === 'segments') h.innerHTML = accPreviewHtml();
+    }).catch(function (e) {
+      var h = $('AccPreview');
+      if (h && S.accessSegment === want) h.innerHTML = '<div class="desk-set-sub">' + esc(e.message) + '</div>';
+    });
+  }
+  function loadAccessRoster(force) {
+    if (force) { S.accessList = null; S.accessListError = ''; }
+    accPaintRoster();
+    if (S.accessList !== null) return;
+    var p = (S.access && S.access.policy) || {};
+    var url = '/api/support/admin/access/roster?limit=2000'
+      + (S.accessListFilter.dormant ? '&dormantDays=' + (Number(p.dormantRevokeDays) || 90) : '');
+    api(url).then(function (d) {
+      S.accessList = d.rows || [];
+      if (S.modal && S.modal.tab === 'whitelist' && S.accessSection === 'roster') accPaintRoster();
+    }).catch(function (e) {
+      S.accessList = [];
+      S.accessListError = e.message;
+      accPaintRoster();
+    });
+  }
+  function accPaintRoster() {
+    var el = $('AccRosterTable');
+    if (el) el.innerHTML = accRosterTableHtml();
+  }
+  function accListDormant(on) { S.accessListFilter.dormant = !!on; loadAccessRoster(true); }
+  function accListSearch() {
+    S.accessListFilter.q = (($('AccRq') || {}).value || '').trim();
+    accPaintRoster();
+  }
+  function accListView(v) {
+    S.accessListFilter.view = v;
+    accPaintRoster();
+  }
+
+  // ---------- mutations ----------
+  // One status line plus one toast per action: the tab re-renders from the
+  // server afterwards, so nothing here patches rows by hand.
+  function accRun(p, onDone) {
+    var bar = $('AccStatus');
+    if (bar) bar.textContent = 'Working\u2026';
+    return p.then(onDone)
+      .catch(function (e) { toast(e.message, true); })
+      .then(function () { var b = $('AccStatus'); if (b) b.textContent = ''; });
+  }
+  function accBody(extra) {
+    var o = accOpts();
+    var body = { level: o.level, days: o.days, note: o.note, sync: o.sync };
+    for (var k in (extra || {})) { if (extra.hasOwnProperty(k)) body[k] = extra[k]; }
+    return body;
+  }
+  function accWritten() {
+    S.accessSel = {};
+    S.accessList = null; S.accessListError = '';
+    S.accessRows = null; S.accessRowsFor = '';
+    return api('/api/support/admin/access/overview').then(function (d) {
+      S.access = d;
+      paintAccess();
+      accFill();
+    }).catch(function (e) {
+      toast(e.message, true);
+      paintAccess();
+    });
+  }
+  function accGrantDone(r) {
+    var bits = [accNum((r.granted || 0) + (r.updated || 0)) + ' allowed'];
+    if (r.invalid && r.invalid.length) bits.push(accNum(r.invalid.length) + ' invalid skipped');
+    if (r.skipped && r.skipped.length) bits.push(accNum(r.skipped.length) + ' unknown skipped');
+    if (r.sync) bits.push(accNum(r.sync.orders) + ' orders pulled');
+    if (r.schemaLimited) bits.push('level/expiry need the new columns');
+    toast(bits.join(' \u00b7 '));
+    accWritten();
+  }
+  function accGrantUrl() { return '/api/support/admin/access/grant'; }
+
+  function accGrantSegment(id) {
+    var seg = accSeg(id);
+    if (!seg) return;
+    if (!window.confirm('Give support access to all ' + accNum(seg.count) + ' customers in \u201c' + seg.label + '\u201d?')) return;
+    accRun(api(accGrantUrl(), { method: 'POST', body: accBody({ segment: id }) }), accGrantDone);
+  }
+  function accSelGrant() {
+    var phones = accNeedSel();
+    if (!phones) return;
+    accRun(api(accGrantUrl(), { method: 'POST', body: accBody({ phones: phones }) }), accGrantDone);
+  }
+  function accAddOne() {
+    var ph = window.prompt('Number to allow (10 digits, or 91XXXXXXXXXX):');
+    if (!ph || !ph.trim()) return;
+    accRun(api(accGrantUrl(), { method: 'POST', body: accBody({ phones: [ph.trim()] }) }), accGrantDone);
+  }
+  function accImport() {
+    var ta = $('AccImport');
+    var text = ((ta || {}).value || '').trim();
+    if (!text) return toast('Paste some numbers first', true);
+    accRun(api('/api/support/admin/access/import', { method: 'POST', body: accBody({ text: text }) }), function (r) {
+      if (ta) ta.value = '';
+      accGrantDone(r);
+    });
+  }
+  // Re-point the list at one segment: everyone outside it loses access, so
+  // this stays master-admin only and asks twice over.
+  function accAllowOnly(id) {
+    var seg = accSeg(id);
+    if (!seg) return;
+    if (!window.confirm('Replace the whole access list with \u201c' + seg.label + '\u201d?\n\nAnyone currently allowed who is NOT in this segment loses the Help & Tickets tab immediately.')) return;
+    accRun(api('/api/support/admin/access/sync-to-segment', { method: 'POST', body: { segment: id, note: accOpts().note } }), function (r) {
+      toast('List re-pointed: ' + accNum(r.granted) + ' added, ' + accNum(r.revoked) + ' removed');
+      accWritten();
+    });
+  }
+  function accSelRevoke() {
+    var phones = accNeedSel();
+    if (!phones) return;
+    if (!window.confirm('Revoke access for ' + phones.length + ' numbers? Their cached orders are dropped too.')) return;
+    accRun(api('/api/support/admin/access/revoke', { method: 'POST', body: { phones: phones } }), function (r) {
+      toast(accNum(r.revoked) + ' revoked');
+      accWritten();
+    });
+  }
+  function accRevokeOne(ph) {
+    if (!window.confirm('Revoke access for ' + ph + '?')) return;
+    accRun(api('/api/support/admin/access/revoke', { method: 'POST', body: { phones: [ph] } }), function (r) {
+      toast(accNum(r.revoked) + ' revoked');
+      accWritten();
+    });
+  }
+  function accClearAll() {
+    if (!window.confirm('Revoke ALL support access? Every customer loses the Help & Tickets tab until they are added back.')) return;
+    accRun(api('/api/support/admin/access/revoke', { method: 'POST', body: { all: true } }), function (r) {
+      toast(accNum(r.revoked) + ' revoked');
+      accWritten();
+    });
+  }
+  function accSelLevel(level) {
+    var phones = accNeedSel();
+    if (!phones) return;
+    accRun(api('/api/support/admin/access/update', { method: 'POST', body: { phones: phones, level: level } }), function (r) {
+      toast(accNum(r.updated) + ' set to ' + (level === 'view' ? 'read-only' : 'full access'));
+      accWritten();
+    });
+  }
+  function accSelExpiry() {
+    var phones = accNeedSel();
+    if (!phones) return;
+    var v = window.prompt('Access expires after how many days? (0 = never)', String((S.access.policy || {}).defaultDays || 0));
+    if (v === null) return;
+    accRun(api('/api/support/admin/access/update', { method: 'POST', body: { phones: phones, days: Number(v) || 0 } }), function (r) {
+      toast(accNum(r.updated) + ' updated');
+      accWritten();
+    });
+  }
+  function accSelResync() {
+    var phones = accNeedSel();
+    if (!phones) return;
+    accRun(api('/api/support/admin/access/resync', { method: 'POST', body: { phones: phones } }), function (r) {
+      toast(accNum(r.orders) + ' orders pulled for ' + accNum(r.synced) + ' customers'
+        + (r.failed ? ', ' + accNum(r.failed) + ' failed' : '')
+        + (r.capped ? ' (capped \u2014 run again for the rest)' : ''));
+    });
+  }
+  function accCleanup(kind) {
+    var labels = {
+      expired: 'the expired grants', invalid: 'the numbers that are not valid Indian mobiles',
+      dormant: 'the grants with no order or ticket inside the dormancy window',
+      unknown: 'the numbers that match no known customer',
+      duplicates: 'the duplicate spellings of the same number'
+    };
+    var body = { kind: kind };
+    if (kind === 'dormant') {
+      var v = window.prompt('Revoke anyone inactive for more than how many days?', String((S.access.policy || {}).dormantRevokeDays || 90));
+      if (v === null) return;
+      body.days = Number(v) || 0;
+    }
+    if (!window.confirm('Remove ' + (labels[kind] || kind) + ' from the access list?')) return;
+    accRun(api('/api/support/admin/access/cleanup', { method: 'POST', body: body }), function (r) {
+      toast(accNum(r.removed) + ' removed');
+      accWritten();
+    });
+  }
+
+  // ---------- selection ----------
+  function accPick(ph, on) {
+    if (on) S.accessSel[ph] = true; else delete S.accessSel[ph];
+    var el = $('AccSelN');
+    if (el) el.textContent = accSelected().length;
+  }
+  function accPickAll(on) {
+    accVisibleRows().forEach(function (r) { if (on) S.accessSel[r.phone] = true; else delete S.accessSel[r.phone]; });
+    var boxes = document.querySelectorAll('#AccessBody input[data-ph]');
+    for (var i = 0; i < boxes.length; i++) {
+      boxes[i].checked = !!S.accessSel[boxes[i].getAttribute('data-ph')];
+    }
+    var n = $('AccSelN');
+    if (n) n.textContent = accSelected().length;
+  }
+  function accClearSel() {
+    S.accessSel = {};
+    accPickAll(false);
+  }
+
+  // ---------- export ----------
+  function accExport() {
+    var sel = accSelected();
+    var src = accVisibleRows();
+    var rows = sel.length ? src.filter(function (r) { return !!S.accessSel[r.phone]; }) : src;
+    if (!rows.length) return toast('Nothing to export', true);
+    var out = ['phone,name,level,expires_at,source,note,live_tickets,total_tickets,orders,last_activity'];
+    rows.forEach(function (r) {
+      out.push([r.phone, r.name || '', r.level || 'full', r.expiresAt ? new Date(r.expiresAt).toISOString() : '',
+        r.source || r.grantSource || '', r.note || '', r.openTickets || 0, r.totalTickets || 0, r.orders || 0,
+        r.lastActivity ? new Date(r.lastActivity).toISOString() : '']
+        .map(function (v) { return '"' + String(v).replace(/"/g, '""') + '"'; }).join(','));
+    });
+    accDownload('support-access-' + (S.accessSection === 'roster' ? 'list' : S.accessSegment) + '.csv', out.join('\r\n'));
+    toast('Exported ' + accNum(rows.length) + ' rows');
+  }
+  function accDownload(name, text) {
+    try {
+      var url = URL.createObjectURL(new Blob([text], { type: 'text/csv' }));
+      var a = document.createElement('a');
+      a.href = url;
+      a.download = name;
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+      setTimeout(function () { URL.revokeObjectURL(url); }, 4000);
+    } catch (e) { toast('The browser blocked the download', true); }
+  }
+
+  // ---------- policy writes ----------
+  function setAccessMode(m) {
+    var value = {};
+    var p = S.access.policy || {};
+    for (var k in p) { if (p.hasOwnProperty(k)) value[k] = p[k]; }
+    value.mode = m;
+    accRun(api('/api/support/admin/access/policy', { method: 'PUT', body: { value: value } }), function (r) {
+      if (r && r.policy) S.access.policy = r.policy;
+      var def = null;
+      ACC_MODES.forEach(function (x) { if (x[0] === m) def = x; });
+      toast('Access mode: ' + (def ? def[1] : m));
+      accWritten();
+    });
+  }
+  function saveAccessPolicy() {
+    var value = {
+      defaultLevel: (($('ApDefaultLevel') || {}).value) || 'full',
+      defaultDays: Number(($('ApDefaultDays') || {}).value) || 0,
+      dormantRevokeDays: Number(($('ApDormantDays') || {}).value) || 0,
+      autoGrantChannel: (($('ApAutoGrantChannel') || {}).value) || 'website'
+    };
+    ACC_TOGGLES.forEach(function (t) { value[t[0]] = !!($('Ap' + t[0]) || {}).checked; });
+    accRun(api('/api/support/admin/access/policy', { method: 'PUT', body: { value: value } }), function (r) {
+      if (r && r.policy) S.access.policy = r.policy;
+      toast('Access policy saved');
+      accWritten();
+    });
+  }
+
   function saveSla() {
     api('/api/support/admin/settings/sla', { method: 'PUT', body: { value: {
       high_hours: Number(($('SlaHigh') || {}).value) || 4,
@@ -1461,18 +2116,6 @@
     api('/api/support/admin/settings/cost_config', { method: 'PUT', body: { value: v } })
       .then(function () { toast('Cost config saved'); return loadSettings(); })
       .then(renderSettingsTab).catch(function (e) { toast(e.message, true); });
-  }
-  function addWl() {
-    var ph = ($('WlPhone') || {}).value, note = ($('WlNote') || {}).value;
-    if (!ph) return;
-    api('/api/support/admin/whitelist', { method: 'POST', body: { phone: ph, note: note } })
-      .then(function () { toast('Phone whitelisted'); loadWhitelist(); })
-      .catch(function (e) { toast(e.message, true); });
-  }
-  function delWl(ph) {
-    api('/api/support/admin/whitelist/' + encodeURIComponent(ph), { method: 'DELETE' })
-      .then(function () { toast('Phone removed'); loadWhitelist(); })
-      .catch(function (e) { toast(e.message, true); });
   }
   function closeModal() {
     var m = $('DeskModal');
@@ -1920,7 +2563,17 @@
     agentReopen: agentReopen, approve: approve, decline: decline,
     openSettings: openSettings, setTab: setTab, saveSla: saveSla, saveTeams: saveTeams,
     addTeam: addTeam, delTeam: delTeam, addCanned: addCanned, delCanned: delCanned, saveCanned: saveCanned,
-    saveTemplates: saveTemplates, saveCost: saveCost, addWl: addWl, delWl: delWl,
+    saveTemplates: saveTemplates, saveCost: saveCost,
+    // access console (Access tab)
+    loadAccessTab: loadAccessTab, reloadAccess: reloadAccess, setAccessSection: setAccessSection,
+    setAccessMode: setAccessMode, saveAccessPolicy: saveAccessPolicy,
+    accJump: accJump, accApplyFilter: accApplyFilter, accPage: accPage,
+    accGrantSegment: accGrantSegment, accAllowOnly: accAllowOnly, accAddOne: accAddOne, accImport: accImport,
+    accPick: accPick, accPickAll: accPickAll, accClearSel: accClearSel,
+    accSelGrant: accSelGrant, accSelRevoke: accSelRevoke, accRevokeOne: accRevokeOne, accClearAll: accClearAll,
+    accSelLevel: accSelLevel, accSelExpiry: accSelExpiry, accSelResync: accSelResync, accCleanup: accCleanup,
+    accExport: accExport, loadAccessRoster: loadAccessRoster, accListDormant: accListDormant, accListView: accListView,
+    accListSearch: accListSearch,
     closeModal: closeModal, syncOrders: syncOrders, lightbox: lightbox,
     // portal engine tabs
     copyText: copyText, portalCreate: portalCreate, portalActive: portalActive, portalMax: portalMax,

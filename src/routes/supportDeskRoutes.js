@@ -4,10 +4,11 @@ const router = express.Router();
 const multer = require('multer');
 const Support = require('../services/supportService');
 const SupportSync = require('../services/supportSync');
+const SupportAccess = require('../services/supportAccessService');
 const shopifyService = require('../services/shopifyService');
 const razorpayService = require('../services/razorpayService');
 const cloudinary = require('../services/cloudinaryService');
-const { verifyToken, requirePermission } = require('../middleware/auth');
+const { verifyToken, requirePermission, requireAdmin } = require('../middleware/auth');
 
 // ============================================================
 // Support Desk API — the premium agent dashboard at /desk.
@@ -576,7 +577,7 @@ router.post('/upload', upload.array('images', 4), async (req, res) => {
 // ── Admin settings ──
 // 'portal_routing' is the desk auto-pilot toggle consumed by
 // Support.autoRouteTicket when a new ticket is created.
-const SETTING_KEYS = ['sla', 'teams', 'canned_responses', 'resolution_templates', 'cost_config', 'portal_routing'];
+const SETTING_KEYS = ['sla', 'teams', 'canned_responses', 'resolution_templates', 'cost_config', 'portal_routing', 'access'];
 router.get('/settings', async (req, res) => {
     try {
         res.json(await Support.getAllSettings());
@@ -632,6 +633,223 @@ router.delete('/whitelist/:phone', async (req, res) => {
     } catch (error) {
         console.error('[Support Desk] whitelist remove error:', error.message);
         res.status(500).json({ error: 'Failed to remove phone' });
+    }
+});
+
+// ============================================================
+// Access console — segments, bulk grants and the access policy.
+//
+// The whitelist decides who gets the storefront Help & Tickets tab,
+// so every mutation here goes through supportAccessService (which
+// owns the shared snapshot) and invalidates it, rather than writing
+// rows from three different places.
+//
+// Authority split: desk agents may add and remove numbers when the
+// policy allows it, but anything that changes who gets in *globally*
+// — the mode, the policy, emptying the list, re-pointing the whole
+// list at a segment — stays master-admin only.
+// ============================================================
+
+// Shopify order sync is rate-limited, so a bulk grant only pulls orders
+// for the head of the list; beyond that the desk points at "Re-sync".
+const GRANT_SYNC_CAP = 100;
+
+async function resolvePhones(req) {
+    const body = req.body || {};
+    if (Array.isArray(body.phones)) return body.phones;
+    if (body.segment) return SupportAccess.segmentPhones(body.segment);
+    if (body.text) return SupportAccess.parseImport(body.text).valid;
+    return [];
+}
+
+// Grants/requisitions honour the policy's agentMayGrant toggle; global
+// switches never do.
+async function mayManageGrants(req, res, next) {
+    try {
+        if (req.admin && req.admin.role === 'admin') return next();
+        const policy = await SupportAccess.getPolicy();
+        if (!policy.agentMayGrant) {
+            return res.status(403).json({ error: 'Access changes are restricted to the master admin (see Access › Policy).' });
+        }
+        next();
+    } catch (e) {
+        next(e);
+    }
+}
+
+async function syncOrdersBounded(phones) {
+    const targets = phones.slice(0, GRANT_SYNC_CAP);
+    let orders = 0;
+    let failed = 0;
+    // Five at a time: enough to keep a 100-number grant under a minute,
+    // few enough to stay clear of the Shopify API rate budget.
+    for (let i = 0; i < targets.length; i += 5) {
+        const batch = targets.slice(i, i + 5);
+        const results = await Promise.all(batch.map(p =>
+            SupportSync.syncOrdersForPhone(p).then(r => r.orders || 0).catch(() => { failed++; return 0; })
+        ));
+        orders += results.reduce((a, b) => a + b, 0);
+    }
+    return { synced: targets.length, orders, failed, capped: phones.length > targets.length };
+}
+
+router.get('/access/overview', async (req, res) => {
+    try {
+        res.json(await SupportAccess.overview());
+    } catch (error) {
+        console.error('[Support Desk] access overview error:', error.message);
+        res.status(500).json({ error: 'Failed to load access overview: ' + error.message });
+    }
+});
+
+router.get('/access/roster', async (req, res) => {
+    try {
+        res.json({ rows: await SupportAccess.listRoster({ limit: req.query.limit, dormantDays: req.query.dormantDays }) });
+    } catch (error) {
+        console.error('[Support Desk] access roster error:', error.message);
+        res.status(500).json({ error: 'Failed to load the access list: ' + error.message });
+    }
+});
+
+router.get('/access/candidates', async (req, res) => {
+    try {
+        if (!req.query.segment) return res.status(400).json({ error: 'segment is required' });
+        res.json(await SupportAccess.candidates(req.query.segment, {
+            q: req.query.q, roster: req.query.roster, limit: req.query.limit, offset: req.query.offset
+        }));
+    } catch (error) {
+        console.error('[Support Desk] access candidates error:', error.message);
+        res.status(400).json({ error: error.message });
+    }
+});
+
+router.post('/access/grant', mayManageGrants, async (req, res) => {
+    try {
+        const body = req.body || {};
+        const phones = await resolvePhones(req);
+        if (!phones.length) return res.status(400).json({ error: 'Nothing to grant — no numbers matched' });
+        const policy = await SupportAccess.getPolicy();
+        const result = await SupportAccess.bulkGrant(phones, {
+            addedBy: agentName(req),
+            note: body.note || null,
+            days: body.days,
+            level: body.level,
+            source: body.segment ? `segment:${body.segment}`.slice(0, 40) : (body.source || 'manual'),
+            policy
+        });
+        const wantSync = body.sync !== undefined ? !!body.sync : policy.syncOnGrant;
+        const sync = wantSync ? await syncOrdersBounded(result.phones || []) : null;
+        res.json({ success: true, ...result, sync });
+    } catch (error) {
+        console.error('[Support Desk] access grant error:', error.message);
+        res.status(400).json({ error: error.message });
+    }
+});
+
+router.post('/access/revoke', mayManageGrants, async (req, res) => {
+    try {
+        const body = req.body || {};
+        let phones;
+        if (body.all) {
+            if (req.admin && req.admin.role !== 'admin') {
+                return res.status(403).json({ error: 'Clearing the whole access list is master-admin only.' });
+            }
+            phones = await SupportAccess.segmentPhones('granted');
+        } else {
+            phones = await resolvePhones(req);
+        }
+        if (!phones.length) return res.status(400).json({ error: 'Nothing to revoke' });
+        const result = await SupportAccess.bulkRevoke(phones);
+        res.json({ success: true, ...result });
+    } catch (error) {
+        console.error('[Support Desk] access revoke error:', error.message);
+        res.status(400).json({ error: error.message });
+    }
+});
+
+// "Allow only this group": grants everyone the segment matches and revokes
+// everyone it does not, so the list can be re-pointed in one action.
+router.post('/access/sync-to-segment', requireAdmin, async (req, res) => {
+    try {
+        const { segment, note } = req.body || {};
+        if (!segment) return res.status(400).json({ error: 'segment is required' });
+        const result = await SupportAccess.syncListToSegment(segment, { addedBy: agentName(req), note });
+        res.json({ success: true, ...result });
+    } catch (error) {
+        console.error('[Support Desk] access sync-to-segment error:', error.message);
+        res.status(400).json({ error: error.message });
+    }
+});
+
+router.post('/access/update', mayManageGrants, async (req, res) => {
+    try {
+        const body = req.body || {};
+        const phones = await resolvePhones(req);
+        if (!phones.length) return res.status(400).json({ error: 'Nothing selected' });
+        const result = await SupportAccess.updateGrants(phones, { level: body.level, days: body.days, note: body.note });
+        res.json({ success: true, ...result });
+    } catch (error) {
+        console.error('[Support Desk] access update error:', error.message);
+        res.status(400).json({ error: error.message });
+    }
+});
+
+router.post('/access/cleanup', mayManageGrants, async (req, res) => {
+    try {
+        const { kind, days } = req.body || {};
+        const result = await SupportAccess.cleanup(kind, { days });
+        res.json({ success: true, ...result });
+    } catch (error) {
+        console.error('[Support Desk] access cleanup error:', error.message);
+        res.status(400).json({ error: error.message });
+    }
+});
+
+// Paste a column of numbers from a sheet or an export; the service normalizes
+// and dedupes before anything is written.
+router.post('/access/import', mayManageGrants, async (req, res) => {
+    try {
+        const body = req.body || {};
+        const parsed = SupportAccess.parseImport(body.text);
+        if (!parsed.valid.length) {
+            return res.status(400).json({ error: 'No valid phone numbers found', invalid: parsed.invalid });
+        }
+        const policy = await SupportAccess.getPolicy();
+        const result = await SupportAccess.bulkGrant(parsed.valid, {
+            addedBy: agentName(req),
+            note: body.note || null,
+            days: body.days,
+            level: body.level,
+            source: 'import',
+            policy
+        });
+        res.json({ success: true, parsed: parsed.valid.length, ignored: parsed.invalid.length, ...result });
+    } catch (error) {
+        console.error('[Support Desk] access import error:', error.message);
+        res.status(400).json({ error: error.message });
+    }
+});
+
+// Re-pull Shopify orders for a selection without touching access itself.
+router.post('/access/resync', async (req, res) => {
+    try {
+        const phones = await resolvePhones(req);
+        if (!phones.length) return res.status(400).json({ error: 'Nothing selected' });
+        res.json({ success: true, ...(await syncOrdersBounded(phones)) });
+    } catch (error) {
+        console.error('[Support Desk] access resync error:', error.message);
+        res.status(400).json({ error: error.message });
+    }
+});
+
+router.put('/access/policy', requireAdmin, async (req, res) => {
+    try {
+        const value = req.body && req.body.value;
+        if (!value || typeof value !== 'object') return res.status(400).json({ error: 'Policy must be an object' });
+        res.json({ success: true, policy: await SupportAccess.savePolicy(value) });
+    } catch (error) {
+        console.error('[Support Desk] access policy error:', error.message);
+        res.status(400).json({ error: error.message });
     }
 });
 
