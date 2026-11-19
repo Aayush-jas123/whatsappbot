@@ -4991,7 +4991,7 @@ tr.ict-detail-row td { background: rgba(255,255,255,0.02); padding: 1rem 1.1rem;
 
 /* Bulk Out max hint + zero projection */
 .sr-bulk-max { font-size: 0.72rem; color: rgba(255,255,255,0.35); margin-left: 4px; }
-.sr-bulk-projected.sr-zero { color: #ff4757; font-weight: 700; }
+.sr-bulk-projected-input.sr-zero { color: #ff4757; font-weight: 700; }
 
 /* Loading & empty */
 .sr-loading { display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 1rem; padding: 4rem; color: rgba(255,255,255,0.5); }
@@ -5060,13 +5060,16 @@ tr.ict-detail-row td { background: rgba(255,255,255,0.02); padding: 1rem 1.1rem;
     border-bottom: 1px solid rgba(255,255,255,0.08);
 }
 .sr-bulk-table tbody td { padding: 0.5rem 0.75rem; border-bottom: 1px solid rgba(255,255,255,0.04); }
-.sr-bulk-qty-input {
+.sr-bulk-qty-input, .sr-bulk-projected-input {
     width: 60px; background: rgba(255,255,255,0.08); border: 1px solid rgba(255,255,255,0.15);
     color: #fff; padding: 0.3rem 0.5rem; border-radius: 4px; font-size: 0.8rem;
     text-align: center; font-family: 'Inter', sans-serif;
 }
-.sr-bulk-qty-input:focus { border-color: #fff; outline: none; }
-.sr-bulk-projected.sr-reorder { color: #ffa502; }
+.sr-bulk-qty-input:focus, .sr-bulk-projected-input:focus { border-color: #fff; outline: none; }
+/* Projected is editable but stays visually secondary: it reads as a value until it is touched */
+.sr-bulk-projected-input { background: transparent; border-color: rgba(255,255,255,0.12); border-style: dashed; width: 72px; }
+.sr-bulk-proj-hint { display: block; font-size: 0.65rem; color: #ff4757; margin-top: 2px; }
+.sr-bulk-projected-input.sr-reorder { color: #ffa502; }
 .sr-bulk-remove { background: none; border: none; color: rgba(255,255,255,0.3); cursor: pointer; font-size: 1.1rem; padding: 2px 6px; }
 .sr-bulk-remove:hover { color: #ff4757; }
 

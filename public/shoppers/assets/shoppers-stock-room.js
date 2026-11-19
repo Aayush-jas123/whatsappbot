@@ -768,6 +768,22 @@
 
     function bulkQtyInput(skuKey) { return bulkCell('[data-sr-bulk-qty]', 'srBulkQty', skuKey); }
 
+    function bulkProjInput(skuKey) { return bulkCell('[data-sr-bulk-proj]', 'srBulkProj', skuKey); }
+
+    // The explanation under a Projected field is owned solely by the entry path, so a background
+    // repaint can never erase a message the operator still needs to read.
+    function setProjHint(skuKey, text) {
+        const hint = bulkCell('[data-sr-bulk-projh]', 'srBulkProjh', skuKey);
+        if (hint) hint.textContent = text;
+    }
+
+    // The valid Projected window for a row. Bulk Out against zero stock has no reachable target, so
+    // both bounds come back null rather than an impossible min > max pair.
+    function projBounds(curQty, isOut) {
+        if (!isOut) return { min: curQty + 1, max: null };
+        return curQty >= 1 ? { min: 0, max: curQty - 1 } : { min: null, max: null };
+    }
+
     // CURRENT must come from the full snapshot, never SR.inventory — that is the toolbar-filtered
     // subset, so any SKU the operator had filtered out would read back as 0 in stock.
     function stockRow(skuKey) {
@@ -795,6 +811,46 @@
         if (commit && item.qty < 1) item.qty = 1;
         refreshBulkDerived();
         if (commit) { const input = bulkQtyInput(skuKey); if (input) input.value = item.qty; }
+    }
+
+    // An impossible target leaves qty exactly as it was, puts the last valid Projected back into the
+    // field and says why. bulkItems[].qty stays the only stored number either way.
+    function revertProjected(skuKey, item, curQty, message) {
+        refreshBulkDerived();
+        const el = bulkProjInput(skuKey);
+        if (el) el.value = SR.bulkOutMode ? curQty - item.qty : curQty + item.qty;
+        setProjHint(skuKey, message);
+    }
+
+    // Projected is the second entry surface: typing the stock level you want to land on derives the
+    // delta. Both endpoints reject quantity <= 0 for the whole batch, so a target that would derive
+    // a zero or negative delta is never committed.
+    function updateBulkProjected(skuKey, value, commit = true) {
+        const item = SR.bulkItems.find(b => b.sku_key === skuKey);
+        if (!item) return;
+        const current = stockRow(skuKey);
+        const curQty = current ? current.quantity : 0;
+        const isOut = SR.bulkOutMode;
+        const n = parseInt(String(value).trim(), 10);
+        if (Number.isNaN(n)) {
+            if (!commit) return;                     // cleared or a lone '-', hold position
+            revertProjected(skuKey, item, curQty, 'Projected must be a number');
+            return;
+        }
+        const derived = isOut ? curQty - n : n - curQty;
+        // Hold while typing: current 78 -> 1200 passes through 1, 12 and 120, all momentarily
+        // invalid. Reverting on a keystroke would make the field impossible to use.
+        if (derived < 1 || (isOut && n < 0)) {
+            if (!commit) return;
+            revertProjected(skuKey, item, curQty, isOut
+                ? `Projected must be between 0 and ${Math.max(0, curQty - 1)}`
+                : `Projected must be at least ${curQty + 1}`);
+            return;
+        }
+        item.qty = derived;
+        setProjHint(skuKey, '');
+        refreshBulkDerived();
+        if (commit) { const el = bulkProjInput(skuKey); if (el) el.value = isOut ? curQty - item.qty : curQty + item.qty; }
     }
 
     function openBulkModal(outMode = false) { SR.bulkItems = []; SR.bulkSearch = ''; SR.bulkReference = ''; SR.bulkNotes = ''; SR.bulkOutMode = !!outMode; renderBulkModal(true); updateBulkModalChrome(); const m = document.getElementById('srBulkModal'); if (m) m.style.display = 'flex'; refreshBulkSnapshot(); }
@@ -858,14 +914,15 @@
                                 const current = stockRow(b.sku_key);
                                 const curQty = current ? current.quantity : 0;
                                 const proj = isOut ? curQty - b.qty : curQty + b.qty;
-                                const projClass = proj <= 0 ? 'sr-bulk-projected sr-zero' : proj <= (current?.reorder_level || 0) ? 'sr-bulk-projected sr-reorder' : 'sr-bulk-projected';
+                                const projClass = proj <= 0 ? ' sr-zero' : proj <= (current?.reorder_level || 0) ? ' sr-reorder' : '';
+                                const bounds = projBounds(curQty, isOut);
                                 const maxHint = isOut ? `<span class="sr-bulk-max" data-sr-bulk-maxh="${esc(b.sku_key)}" title="Max: ${curQty}">max ${curQty}</span>` : '';
                                 return `<tr>
                                     <td class="sr-bulk-product">${esc(b.product_name)}</td>
                                     <td class="sr-bulk-size">${esc(b.size)}</td>
                                     <td class="sr-bulk-current" data-sr-bulk-cur="${esc(b.sku_key)}">${num(curQty)}</td>
                                     <td><input type="number" min="1" ${isOut ? `max="${curQty}"` : ''} value="${b.qty}" class="sr-bulk-qty-input" data-sr-bulk-qty="${esc(b.sku_key)}">${maxHint}</td>
-                                    <td class="${projClass}" data-sr-bulk-proj="${esc(b.sku_key)}">${num(proj)}</td>
+                                    <td class="sr-bulk-proj-cell"><input type="number"${bounds.min === null ? '' : ` min="${bounds.min}"`}${bounds.max === null ? '' : ` max="${bounds.max}"`} value="${proj}" class="sr-bulk-projected-input${projClass}" data-sr-bulk-proj="${esc(b.sku_key)}"><span class="sr-bulk-proj-hint" data-sr-bulk-projh="${esc(b.sku_key)}"></span></td>
                                     <td><button class="sr-bulk-remove" data-sr="bulk-remove" data-sku="${esc(b.sku_key)}" title="Remove">&times;</button></td>
                                 </tr>`;
                             }).join('')}
@@ -909,8 +966,8 @@
         const isOut = SR.bulkOutMode;
         const totalEl = modal.querySelector('#srBulkTotalQty');
         if (totalEl) totalEl.textContent = `Total units: ${num(SR.bulkItems.reduce((s, b) => s + b.qty, 0))}`;
-        modal.querySelectorAll('[data-sr-bulk-proj]').forEach(td => {
-            const skuKey = td.dataset.srBulkProj;
+        modal.querySelectorAll('[data-sr-bulk-proj]').forEach(projInput => {
+            const skuKey = projInput.dataset.srBulkProj;
             const bulk = SR.bulkItems.find(b => b.sku_key === skuKey);
             if (!bulk) return;
             const current = stockRow(skuKey);
@@ -924,8 +981,17 @@
                 if (input) input.setAttribute('max', curQty);
             }
             const proj = isOut ? curQty - bulk.qty : curQty + bulk.qty;
-            td.className = proj <= 0 ? 'sr-bulk-projected sr-zero' : proj <= (current?.reorder_level || 0) ? 'sr-bulk-projected sr-reorder' : 'sr-bulk-projected';
-            td.textContent = num(proj);
+            projInput.className = 'sr-bulk-projected-input' + (proj <= 0 ? ' sr-zero' : proj <= (current?.reorder_level || 0) ? ' sr-reorder' : '');
+            // The bounds follow the live CURRENT, so a background stock change keeps the window honest
+            const bounds = projBounds(curQty, isOut);
+            if (bounds.min === null) projInput.removeAttribute('min'); else projInput.setAttribute('min', bounds.min);
+            if (bounds.max === null) projInput.removeAttribute('max'); else projInput.setAttribute('max', bounds.max);
+            // Never write into the field the operator is typing in — that is how a caret gets lost.
+            // The two entry surfaces are symmetric: typing Qty refreshes Projected, typing Projected
+            // refreshes Qty, and a background repaint touches neither while it holds focus.
+            if (projInput !== document.activeElement) projInput.value = proj;
+            const qtyInput = bulkQtyInput(skuKey);
+            if (qtyInput && qtyInput !== document.activeElement) qtyInput.value = bulk.qty;
         });
     }
 
@@ -1310,6 +1376,15 @@
         const view = document.getElementById('inventoryView');
         if (!view || view.style.display === 'none') return;
 
+        // Bulk projected input — typing derives the delta and patches cells in place; the hint goes
+        // away the moment the operator starts correcting, and an invalid target only reverts on commit
+        const projInput = e.target.closest('[data-sr-bulk-proj]');
+        if (projInput) {
+            const sku = projInput.dataset.srBulkProj;
+            if (sku) { setProjHint(sku, ''); updateBulkProjected(sku, projInput.value, false); }
+            return;
+        }
+
         // Bulk qty input — typing only patches the derived cells, never re-renders (that steals focus)
         const qtyInput = e.target.closest('[data-sr-bulk-qty]');
         if (qtyInput) {
@@ -1326,6 +1401,14 @@
     document.addEventListener('change', (e) => {
         const view = document.getElementById('inventoryView');
         if (!view || view.style.display === 'none') return;
+
+        // Bulk projected commit (blur or spinner) — derive the delta, or revert an impossible target
+        const projInput = e.target.closest('[data-sr-bulk-proj]');
+        if (projInput) {
+            const sku = projInput.dataset.srBulkProj;
+            if (sku) updateBulkProjected(sku, projInput.value, true);
+            return;
+        }
 
         // Bulk qty commit (blur or spinner) — clamp and write the normalised number back into the field
         const qtyInput = e.target.closest('[data-sr-bulk-qty]');
@@ -1382,6 +1465,7 @@
         addToBulk,
         removeFromBulk,
         updateBulkQty,
+        updateBulkProjected,
         openBulkModal,
         closeBulkModal,
         confirmBulkIn,
