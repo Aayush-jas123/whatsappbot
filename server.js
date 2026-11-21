@@ -334,6 +334,11 @@ app.use('/api/order-confirmation', orderConfirmationRoutes);
 const abandonedCartCron = require('./src/services/abandonedCartCron');
 const reengagementCron = require('./src/services/reengagementCron');
 const shipmentSyncCron = require('./src/services/shipmentSyncCron');
+// Delivered COD orders → Zoho invoice payments. The live carrier hook fires
+// once at the delivery transition and never looks again, so a rate limit or a
+// not-yet-synced invoice left the order unpaid permanently. This sweep is the
+// backstop that actually drains that backlog.
+const zohoCodSweepCron = require('./src/services/zohoCodSweepCron');
 
 // Periodic duplicate invoice sweeper — runs every 15 min to catch any
 // invoices created by the native Zoho ↔ Shopify integration
@@ -797,6 +802,7 @@ async function startServer() {
         abandonedCartCron.init();
         reengagementCron.init();
         shipmentSyncCron.init();
+        if (process.env.ZOHO_ORGANIZATION_ID) zohoCodSweepCron.init();
 
         // Keep the Inventory Control Tower's 3-min snapshot cache perpetually
         // warm so the hub view opens instantly; without this the first open

@@ -335,6 +335,7 @@
                 <div class="section-header-left">
                     <h3>COD Payments &amp; Reconciliation</h3>
                     <span class="count-pill" id="codCount">0</span>
+                    <span class="count-pill" id="codBacklogPill" title="Delivered orders with no reconciled payment yet" style="display:none">0 awaiting reconciliation</span>
                 </div>
                 <div class="section-header-actions">
                     <input type="text" id="codSearch" placeholder="Search order ID, AWB, carrier..." class="filter-input filter-input-compact">
@@ -343,6 +344,7 @@
                         <option value="reconciled">Reconciled</option>
                         <option value="pending">Pending</option>
                         <option value="failed">Failed</option>
+                        <option value="superseded">Superseded</option>
                     </select>
                     <select id="codLimitSelect" class="filter-select filter-select-compact" title="Rows per page">
                         <option value="10">10 / page</option>
@@ -354,6 +356,7 @@
                         <svg class="refresh-icon" width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2"><path d="M21.5 2v6h-6M2.5 22v-6h6M2 11.5a10 10 0 0 1 18.8-4.3M22 12.5a10 10 0 0 1-18.8 4.2"/></svg>
                         <span>Refresh</span>
                     </button>
+                    <button class="btn btn-sm btn-outline" id="btnSweepCod" data-action="sweep-cod" title="Find delivered COD orders Zoho still shows as unpaid and record their payments">Sweep unpaid COD</button>
                 </div>
             </div>
 

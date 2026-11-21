@@ -20,6 +20,9 @@ async function onShipmentTerminal(shipment, newStatus, deliveredAt) {
     const carrierInfo = {
         carrier: shipment.carrier || shipment.courier_name || 'unknown',
         awb: shipment.awb || '',
+        // Only a hint for the log row — the reconciler pays what the invoice
+        // actually still owes, which is what COD collection amounts to.
+        amount: parseFloat(shipment.cod_amount || 0) || undefined,
         deliveryDate: deliveredAt || new Date().toISOString()
     };
 

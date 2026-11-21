@@ -619,6 +619,22 @@ async function initializeZohoTables() {
             )
         `);
 
+        // Retry bookkeeping (added after the first rollout). Without these the
+        // reconciler had no way to tell "never tried" from "tried and failed",
+        // so a delivered COD order stuck on a transient Zoho error sat unpaid
+        // for good — and the log kept a fresh duplicate row per attempt.
+        await pool.query('ALTER TABLE zoho_cod_payments ADD COLUMN IF NOT EXISTS error_message TEXT');
+        await pool.query('ALTER TABLE zoho_cod_payments ADD COLUMN IF NOT EXISTS attempts INT DEFAULT 0');
+        await pool.query('ALTER TABLE zoho_cod_payments ADD COLUMN IF NOT EXISTS last_attempt_at TIMESTAMPTZ');
+        // Stamp existing rows so the sweep's "already tried recently" test has
+        // something to compare against instead of treating NULL as never tried.
+        await pool.query('UPDATE zoho_cod_payments SET last_attempt_at = created_at WHERE last_attempt_at IS NULL')
+            .catch(() => { /* non-critical: the reconciler falls back to created_at */ });
+        // The reconciler keys every lookup on the bare order number; hub rows
+        // arrive as "#45272", so every query now strips the prefix first.
+        await pool.query(`CREATE INDEX IF NOT EXISTS idx_zoho_cod_order_bare ON zoho_cod_payments(REGEXP_REPLACE(shopify_order_id, '^#', ''))`);
+        await pool.query('CREATE INDEX IF NOT EXISTS idx_zoho_cod_open ON zoho_cod_payments(payment_status, last_attempt_at DESC)');
+
         await pool.query(`
             CREATE TABLE IF NOT EXISTS zoho_bundle_map (
                 id SERIAL PRIMARY KEY,
