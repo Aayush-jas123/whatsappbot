@@ -434,12 +434,15 @@ async function discoverShopifyCancellations({ hours = DISCOVERY_HOURS } = {}) {
     const names = [];
 
     try {
-        let url = `https://${base}.myshopify.com/admin/api/2024-01/orders.json`;
         const params = new URLSearchParams({
             status: 'canceled', limit: '250', updated_at_min: updatedMin, order: 'updated_at asc'
         });
+        // The page_info cursor Shopify hands back already carries every
+        // parameter, so it must be requested verbatim — re-appending the query
+        // string gets a 400 and used to discard the whole discovery pass.
+        let url = `https://${base}.myshopify.com/admin/api/2024-01/orders.json?${params}`;
         for (let page = 1; url && page <= 6; page++) {
-            const res = await axios.get(`${url}?${params}`, {
+            const res = await axios.get(url, {
                 headers: { 'X-Shopify-Access-Token': token }, timeout: 20000
             });
             for (const o of (res.data?.orders || [])) {
@@ -450,8 +453,12 @@ async function discoverShopifyCancellations({ hours = DISCOVERY_HOURS } = {}) {
             url = next || null;
         }
     } catch (err) {
-        console.warn(`⚠️ Zoho cancel discovery: Shopify cancelled-order fetch failed: ${err.message}`);
-        return { flagged: 0, error: err.message };
+        // Keep the pages that did come back. Throwing the pass away instead
+        // would quietly retire the Shopify-direct feed — the sweep has no other
+        // way to see a cancellation that has no store_shoppers row — and every
+        // candidate is re-verified against Shopify before anything is voided.
+        console.warn(`⚠️ Zoho cancel discovery: Shopify cancelled-order fetch failed after ${names.length} order(s): ${err.message}`);
+        return { flagged: 0, seen: new Set(names).size, names: [...new Set(names)], error: err.message };
     }
 
     if (!names.length) return { flagged: 0, seen: 0, names: [] };

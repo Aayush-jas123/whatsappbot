@@ -80,6 +80,9 @@ const inv = (id, ref, status = 'overdue') => ({
     invoice_id: id, invoice_number: `OFF/${id}`, reference_number: ref, status, total: '1499.00'
 });
 
+// Discovery builds cursor URLs off this base, so the stub can recognise them.
+const base = 'https://stub.myshopify.com/admin/api/2024-01/';
+
 (async () => {
     const svc = require('../src/services/zohoCancelService');
 
@@ -317,6 +320,53 @@ const inv = (id, ref, status = 'overdue') => ({
     check('shared receipt: helper sees the linkage', svc.isSharedPayment({ invoices: [{}, {}] }) === true
         && svc.isSharedPayment({ invoices: [{}] }) === false
         && svc.isSharedPayment({ invoice_numbers: 'OFF/1' }) === false);
+
+    // 16. Discovery pagination. Shopify's page_info cursor already carries the
+    //     whole query string, so it must be requested verbatim — re-appending
+    //     the parameters gets a 400, and a 400 used to throw the entire pass
+    //    (including the page that had succeeded) away, which silently killed
+    //     the only feed that sees cancellations with no hub row.
+    reset();
+    const urls = [];
+    const cursor = 'https://stub.myshopify.com/admin/api/2024-01/orders.json?status=canceled&page_info=abc123';
+    const pages = [
+        { headers: { link: `<${cursor}>; rel="next"` }, data: { orders: [{ order_number: 43030 }] } },
+        { headers: {}, data: { orders: [{ order_number: 43031 }, { order_number: 43030 }] } },
+    ];
+    axios.get = async url => {
+        urls.push(url);
+        return pages[urls.length - 1];
+    };
+    let d = await svc.discoverShopifyCancellations({ hours: 26 });
+    check('discovery: first page built from the query', /status=canceled/.test(urls[0]) && /updated_at_min=/.test(urls[0]));
+    check('discovery: cursor page requested verbatim, query not re-appended',
+        urls[1] === cursor && !/updated_at_min/.test(urls[1]));
+    check('discovery: pages deduped and reported', d.names.join() === '43030,43031' && d.seen === 2);
+
+    reset();
+    urls.length = 0;
+    axios.get = async url => {
+        urls.push(url);
+        if (urls.length === 1) return { headers: { link: `<${cursor}>; rel="next"` }, data: { orders: [{ order_number: 43032 }] } };
+        throw new Error('Shopify API error (400): page_info cannot be used with other parameters');
+    };
+    d = await svc.discoverShopifyCancellations({ hours: 26 });
+    check('discovery: a later-page failure keeps the orders already found',
+        !!d.error && d.names.join() === '43032' && d.seen === 1);
+
+    // ...and the sweep must still be able to use that partial list
+    reset();
+    registry['43033'] = [inv('INV18', '43033')];
+    stubZoho({ detail: { INV18: { invoice_id: 'INV18', status: 'overdue', credits_applied: 0 } } });
+    stubSweep({ hub: [], marked: [] });
+    axios.get = async url => {
+        if (/page_info=broken/.test(url)) throw new Error('Shopify API error (400): bad cursor');
+        if (/status=canceled/.test(url)) return { headers: { link: `<${base}orders.json?page_info=broken>; rel="next"` }, data: { orders: [{ order_number: 43033 }] } };
+        return { data: { orders: [{ order_number: 43033, cancelled_at: '2026-11-20T00:00:00Z', fulfillments: [] }] } };
+    };
+    const sweep3 = await svc.sweepCancelledInvoices({ limit: 10 });
+    check('sweep: partial discovery still reverses the order it found',
+        calls.includes('void:INV18') && sweep3.voided === 1 && sweep3.fromShopify === 1);
 
     console.log(failures ? `\n❌ ${failures} check(s) failed` : '\n🎉 all checks passed');
     process.exit(failures ? 1 : 0);
