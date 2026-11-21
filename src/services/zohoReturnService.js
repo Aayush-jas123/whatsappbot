@@ -289,6 +289,16 @@ async function prepareAndCreateCreditNote({ shopifyOrder, orderId, returnItems, 
     }
     const fullInvoice = await fetchFullInvoice(originalInvoice);
 
+    // A cancelled order's invoice is voided by the cancellation path (with its
+    // receipt removed if it had one), so there is nothing left to credit —
+    // raising a note here would reverse the same sale twice, and Books rejects
+    // documents pointed at a void invoice anyway.
+    const invoiceStatus = String(fullInvoice.status || originalInvoice.status || '');
+    if (invoiceStatus === 'void' || invoiceStatus === 'deleted') {
+        console.log(`ℹ️ Zoho ${returnType}: invoice for order #${orderId} is ${invoiceStatus} — the cancellation already reversed it, no credit note raised (${reference})`);
+        return { success: true, creditNoteId: null, invoiceVoided: true, creditNoteTotal: 0, customerId };
+    }
+
     const creditNotePayload = await buildMirroredCreditNotePayload({
         shopifyOrder, orderId, returnItems, returnType, fullInvoice, reference, extraNotes,
         customerId: customerId || originalInvoice.customer_id

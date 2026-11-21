@@ -8,6 +8,7 @@ const zohoSyncService = require('../services/zohoSyncService');
 const zohoReturnService = require('../services/zohoReturnService');
 const zohoCodService = require('../services/zohoCodService');
 const zohoService = require('../services/zohoService');
+const zohoCancelService = require('../services/zohoCancelService');
 
 // ============================================================
 // SHOPIFY WEBHOOK VERIFICATION (HMAC-SHA256)
@@ -102,10 +103,14 @@ router.post('/orders/updated', verifyShopifyWebhook, async (req, res) => {
 });
 
 // ============================================================
-// SHOPIFY ORDER CANCELLED — void the Zoho invoice when the order
-// never shipped (cancelled-before-dispatch orders must not carry a
-// live invoice). Already-dispatched orders are left untouched — any
-// later RTO is handled via credit note, never invoice deletion.
+// SHOPIFY ORDER CANCELLED — the invoice follows the cancellation.
+// A cancelled order must not carry a live Zoho invoice, whether or not the
+// parcel had already shipped, and a paid invoice has its receipt removed
+// first (see zohoCancelService for the full rule and its safety rails).
+//
+// NOTE: Shopify has never had this topic subscribed to this URL, so this
+// handler is not the working feed — see src/services/zohoCancelService.js,
+// which owns the void rule and runs hourly against the same data.
 // ============================================================
 
 router.post('/orders/cancelled', verifyShopifyWebhook, async (req, res) => {
@@ -118,59 +123,10 @@ router.post('/orders/cancelled', verifyShopifyWebhook, async (req, res) => {
 
         console.log(`📦 Zoho cancel: processing cancellation for order #${orderId}`);
 
-        // Anything fulfilled (not cancelled) means it shipped — keep invoice
-        const shipped = (order.fulfillments || []).some(f =>
-            f.status !== 'cancelled' && f.status !== 'failure'
-        );
-        if (shipped) {
-            console.log(`ℹ️ Zoho cancel: order #${orderId} was shipped — invoice kept (RTOs handled via credit note)`);
-            return;
+        const result = await zohoCancelService.processCancellation(order);
+        if (result.voided > 0) {
+            console.log(`✅ Zoho cancel: order #${orderId} — ${result.voided} invoice(s) voided`);
         }
-
-        const invoices = await zohoService.searchInvoice({ reference_number: orderId });
-
-        if (invoices.length === 0) {
-            console.log(`ℹ️ Zoho cancel: order #${orderId} — no invoices found in Zoho (may not have been synced yet)`);
-        }
-
-        let voided = 0;
-        for (const inv of invoices) {
-            if (inv.status === 'void' || inv.status === 'deleted') continue;
-            try {
-                // Void (never delete) — keeps the audit trail
-                await zohoService.voidInvoice(inv.invoice_id);
-                voided++;
-            } catch (voidErr) {
-                console.warn(`⚠️ Zoho cancel: void failed for invoice ${inv.invoice_id} (order #${orderId}): ${voidErr.message}`);
-            }
-        }
-
-        if (voided > 0) {
-            console.log(`✅ Zoho cancel: order #${orderId} cancelled before dispatch — ${voided} invoice(s) voided`);
-        }
-
-        // Mark the sync log so retries/backfill don't revive the invoice.
-        // If no row exists yet (cancel arrived before create), insert one so
-        // the create webhook sees 'cancelled' and skips invoice creation.
-        try {
-            const { dbAdapter } = require('../database/db');
-            const updated = await dbAdapter.run(
-                `UPDATE zoho_sync_log SET status = ?, error_message = ?, updated_at = NOW()
-                 WHERE shopify_order_id = ? AND status IN ('synced', 'pending', 'retry')`,
-                ['cancelled', 'Order cancelled before dispatch — invoice voided', orderId]
-            );
-            // If no row was updated, the order hasn't been synced yet — insert
-            // a cancelled row so the pending create webhook won't create it.
-            const rowsAffected = updated?.changes || updated?.rowCount || 0;
-            if (rowsAffected === 0) {
-                await dbAdapter.run(
-                    `INSERT INTO zoho_sync_log (shopify_order_id, status, error_message, created_at, updated_at)
-                     VALUES (?, 'cancelled', 'Order cancelled before sync — invoice creation blocked', NOW(), NOW())`,
-                    [orderId]
-                );
-                console.log(`📝 Zoho cancel: order #${orderId} — inserted cancel guard row (no prior sync existed)`);
-            }
-        } catch (e) { /* log-only */ }
 
         // Flag matching hub rows as cancelled on the order channel so the
         // Shoppers Hub shows the "Synced" badge on these cancelled orders.

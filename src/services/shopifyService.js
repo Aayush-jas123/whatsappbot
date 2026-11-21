@@ -1440,6 +1440,7 @@ class ShopifyService {
         if (order.cancelled_at) {
             result.alreadyCancelled = true;
             result.cancelled = true;
+            this._voidZohoInvoiceForCancelled(order);
             return result;
         }
         try {
@@ -1447,10 +1448,24 @@ class ShopifyService {
             result.cancelled = true;
             if (note) result.cancelNote = note;
             console.log(`✅ Shopify order ${order.name || order.id} cancelled${result.refunded ? ` (refunded ₹${result.refundAmount})` : ''}`);
+            this._voidZohoInvoiceForCancelled(order);
         } catch (cancelError) {
             result.error = (result.refunded ? 'Refund succeeded but cancel failed: ' : '') + this._shopifyErrorMsg(cancelError);
         }
         return result;
+    }
+
+    // A cancelled Shopify order must not keep a live Zoho invoice. Shopify has
+    // no orders/cancelled webhook subscribed to the Zoho middleware, so this
+    // in-flight hook (plus the hourly zohoCancelSweepCron backstop) is what
+    // actually reverses the sale. Fire-and-forget: accounting must never
+    // block or fail a cancellation the customer already got.
+    _voidZohoInvoiceForCancelled(order) {
+        require('./zohoCancelService').processCancellation(order)
+            .then(res => {
+                if (res?.voided) console.log(`📒 [cancel+refund] Zoho: ${res.voided} invoice(s) voided for ${order.name || order.id}`);
+            })
+            .catch(err => console.warn(`⚠️ [cancel+refund] Zoho void failed for ${order.name || order.id}: ${err.message}`));
     }
 
     // Fetch transactions separately — REST GET /orders/{id}.json does NOT include them

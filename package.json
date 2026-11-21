@@ -10,6 +10,7 @@
     "test:redact": "node test/testRedact.js",
     "test:logger": "node test/testLogger.js",
     "test:health": "node test/testHealth.js",
+    "test:zohocancel": "node test/testZohoCancelInvoiceVoid.js",
     "test:phase1": "node test/testRedact.js && node test/testLogger.js && node test/testHealth.js"
   },
   "keywords": [

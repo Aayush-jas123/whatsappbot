@@ -334,6 +334,10 @@ app.use('/api/order-confirmation', orderConfirmationRoutes);
 const abandonedCartCron = require('./src/services/abandonedCartCron');
 const reengagementCron = require('./src/services/reengagementCron');
 const shipmentSyncCron = require('./src/services/shipmentSyncCron');
+// Cancelled Shopify orders → Zoho invoice voids. Shopify never subscribed
+// orders/cancelled to /webhooks/zoho/orders/cancelled, so the webhook handler
+// on its own voids nothing; this sweep is the feed that actually works.
+const zohoCancelSweepCron = require('./src/services/zohoCancelSweepCron');
 // Delivered COD orders → Zoho invoice payments. The live carrier hook fires
 // once at the delivery transition and never looks again, so a rate limit or a
 // not-yet-synced invoice left the order unpaid permanently. This sweep is the
@@ -802,6 +806,10 @@ async function startServer() {
         abandonedCartCron.init();
         reengagementCron.init();
         shipmentSyncCron.init();
+        // Gated on the variable zohoService actually reads (ZOHO_ORGANIZATION_ID).
+        // Not ZOHO_ORG_ID — that one is set nowhere, which is why the duplicate
+        // sweeper above has never fired in production.
+        if (process.env.ZOHO_ORGANIZATION_ID) zohoCancelSweepCron.init();
         if (process.env.ZOHO_ORGANIZATION_ID) zohoCodSweepCron.init();
 
         // Keep the Inventory Control Tower's 3-min snapshot cache perpetually
