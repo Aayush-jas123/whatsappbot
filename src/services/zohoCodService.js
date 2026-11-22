@@ -11,8 +11,13 @@ const { dbAdapter } = require('../database/db');
 // ── Backlog sweep knobs (Render env wins). One candidate costs 1 Shopify
 // call + 2–3 Zoho calls, sized to sit alongside live order sync inside the
 // org-wide 10,000 calls/day without eating it.────────────────────────────
-const SWEEP_LIMIT = parseInt(process.env.ZOHO_COD_SWEEP_LIMIT || '30', 10);
-const SWEEP_DAILY_BUDGET = parseInt(process.env.ZOHO_COD_SWEEP_DAILY_BUDGET || '150', 10);
+// Sized to clear a ~2k backlog in about two days without threatening Zoho's
+// 10,000-call org-wide day: a candidate costs one invoice read, plus a payment
+// read/write only when something is actually due, so a 1000/day budget is
+// roughly 2,000 Books calls shared with the cancel sweep and live order sync.
+// 50 per hourly tick keeps each tick to a couple of minutes.
+const SWEEP_LIMIT = parseInt(process.env.ZOHO_COD_SWEEP_LIMIT || '50', 10);
+const SWEEP_DAILY_BUDGET = parseInt(process.env.ZOHO_COD_SWEEP_DAILY_BUDGET || '1000', 10);
 const SWEEP_WINDOW_DAYS = parseInt(process.env.ZOHO_COD_SWEEP_WINDOW_DAYS || '120', 10);
 const SWEEP_ENABLED = process.env.ZOHO_COD_SWEEP_ENABLED !== 'false';
 
@@ -258,23 +263,44 @@ async function handleCodDelivery(rawOrderId, { amount, carrier, awb, deliveryDat
         }
         const zohoInvoice = live.find(inv => parseFloat(inv.balance) > 0) || live[0];
         const invoiceId = zohoInvoice.invoice_id;
+        // Any OTHER live invoice on this order is a second bill for one
+        // collection, and both directions are dangerous: an owed twin left
+        // unmentioned is why these orders kept showing unpaid forever (it must
+        // be voided, not paid), while paying the twin we chose when a sibling
+        // is already settled books a receipt for money collected once.
+        // Voiding is a human call — Books has no un-void — so report both.
+        const otherLive = live.filter(inv => inv !== zohoInvoice);
+        const twinShape = inv => ({ invoice: inv.invoice_number || inv.invoice_id, amount: parseFloat(inv.balance || 0), status: inv.status });
+        const openTwins = otherLive.filter(inv => parseFloat(inv.balance) > 0).map(twinShape);
+        const settledTwins = otherLive.filter(inv => !(parseFloat(inv.balance) > 0)).map(twinShape);
+        if (openTwins.length) {
+            console.warn(`⚠️ Zoho COD: order #${orderId} also has ${openTwins.length} live invoice(s) with a balance ` +
+                `(duplicate bills — void, do not pay): ${openTwins.map(t => `${t.invoice} ₹${t.amount}`).join(', ')}`);
+        }
+        if (settledTwins.length) {
+            console.warn(`⚠️ Zoho COD: order #${orderId} already has ${settledTwins.length} settled invoice(s) ` +
+                `(${settledTwins.map(t => t.invoice).join(', ')}) — collecting another one may double-count this COD`);
+        }
         // 'balance' is the remaining amount due on the invoice (the list
         // API returns it). 'total' is the grand total, which can be
         // larger than the balance when partial payments or credit notes
         // have been applied — paying the total in that case makes Zoho
-        // reject with "amount more than balance due". Fall back to total
-        // only if balance is absent.
+        // reject with "amount more than balance due". So `balance` decides,
+        // whenever the API returned it: a settled invoice must resolve to 0
+        // and short-circuit below. Falling back to 'total' when balance is
+        // present-but-zero is what produced the "amount entered is more than
+        // the balance due" rows — an invoice paid outside this log (the native
+        // integration does exactly that) has no payments of its own visible
+        // here, so it used to reach Step 3 and be asked for its full total.
         const balance = parseFloat(zohoInvoice.balance);
-        const invoiceAmount = parseFloat(
-            !isNaN(balance) && balance > 0
-                ? balance
-                : (zohoInvoice.total || zohoInvoice.amount || amount || 0)
-        );
+        const invoiceAmount = !isNaN(balance)
+            ? balance
+            : parseFloat(zohoInvoice.total || zohoInvoice.amount || amount || 0);
         if (invoiceAmount <= 0) {
             console.log(`ℹ️ Zoho COD: invoice ${invoiceId} balance is 0 — nothing to reconcile`);
             await finishReconciled(orderId, logId, { invoiceId, amount: null });
             await markShopifyPaid(orderId);
-            return { success: true, alreadyPaid: true, zeroBalance: true };
+            return { success: true, alreadyPaid: true, zeroBalance: true, openTwins, settledTwins };
         }
 
         // Step 2: Check if payment already recorded in Zoho
@@ -285,7 +311,7 @@ async function handleCodDelivery(rawOrderId, { amount, carrier, awb, deliveryDat
                 invoiceId, paymentId: existingPayments[0].payment_id, amount: invoiceAmount
             });
             await markShopifyPaid(orderId);
-            return { success: true, alreadyPaid: true };
+            return { success: true, alreadyPaid: true, openTwins, settledTwins };
         }
 
         // Step 3: Record payment in Zoho (customer_id required by Books)
@@ -307,8 +333,11 @@ async function handleCodDelivery(rawOrderId, { amount, carrier, awb, deliveryDat
             success: true,
             logId,
             invoiceId,
+            invoiceNumber: zohoInvoice.invoice_number,
             paymentId: payment?.payment_id,
-            amount: invoiceAmount
+            amount: invoiceAmount,
+            openTwins,
+            settledTwins
         };
 
     } catch (err) {
@@ -560,7 +589,8 @@ async function sweepUnreconciledCod({ limit = SWEEP_LIMIT, dryRun = false } = {}
 
     const stats = {
         checked: 0, reconciled: 0, alreadyPaid: 0, notCod: 0, notPayable: 0,
-        inProgress: 0, noInvoice: 0, failed: 0, rateLimited: false, dryRun, wouldPay: [], errors: []
+        inProgress: 0, noInvoice: 0, failed: 0, rateLimited: false, dryRun,
+        wouldPay: [], openTwins: [], doubleCountRisk: [], errors: []
     };
 
     for (const candidate of candidates) {
@@ -597,6 +627,23 @@ async function sweepUnreconciledCod({ limit = SWEEP_LIMIT, dryRun = false } = {}
                     stats.errors.push(`#${orderId}: no Zoho invoice yet (needs a sync)`);
                 }
                 else stats.alreadyPaid++;
+                // A second live invoice with a balance on the same order is a
+                // duplicate bill, not uncollected COD: paying it would invent
+                // revenue. Collect those separately for a human to void.
+                for (const twin of live.filter(i => i !== inv && parseFloat(i.balance) > 0)) {
+                    stats.openTwins.push({ order_id: orderId, invoice: twin.invoice_number || twin.invoice_id, amount: parseFloat(twin.balance) });
+                }
+                // Owed here but settled next door means the collection may
+                // already be booked, so the preview says so too.
+                if (inv) {
+                    const settled = live.filter(i => i !== inv && !(parseFloat(i.balance) > 0));
+                    if (settled.length) {
+                        stats.doubleCountRisk.push({
+                            order_id: orderId, invoice: inv.invoice_number || inv.invoice_id,
+                            amount: parseFloat(inv.balance), settled: settled.map(s => s.invoice_number || s.invoice_id)
+                        });
+                    }
+                }
                 continue;
             }
 
@@ -610,6 +657,17 @@ async function sweepUnreconciledCod({ limit = SWEEP_LIMIT, dryRun = false } = {}
             if (result.success) {
                 if (result.alreadyPaid || result.alreadyReconciled) stats.alreadyPaid++;
                 else stats.reconciled++;
+                for (const twin of (result.openTwins || [])) {
+                    stats.openTwins.push({ order_id: orderId, invoice: twin.invoice, amount: twin.amount });
+                }
+                // Only a fresh payment can double-count; an already-settled
+                // outcome recorded nothing extra.
+                if (result.paymentId && (result.settledTwins || []).length) {
+                    stats.doubleCountRisk.push({
+                        order_id: orderId, invoice: result.invoiceNumber, amount: result.amount,
+                        settled: result.settledTwins.map(t => t.invoice)
+                    });
+                }
             } else if (result.inProgress) {
                 stats.inProgress++;
             } else {
@@ -630,7 +688,13 @@ async function sweepUnreconciledCod({ limit = SWEEP_LIMIT, dryRun = false } = {}
 
     console.log(`💰 Zoho COD sweep${dryRun ? ' [DRY RUN]' : ''}: ${stats.checked} checked, ${stats.reconciled} reconciled, ` +
         `${stats.alreadyPaid} already paid, ${stats.notCod} prepaid, ${stats.notPayable} cancelled/refunded, ` +
-        `${stats.inProgress} in flight, ${stats.noInvoice} missing an invoice, ${stats.failed} errors`);
+        `${stats.inProgress} in flight, ${stats.noInvoice} missing an invoice, ` +
+        `${stats.openTwins.length} duplicate-billed, ${stats.doubleCountRisk.length} possibly double-collected, ${stats.failed} errors`);
+    if (stats.openTwins.length) {
+        console.warn(`   duplicate bills — void these, do NOT pay: ` +
+            `${stats.openTwins.slice(0, 10).map(t => `#${t.order_id} ${t.invoice} ₹${t.amount}`).join(', ')}` +
+            (stats.openTwins.length > 10 ? ` … (+${stats.openTwins.length - 10} more)` : ''));
+    }
     if (dryRun && stats.wouldPay.length) {
         console.log(`   would pay: ${stats.wouldPay.slice(0, 20).map(w => `#${w.order_id} ₹${w.amount}`).join(', ')}` +
             (stats.wouldPay.length > 20 ? ` … (+${stats.wouldPay.length - 20} more)` : ''));

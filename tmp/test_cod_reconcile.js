@@ -421,6 +421,55 @@ async function main() {
     check('reconciling an unsynced order does run the sync', syncCalls === 1, `syncs=${syncCalls}`);
     check('and still fails cleanly when no invoice appears', res.success === false && /No Zoho invoice/.test(res.error), JSON.stringify(res));
 
+    // -------------------------- 13. balance 0 means nothing is due, not "pay total"
+    console.log('\n13. a settled invoice must never be paid its grand total');
+    resetWorld();
+    // The production shape behind the "amount entered is more than the balance
+    // due" rows: paid, balance 0, and no payment visible to us because the
+    // native integration recorded the collection on its own copy.
+    invoice('INV-NATIVE', '47202', { balance: 0, total: 1298, status: 'paid' });
+    res = await zohoCodService.handleCodDelivery('47202', { carrier: 'delhivery' });
+    check('no payment is attempted against a zero balance', paymentsRecorded.length === 0, JSON.stringify(paymentsRecorded));
+    check('the order reconciles instead of erroring', res.success === true && res.zeroBalance === true, JSON.stringify(res));
+    check('and the row is not parked as failed', codRows.length === 1 && codRows[0].payment_status === 'reconciled', JSON.stringify(codRows[0]));
+
+    resetWorld();
+    invoice('INV-PART', '47203', { balance: 299, total: 1298, status: 'sent' });
+    res = await zohoCodService.handleCodDelivery('47203', { carrier: 'delhivery' });
+    check('a partly settled invoice is paid its balance', paymentsRecorded.length === 1 && paymentsRecorded[0].amount === 299, JSON.stringify(paymentsRecorded));
+    check('never the grand total', res.amount === 299, JSON.stringify(res));
+
+    // -------------------------- 14. one order billed twice
+    console.log('\n14. one order billed twice: both directions get reported');
+    resetWorld();
+    invoice('INV-DUP', '47204', { balance: 1258.95, total: 1258.95, status: 'overdue' });
+    invoice('INV-PAID', '47204', { balance: 0, total: 1298, status: 'paid' });
+    res = await zohoCodService.handleCodDelivery('47204', { carrier: 'delhivery' });
+    check('the owed document is the one collected', paymentsRecorded.length === 1 && paymentsRecorded[0].invoice_id === 'INV-DUP', JSON.stringify(paymentsRecorded));
+    check('the settled sibling is flagged as a possible double count',
+        res.settledTwins.length === 1 && res.settledTwins[0].invoice === 'OFF/26-27/INV-PAID', JSON.stringify(res.settledTwins));
+    check('and no sibling is filed as an owed twin', res.openTwins.length === 0, JSON.stringify(res.openTwins));
+
+    resetWorld();
+    invoice('INV-A', '47205', { balance: 999, total: 999, status: 'overdue' });
+    invoice('INV-B', '47205', { balance: 299, total: 299, status: 'sent' });
+    res = await zohoCodService.handleCodDelivery('47205', { carrier: 'delhivery' });
+    check('an owed sibling is reported, not left silently due',
+        res.openTwins.length === 1 && res.openTwins[0].invoice === 'OFF/26-27/INV-B', JSON.stringify(res.openTwins));
+
+    // -------------------------- 15. the sweep surfaces the same two signals
+    console.log('\n15. the sweep reports twins in both directions');
+    resetWorld();
+    shipmentRows = [{ order_id: '64800', status: 'delivered', carrier: 'delhivery', awb: 'AWB-9', delivered_at: new Date(), cod_amount: 1298 }];
+    codShopifyOrder('64800');
+    invoice('INV-OWED', '64800', { balance: 1298, total: 1298, status: 'overdue' });
+    invoice('INV-BOOKED', '64800', { balance: 0, total: 1298, status: 'paid' });
+    stats = await zohoCodService.sweepUnreconciledCod({ dryRun: true });
+    check('the preview still writes nothing', paymentsRecorded.length === 0 && codRows.length === 0);
+    check('the owed document shows up in wouldPay', stats.wouldPay.length === 1 && stats.wouldPay[0].amount === 1298, JSON.stringify(stats.wouldPay));
+    check('the settled sibling raises the double-count flag',
+        stats.doubleCountRisk.length === 1 && stats.doubleCountRisk[0].settled[0] === 'OFF/26-27/INV-BOOKED', JSON.stringify(stats.doubleCountRisk));
+
     // ---------------------------------------------------------- summary
     console.log(`\n================ ${passed} passed, ${failedChecks} failed ================`);
     process.exit(failedChecks ? 1 : 0);
