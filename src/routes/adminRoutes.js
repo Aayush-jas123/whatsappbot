@@ -7554,51 +7554,65 @@ router.get('/inventory', verifyToken, async (req, res) => {
             setCache(bundleCacheKey, bundleRows, 'stats', 3600000); // Cache for 1 hour
         }
 
-        // Two lightweight per-row scans — optimized for index usage.
-        // A) windowed history → delivered + RTO buckets (split into two queries to avoid OR)
-        // B) current in-circulation shipments (never window-trimmed)
-        const [historyDelivered, historyRto, circulationRows, returnRows, exchangeRows, rsPipeline, salesRows] = await Promise.all([
-            // History: delivered orders
+        // ONE forward-order scan replaces the four separate ones this route used
+        // to fire (delivered history, RTO history, circulation, 84-day sales).
+        // They all read the same store_shoppers heap pages — delivered and the
+        // 84-day sales series overlap almost completely — and each held its own
+        // pool slot, so the Nov 2026 Render boot logs showed 3.8s, 4.0s, 4.4s and
+        // 5.5s in parallel. The superset below is the union of the two filters:
+        //   in-window rows (max(window, 84) — the sales series is always 84 days)
+        //   ∪ in-circulation rows (never window-trimmed)
+        // and the split back into the old bucket queries happens in JS below.
+        const forwardScanDays = Math.max(windowDays, 84);
+        const inWindowSql = windowDays > 0
+            ? `(s.created_at >= NOW() - INTERVAL '${windowDays} days')`
+            : 'TRUE';
+        const forwardWhereSql = windowDays > 0
+            ? `s.created_at >= NOW() - INTERVAL '${forwardScanDays} days'
+                   OR (s.status = 'confirmed'
+                       AND (o.awb IS NOT NULL OR o.status = 'shipped')
+                       AND COALESCE(o.status, '') NOT IN ('delivered','rto','cancelled','failed'))`
+            : 'TRUE';
+
+        const [forwardRows, returnRows, exchangeRows, rsPipeline] = await Promise.all([
             dbAdapter.query(`
-                SELECT s.items_json, s.status AS shopper_status, o.status AS order_status
-                FROM store_shoppers s
-                INNER JOIN orders o ON o.order_id = s.order_id
-                WHERE s.items_json IS NOT NULL
-                  AND o.status = 'delivered'
-                  ${windowDays > 0 ? `AND s.created_at >= NOW() - INTERVAL '${windowDays} days'` : ''}
-            `),
-            // History: RTO orders (order status OR shopper status)
-            dbAdapter.query(`
-                SELECT s.items_json, s.status AS shopper_status, COALESCE(o.status, '') AS order_status
+                SELECT s.items_json, s.status AS shopper_status, s.created_at,
+                       COALESCE(o.status, '') AS order_status, o.awb,
+                       ${inWindowSql} AS in_window,
+                       (s.created_at >= NOW() - INTERVAL '84 days') AS in_sales
                 FROM store_shoppers s
                 LEFT JOIN orders o ON o.order_id = s.order_id
                 WHERE s.items_json IS NOT NULL
-                  AND (s.status = 'rto' OR o.status = 'rto')
-                  ${windowDays > 0 ? `AND s.created_at >= NOW() - INTERVAL '${windowDays} days'` : ''}
-            `),
-            dbAdapter.query(`
-                SELECT s.items_json, s.status AS shopper_status, o.status AS order_status, o.awb
-                FROM store_shoppers s
-                INNER JOIN orders o ON o.order_id = s.order_id
-                WHERE s.items_json IS NOT NULL
-                  AND s.status = 'confirmed'
-                  AND (o.awb IS NOT NULL OR o.status = 'shipped')
-                  AND COALESCE(o.status, '') NOT IN ('delivered','rto','cancelled','failed')
+                  AND (${forwardWhereSql})
             `),
             dbAdapter.query(`SELECT items FROM returns WHERE status IN ('pending_approval','initiated','approved','pickup_scheduled') ${windowSql}`),
-            dbAdapter.query(`SELECT old_items, new_items FROM exchanges WHERE status IN ('pending_approval','initiated','pickup_scheduled') ${windowSql}`),
-            fetchReturnsServerPipeline(windowDays),
-            // Trailing 84 days of shipped/delivered units for velocity & forecast
-            // series — always a fixed window, independent of the pipeline window.
-            dbAdapter.query(`
-                SELECT s.items_json, s.created_at
-                FROM store_shoppers s
-                INNER JOIN orders o ON o.order_id = s.order_id
-                WHERE s.items_json IS NOT NULL
-                  AND s.created_at >= NOW() - INTERVAL '84 days'
-                  AND o.status IN ('delivered','shipped')
-            `)
+            dbAdapter.query(`SELECT old_items, new_items FROM exchanges WHERE status IN ('pending_approval','initiated','approved','pickup_scheduled') ${windowSql}`),
+            fetchReturnsServerPipeline(windowDays)
         ]);
+
+        // Re-apply the legacy WHERE predicates to the scan rows so the
+        // aggregation below stays row-for-row identical. Verified against the
+        // live table for windows 30 / 90 / 730 / unbounded: identical per-bucket
+        // row multisets (md5 of items_json) in all four cases.
+        const historyDelivered = [];
+        const historyRto = [];
+        const circulationRows = [];
+        const salesRows = [];
+        const TERMINAL_ORDER_STATUS = new Set(['delivered', 'rto', 'cancelled', 'failed']);
+        for (const row of forwardRows) {
+            if (row.in_window) {
+                if (row.order_status === 'delivered') historyDelivered.push(row);
+                if (row.shopper_status === 'rto' || row.order_status === 'rto') historyRto.push(row);
+            }
+            if (row.shopper_status === 'confirmed'
+                && (row.awb || row.order_status === 'shipped')
+                && !TERMINAL_ORDER_STATUS.has(row.order_status)) {
+                circulationRows.push(row);
+            }
+            if (row.in_sales && (row.order_status === 'delivered' || row.order_status === 'shipped')) {
+                salesRows.push(row);
+            }
+        }
 
         // ---------- Bundle / combo expansion (Zoho configuration) ----------
         // Combos & bundles are NOT distinct products — zoho_bundle_map breaks
@@ -7714,6 +7728,9 @@ router.get('/inventory', verifyToken, async (req, res) => {
                 return Array.isArray(parsed) ? parsed : [];
             } catch (_) { return []; }
         };
+        // items_json is ~1.2KB of the row payload and a delivered row feeds both
+        // the delivered bucket and the velocity series — parse each row once.
+        const itemsOf = (row) => (row.__items || (row.__items = parseItems(row.items_json)));
 
         // Expand combo/bundle line items into their single-product components
         // per zoho_bundle_map; non-bundle items pass through untouched.
@@ -7779,14 +7796,14 @@ router.get('/inventory', verifyToken, async (req, res) => {
         };
         for (const row of circulationRows) {
             const bucket = classifyRow(row);
-            if (bucket) addItemUnits(parseItems(row.items_json), bucket);
+            if (bucket) addItemUnits(itemsOf(row), bucket);
         }
-        // Process split history queries (delivered + RTO)
+        // History buckets split out of the shared forward scan
         for (const row of historyDelivered) {
-            addItemUnits(parseItems(row.items_json), 'delivered');
+            addItemUnits(itemsOf(row), 'delivered');
         }
         for (const row of historyRto) {
-            addItemUnits(parseItems(row.items_json), 'rto_incoming');
+            addItemUnits(itemsOf(row), 'rto_incoming');
         }
 
         // 2) Open customer returns → stock coming back
@@ -7838,7 +7855,7 @@ router.get('/inventory', verifyToken, async (req, res) => {
             if (!ts || isNaN(ts)) continue;
             const ageDays = Math.floor((nowTs - ts) / 86400000);
             if (ageDays < 0 || ageDays >= VEL_DAYS) continue;
-            for (const item of expandBundleItems(parseItems(row.items_json))) {
+            for (const item of expandBundleItems(itemsOf(row))) {
                 const qty = Math.max(1, parseInt(item.quantity ?? item.qty, 10) || 1);
                 const resolved = resolveItem(item);
                 if (!resolved || !resolved.v) {

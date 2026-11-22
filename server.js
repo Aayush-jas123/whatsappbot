@@ -812,9 +812,12 @@ async function startServer() {
         if (process.env.ZOHO_ORGANIZATION_ID) zohoCancelSweepCron.init();
         if (process.env.ZOHO_ORGANIZATION_ID) zohoCodSweepCron.init();
 
-        // Keep the Inventory Control Tower's 3-min snapshot cache perpetually
-        // warm so the hub view opens instantly; without this the first open
-        // after a deploy pays for the full reconciliation pass.
+        // Keep the Inventory Control Tower's snapshot cached so the hub view opens
+        // instantly. The snapshot itself is cached for 1 hour (adminRoutes
+        // /inventory) and this call passes no refresh flag, so on a warm cache it
+        // is a no-op — its real job is to repopulate the snapshot if the cache was
+        // purged by the memory watchdog or an invalidation, without paying the
+        // reconciliation pass on a user's first open of the tower.
         const warmInventoryTower = async () => {
             try {
                 const jwt = require('jsonwebtoken');
@@ -837,7 +840,7 @@ async function startServer() {
             }
         };
         setTimeout(warmInventoryTower, 8000);
-        setInterval(warmInventoryTower, 150000); // refresh before the 3-min TTL lapses
+        setInterval(warmInventoryTower, 150000); // repopulate the 1-hour snapshot if it was purged
 
         // ── Unified memory watchdog ─────────────────────────────────────
         // One adaptive 120s timer replaces the previous stack of overlapping
