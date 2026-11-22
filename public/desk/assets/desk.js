@@ -1904,7 +1904,12 @@
   function accAddOne() {
     var ph = window.prompt('Number to allow (10 digits, or 91XXXXXXXXXX):');
     if (!ph || !ph.trim()) return;
-    accRun(api(accGrantUrl(), { method: 'POST', body: accBody({ phones: [ph.trim()] }) }), accGrantDone);
+    ph = ph.trim();
+    // Single adds always get the intro offered explicitly: the options-bar
+    // checkbox already says yes when ticked, otherwise this prompt decides
+    // for just this number (a "no" here must not uncheck the bar).
+    var intro = accOpts().announce || window.confirm('Send the Support Desk intro WhatsApp message to ' + ph + ' as well?');
+    accRun(api(accGrantUrl(), { method: 'POST', body: accBody({ phones: [ph], announce: intro }) }), accGrantDone);
   }
   function accImport() {
     var ta = $('AccImport');
