@@ -334,8 +334,12 @@ async function handleCodDelivery(rawOrderId, { amount, carrier, awb, deliveryDat
  * webhook sync failed or was skipped), pull the order from Shopify,
  * run the full sync, and retry once. Results are verified against the
  * order number — see invoicesForOrder.
+ *
+ * The auto-sync WRITES documents to Books, so a caller that only wants to
+ * look must pass `allowSync: false`. Without it a "dry run" would create the
+ * missing invoices it was supposed to report on.
  */
-async function ensureInvoiceExists(rawOrderId) {
+async function ensureInvoiceExists(rawOrderId, { allowSync = true } = {}) {
     const orderId = normOrderId(rawOrderId);
     if (!orderId) return [];
 
@@ -343,6 +347,7 @@ async function ensureInvoiceExists(rawOrderId) {
         await zohoService.searchInvoice({ reference_number: orderId }), orderId
     );
     if (matched.length > 0) return matched;
+    if (!allowSync) return matched;
 
     const shopifyOrder = await fetchShopifyOrderByNumber(orderId);
     if (!shopifyOrder) return matched;
@@ -537,7 +542,8 @@ async function countSweepBacklog() {
  * share of the Zoho daily cap; the next tick picks up where it stopped.
  *
  * `dryRun` performs every read (including the Shopify order check and the
- * invoice lookup) and no write, so the backlog can be reviewed first.
+ * invoice lookup) and no write — it also declines the on-demand order sync, so
+ * the backlog can be reviewed before anything is created in Books.
  */
 async function sweepUnreconciledCod({ limit = SWEEP_LIMIT, dryRun = false } = {}) {
     if (!SWEEP_ENABLED) return { skipped: 'disabled' };
@@ -554,7 +560,7 @@ async function sweepUnreconciledCod({ limit = SWEEP_LIMIT, dryRun = false } = {}
 
     const stats = {
         checked: 0, reconciled: 0, alreadyPaid: 0, notCod: 0, notPayable: 0,
-        inProgress: 0, failed: 0, rateLimited: false, dryRun, wouldPay: [], errors: []
+        inProgress: 0, noInvoice: 0, failed: 0, rateLimited: false, dryRun, wouldPay: [], errors: []
     };
 
     for (const candidate of candidates) {
@@ -578,9 +584,18 @@ async function sweepUnreconciledCod({ limit = SWEEP_LIMIT, dryRun = false } = {}
             }
 
             if (dryRun) {
-                const live = (await ensureInvoiceExists(orderId)).filter(isLiveInvoice);
+                // Read-only: allowSync false, so a preview cannot mint the very
+                // invoices it is meant to be counting.
+                const found = await ensureInvoiceExists(orderId, { allowSync: false });
+                const live = found.filter(isLiveInvoice);
                 const inv = live.find(i => parseFloat(i.balance) > 0);
                 if (inv) stats.wouldPay.push({ order_id: orderId, invoice: inv.invoice_number || inv.invoice_id, amount: parseFloat(inv.balance) });
+                else if (live.length === 0) {
+                    // No invoice at all — reconciling it needs a sync first, so
+                    // call that out instead of filing it under "already paid".
+                    stats.noInvoice++;
+                    stats.errors.push(`#${orderId}: no Zoho invoice yet (needs a sync)`);
+                }
                 else stats.alreadyPaid++;
                 continue;
             }
@@ -615,7 +630,7 @@ async function sweepUnreconciledCod({ limit = SWEEP_LIMIT, dryRun = false } = {}
 
     console.log(`💰 Zoho COD sweep${dryRun ? ' [DRY RUN]' : ''}: ${stats.checked} checked, ${stats.reconciled} reconciled, ` +
         `${stats.alreadyPaid} already paid, ${stats.notCod} prepaid, ${stats.notPayable} cancelled/refunded, ` +
-        `${stats.inProgress} in flight, ${stats.failed} errors`);
+        `${stats.inProgress} in flight, ${stats.noInvoice} missing an invoice, ${stats.failed} errors`);
     if (dryRun && stats.wouldPay.length) {
         console.log(`   would pay: ${stats.wouldPay.slice(0, 20).map(w => `#${w.order_id} ₹${w.amount}`).join(', ')}` +
             (stats.wouldPay.length > 20 ? ` … (+${stats.wouldPay.length - 20} more)` : ''));

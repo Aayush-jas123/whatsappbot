@@ -38,6 +38,7 @@ let invoicesById = {};
 let paymentsRecorded = [];
 let shopifyOrdersByName = {};
 let cancelledSyncLog = new Set();   // orders with a 'cancelled' zoho_sync_log row
+let syncCalls = 0;                  // on-demand Shopify → Zoho order syncs (a WRITE)
 let nextRowId = 1;
 
 const bare = id => String(id || '').replace(/^#/, '').trim();
@@ -49,6 +50,7 @@ function resetWorld() {
     paymentsRecorded = [];
     shopifyOrdersByName = {};
     cancelledSyncLog = new Set();
+    syncCalls = 0;
     nextRowId = 1;
 }
 
@@ -222,6 +224,10 @@ axios.get = async (url, config = {}) => {
     return { data: { orders: matches }, headers: {} };
 };
 shopifyService.markOrderPaidByOrderNumber = async () => ({ success: true, action: 'sale' });
+
+// The on-demand sync is the one write hiding inside ensureInvoiceExists.
+const zohoSyncService = require(path.join(ROOT, 'src', 'services', 'zohoSyncService'));
+zohoSyncService.syncOrderToZoho = async () => { syncCalls++; return { success: true }; };
 
 // ============================================================
 // Assertions
@@ -398,6 +404,22 @@ async function main() {
     check('gateway COD wins', zohoCodService.isCodShopifyOrder({ payment_gateway_names: ['COD'], financial_status: 'paid' }) === true);
     check('an online gateway is never COD', zohoCodService.isCodShopifyOrder({ payment_gateway_names: ['razorpay'], financial_status: 'pending' }) === false);
     check('no gateway at all falls back to financial_status', zohoCodService.isCodShopifyOrder({ payment_gateway_names: [], financial_status: 'pending' }) === true);
+
+    // ---------------------------------------------------------- 12. dry-run purity
+    console.log('\n12. a dry run must not write — not even a missing invoice');
+    resetWorld();
+    shipmentRows = [{ order_id: '64700', status: 'delivered', carrier: 'delhivery', awb: 'AWB-5', delivered_at: new Date(), cod_amount: 999 }];
+    codShopifyOrder('64700');                 // delivered COD order with NO invoice in Zoho
+    stats = await zohoCodService.sweepUnreconciledCod({ dryRun: true });
+    check('dry run creates no invoice while previewing', syncCalls === 0 && paymentsRecorded.length === 0 && codRows.length === 0, `syncs=${syncCalls}`);
+    check('the missing invoice is called out, not filed as paid', stats.noInvoice === 1 && stats.alreadyPaid === 0, JSON.stringify(stats));
+
+    // the real path still auto-syncs, which is what makes it able to pay
+    resetWorld();
+    codShopifyOrder('64700');                 // resetWorld() clears the fixtures too
+    res = await zohoCodService.handleCodDelivery('64700', { carrier: 'delhivery' });
+    check('reconciling an unsynced order does run the sync', syncCalls === 1, `syncs=${syncCalls}`);
+    check('and still fails cleanly when no invoice appears', res.success === false && /No Zoho invoice/.test(res.error), JSON.stringify(res));
 
     // ---------------------------------------------------------- summary
     console.log(`\n================ ${passed} passed, ${failedChecks} failed ================`);
