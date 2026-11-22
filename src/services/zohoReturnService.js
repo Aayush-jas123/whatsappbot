@@ -104,6 +104,37 @@ function fallbackTaxDecisionFor(shopifyOrder) {
     return determineTaxType(process.env.ZOHO_SELLER_STATE || 'Haryana', customerState);
 }
 
+/** Calendar day on the server clock — Books dates are plain yyyy-MM-dd, so
+ *  the UTC day would be wrong for IST returns processed after midnight UTC. */
+function todayYmd() {
+    const now = new Date();
+    return `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}-${String(now.getDate()).padStart(2, '0')}`;
+}
+
+function addDaysYmd(ymd, days) {
+    const d = new Date(`${ymd}T00:00:00Z`);
+    d.setUTCDate(d.getUTCDate() + days);
+    return d.toISOString().slice(0, 10);
+}
+
+/**
+ * Credit note date Books will accept for this invoice.
+ *
+ * No date was ever sent, so Books defaulted the note to today — and rejected
+ * it with 400 "The credit note date should be later than the invoice date"
+ * whenever the return landed on the day the invoice was raised. The rule is
+ * strictly later-than, so the earliest valid date is invoice date + 1; keep
+ * today when it is already past that (a normal, later return), and only step
+ * forward for the same-day case.
+ */
+function creditNoteDateFor(invoiceDate) {
+    const today = todayYmd();
+    const inv = String(invoiceDate || '').slice(0, 10);
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(inv)) return today;
+    const earliest = addDaysYmd(inv, 1);
+    return today >= earliest ? today : earliest;
+}
+
 /**
  * Credit note payload that MIRRORS the invoice it reverses: same rate, same
  * discount proportion, same tax basis (CGST+SGST vs IGST, inclusive vs
@@ -130,6 +161,8 @@ async function buildMirroredCreditNotePayload({
     // fallback for the rare case the invoice has none.
     payload.customer_id = fullInvoice?.customer_id || customerId || null;
     payload.invoice_id = fullInvoice?.invoice_id;
+    // Must be later than the invoice date, or Books rejects the note outright
+    payload.date = creditNoteDateFor(fullInvoice?.date || fullInvoice?.issued_date);
     return payload;
 }
 
@@ -2261,6 +2294,10 @@ module.exports = {
     handleReturnsServerReturn,
     prepareAndCreateCreditNote,
     creditNoteReference,
+    // exported for the date-rule test (tmp/test-zoho-cancel-and-cn-date.js):
+    // same-day returns used to fail with 400 "credit note date should be later
+    // than the invoice date", and the rule is a boundary condition.
+    creditNoteDateFor,
     retryReturn,
     getReturnStats,
     getReturnLog,
