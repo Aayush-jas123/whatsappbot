@@ -1432,7 +1432,8 @@
     ['verifyBeforeGrant', 'Skip numbers we have never seen', 'Bulk grants ignore phones that appear in no ticket, no order and no shopper record.'],
     ['autoGrantNewTickets', 'Auto-grant when a ticket lands', 'Anyone who writes in is added to the list themselves, so an answer is always deliverable.'],
     ['agentMayGrant', 'Desk agents may change the list', 'Turn off and only the master admin can grant, revoke or clean up access.'],
-    ['webhookCacheFollowsList', 'Order cache follows the list', 'Shopify webhooks only store orders for listed numbers. Leave on unless the cache must cover everyone.']
+    ['webhookCacheFollowsList', 'Order cache follows the list', 'Shopify webhooks only store orders for listed numbers. Leave on unless the cache must cover everyone.'],
+    ['notifyOnGrant', 'Send the Support Desk intro on WhatsApp', 'Every grant also queues the approved support_desk_intro announcement to the new numbers. Off by default \u2014 these are Meta-billed marketing sends.']
   ];
 
   function accNum(n) { return (Number(n) || 0).toLocaleString('en-IN'); }
@@ -1539,6 +1540,7 @@
       + '<label class="desk-acc-field"><span>Expires after</span><input id="AccDays" type="number" min="0" step="1" value="' + (p.defaultDays || 0) + '"><em>days (0 = never)</em></label>'
       + '<label class="desk-acc-field grow"><span>Note</span><input id="AccNote" type="text" placeholder="why these were added"></label>'
       + '<label class="desk-check"><input id="AccSync" type="checkbox"' + (p.syncOnGrant === false ? '' : ' checked') + '> Pull their orders now</label>'
+      + '<label class="desk-check" title="WhatsApp the approved Support Desk intro to everyone this action grants"><input id="AccAnnounce" type="checkbox"' + (p.notifyOnGrant ? ' checked' : '') + '> Send intro message</label>'
       + '<button class="desk-btn"' + grantDis() + ' onclick="DESK.accAddOne()">Add one number</button>'
       + '</div>';
   }
@@ -1548,7 +1550,8 @@
       level: ($('AccLevel') || {}).value || 'full',
       days: Number(($('AccDays') || {}).value) || 0,
       note: (($('AccNote') || {}).value || '').trim() || null,
-      sync: !!($('AccSync') || {}).checked
+      sync: !!($('AccSync') || {}).checked,
+      announce: !!($('AccAnnounce') || {}).checked
     };
   }
 
@@ -1623,6 +1626,7 @@
       + '<button class="desk-btn-plain"' + (accExt() ? grantDis() : ' disabled') + ' onclick="DESK.accSelLevel(\'full\')">Make full access</button>'
       + '<button class="desk-btn-plain"' + (accExt() ? grantDis() : ' disabled') + ' onclick="DESK.accSelExpiry()">Set expiry\u2026</button>'
       + '<button class="desk-btn-plain" onclick="DESK.accSelResync()">Re-sync orders</button>'
+      + '<button class="desk-btn-plain"' + grantDis() + ' onclick="DESK.accSelAnnounce()">Send intro message</button>'
       + '<button class="desk-btn-plain" onclick="DESK.accExport()">Export CSV</button>'
       + '</div>';
   }
@@ -1721,7 +1725,7 @@
       + '</div>';
     html += '<div class="desk-set-sec">Rules</div>';
     ACC_TOGGLES.forEach(function (t) {
-      html += '<label class="desk-acc-toggle"><input id="Ap' + t[0] + '" type="checkbox"' + (p[t[0]] === false ? '' : ' checked')
+      html += '<label class="desk-acc-toggle"><input id="Ap' + t[0] + '" type="checkbox"' + (p[t[0]] ? ' checked' : '')
         + (isAdmin() ? '' : ' disabled') + '><span><b>' + t[1] + '</b><em>' + t[2] + '</em></span></label>';
     });
     html += '<div style="margin-top:14px"><button class="desk-btn"' + adminOnly() + ' onclick="DESK.saveAccessPolicy()">Save policy</button></div>';
@@ -1854,7 +1858,7 @@
   }
   function accBody(extra) {
     var o = accOpts();
-    var body = { level: o.level, days: o.days, note: o.note, sync: o.sync };
+    var body = { level: o.level, days: o.days, note: o.note, sync: o.sync, announce: o.announce };
     for (var k in (extra || {})) { if (extra.hasOwnProperty(k)) body[k] = extra[k]; }
     return body;
   }
@@ -1876,6 +1880,10 @@
     if (r.invalid && r.invalid.length) bits.push(accNum(r.invalid.length) + ' invalid skipped');
     if (r.skipped && r.skipped.length) bits.push(accNum(r.skipped.length) + ' unknown skipped');
     if (r.sync) bits.push(accNum(r.sync.orders) + ' orders pulled');
+    if (r.announce) {
+      if (r.announce.queued) bits.push('intro queued for ' + accNum(r.announce.queued) + (r.announce.capped ? ' (capped \u2014 use Send intro for the rest)' : ''));
+      else if (r.announce.error) bits.push('intro failed: ' + r.announce.error);
+    }
     if (r.schemaLimited) bits.push('level/expiry need the new columns');
     toast(bits.join(' \u00b7 '));
     accWritten();
@@ -1966,6 +1974,17 @@
       toast(accNum(r.orders) + ' orders pulled for ' + accNum(r.synced) + ' customers'
         + (r.failed ? ', ' + accNum(r.failed) + ' failed' : '')
         + (r.capped ? ' (capped \u2014 run again for the rest)' : ''));
+    });
+  }
+  // WhatsApp the approved Support Desk intro to the ticked numbers without
+  // touching access itself \u2014 the sends ride the shared broadcast queue.
+  function accSelAnnounce() {
+    var phones = accNeedSel();
+    if (!phones) return;
+    if (!window.confirm('Send the Support Desk intro WhatsApp message to ' + accNum(phones.length) + ' selected numbers?')) return;
+    accRun(api('/api/support/admin/access/announce', { method: 'POST', body: { phones: phones } }), function (r) {
+      if (r.queued) toast('Intro queued for ' + accNum(r.queued) + (r.capped ? ' (capped \u2014 run again for the rest)' : ''));
+      else toast(r.error || 'Nothing queued', true);
     });
   }
   function accCleanup(kind) {
@@ -2601,7 +2620,7 @@
     accGrantSegment: accGrantSegment, accAllowOnly: accAllowOnly, accAddOne: accAddOne, accImport: accImport,
     accPick: accPick, accPickAll: accPickAll, accClearSel: accClearSel,
     accSelGrant: accSelGrant, accSelRevoke: accSelRevoke, accRevokeOne: accRevokeOne, accClearAll: accClearAll,
-    accSelLevel: accSelLevel, accSelExpiry: accSelExpiry, accSelResync: accSelResync, accCleanup: accCleanup,
+    accSelLevel: accSelLevel, accSelExpiry: accSelExpiry, accSelResync: accSelResync, accSelAnnounce: accSelAnnounce, accCleanup: accCleanup,
     accExport: accExport, loadAccessRoster: loadAccessRoster, accListDormant: accListDormant, accListView: accListView,
     accListSearch: accListSearch,
     closeModal: closeModal, syncOrders: syncOrders, lightbox: lightbox,

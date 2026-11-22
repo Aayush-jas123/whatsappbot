@@ -39,7 +39,8 @@ const POLICY_DEFAULTS = {
     autoGrantChannel: 'website',// 'website' | 'any' — which channels auto-grant applies to
     dormantRevokeDays: 0,       // 0 = off; feeds the "revoke dormant" cleanup
     agentMayGrant: true,        // desk agents without the master-admin role may grant/revoke
-    webhookCacheFollowsList: true // only cache Shopify orders for explicitly listed phones
+    webhookCacheFollowsList: true, // only cache Shopify orders for explicitly listed phones
+    notifyOnGrant: false        // queue the support_desk_intro WhatsApp message on every grant
 };
 
 function clampEnum(value, allowed, fallback) {
@@ -61,6 +62,7 @@ async function getPolicy() {
     out.autoGrantNewTickets = !!out.autoGrantNewTickets;
     out.agentMayGrant = out.agentMayGrant !== false;
     out.webhookCacheFollowsList = out.webhookCacheFollowsList !== false;
+    out.notifyOnGrant = !!out.notifyOnGrant;
     return out;
 }
 

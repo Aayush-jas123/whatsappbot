@@ -5,6 +5,7 @@ const multer = require('multer');
 const Support = require('../services/supportService');
 const SupportSync = require('../services/supportSync');
 const SupportAccess = require('../services/supportAccessService');
+const broadcastService = require('../services/broadcastService');
 const shopifyService = require('../services/shopifyService');
 const razorpayService = require('../services/razorpayService');
 const cloudinary = require('../services/cloudinaryService');
@@ -700,6 +701,43 @@ async function syncOrdersBounded(phones) {
     return { synced: targets.length, orders, failed, capped: phones.length > targets.length };
 }
 
+// ---------- Support Desk intro message ----------
+// The Meta template support_desk_intro (see create_support_desk_intro_template.js)
+// announces the Support Desk to customers. It can ride along with any grant
+// (the Access console's "Send intro message" checkbox, or the notifyOnGrant
+// policy default) or go on demand to any selection/segment via /access/announce.
+// Sending goes through the shared broadcast queue, so the customer name is
+// resolved per recipient ({{name}}) and Meta's send rate is respected; if the
+// template is still pending approval the sends fail in the queue, not here.
+const SUPPORT_DESK_INTRO_TEMPLATE = 'support_desk_intro';
+const INTRO_QUEUE_CAP = 2000;
+
+async function queueSupportDeskIntro(phones, req) {
+    const targets = (phones || []).slice(0, INTRO_QUEUE_CAP);
+    if (!targets.length) return { queued: 0 };
+    try {
+        const result = await broadcastService.sendTemplateToPhones(
+            SUPPORT_DESK_INTRO_TEMPLATE,
+            'en',
+            targets,
+            agentName(req),
+            [{ type: 'body', parameters: [{ type: 'text', text: '{{name}}' }] }],
+            5,
+            'Support Desk intro'
+        );
+        if (!result.success) return { error: result.message };
+        return { queued: targets.length, broadcastId: result.broadcastId, capped: phones.length > targets.length };
+    } catch (e) {
+        console.error('[Support Desk] intro queue error:', e.message);
+        return { error: e.message };
+    }
+}
+
+// The grant checkbox always wins; without it the policy default decides.
+function wantAnnounce(body, policy) {
+    return body.announce !== undefined ? !!body.announce : !!policy.notifyOnGrant;
+}
+
 router.get('/access/overview', async (req, res) => {
     try {
         res.json(await SupportAccess.overview());
@@ -746,7 +784,8 @@ router.post('/access/grant', mayManageGrants, async (req, res) => {
         });
         const wantSync = body.sync !== undefined ? !!body.sync : policy.syncOnGrant;
         const sync = wantSync ? await syncOrdersBounded(result.phones || []) : null;
-        res.json({ success: true, ...result, sync });
+        const announce = wantAnnounce(body, policy) ? await queueSupportDeskIntro(result.phones || [], req) : null;
+        res.json({ success: true, ...result, sync, announce });
     } catch (error) {
         console.error('[Support Desk] access grant error:', error.message);
         res.status(400).json({ error: error.message });
@@ -830,9 +869,24 @@ router.post('/access/import', mayManageGrants, async (req, res) => {
             source: 'import',
             policy
         });
-        res.json({ success: true, parsed: parsed.valid.length, ignored: parsed.invalid.length, ...result });
+        const announce = wantAnnounce(body, policy) ? await queueSupportDeskIntro(result.phones || [], req) : null;
+        res.json({ success: true, parsed: parsed.valid.length, ignored: parsed.invalid.length, ...result, announce });
     } catch (error) {
         console.error('[Support Desk] access import error:', error.message);
+        res.status(400).json({ error: error.message });
+    }
+});
+
+// Send the Support Desk intro on demand — to ticked numbers, a whole segment
+// or pasted text, same resolution rules as a grant. Nothing is written to the
+// whitelist here; this route only queues WhatsApp sends.
+router.post('/access/announce', mayManageGrants, async (req, res) => {
+    try {
+        const phones = await resolvePhones(req);
+        if (!phones.length) return res.status(400).json({ error: 'Nothing to send — no numbers matched' });
+        res.json({ success: true, ...(await queueSupportDeskIntro(phones, req)) });
+    } catch (error) {
+        console.error('[Support Desk] access announce error:', error.message);
         res.status(400).json({ error: error.message });
     }
 });
