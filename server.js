@@ -859,15 +859,8 @@ async function startServer() {
         const SettingsModel = require('./src/models/Settings');
         const followUpService = require('./src/services/followUpService');
         const shiprocketService = require('./src/services/shiprocketService');
-        // Lazy-load zohoItemResolver — only needed for cache clearing on pressure
-        let _zohoItemResolver = null;
-        function getZohoItemResolver() {
-            if (!_zohoItemResolver) {
-                try { _zohoItemResolver = require('./src/services/zohoItemResolver'); }
-                catch (e) { /* module may not exist in all deploys */ }
-            }
-            return _zohoItemResolver;
-        }
+        // zohoItemResolver's item cache is process-wide but bounded (LRU cap 300,
+        // 10 min TTL), so it needs no pressure-time sweep.
 
         let watchdogTick = 0;
         setInterval(() => {
@@ -930,12 +923,9 @@ async function startServer() {
 
                     try { shiprocketService.orderCache.clear(); } catch (e) { /* ignore */ }
 
-                    // Clear zohoItemResolver caches (unbounded itemCache Map)
+                    // The Zoho item cache is bounded (see above); invalidate the
+                    // LRU query caches that feed everything else.
                     try {
-                        const zir = getZohoItemResolver();
-                        // zohoItemResolver doesn't expose a clear() — the resolver
-                        // is created per-run by callers, so there's no global handle.
-                        // Instead, invalidate the LRU caches that feed it.
                         invalidateCache('queries');
                     } catch (e) { /* ignore */ }
 
