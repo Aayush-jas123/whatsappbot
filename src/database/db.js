@@ -1216,6 +1216,9 @@ async function initializePerformanceIndexes() {
     await pool.query('CREATE INDEX IF NOT EXISTS idx_store_shoppers_created_at ON store_shoppers(created_at DESC)');
     // Composite index for inventory intelligence (status + created_at for filtering; items_json fetched from heap)
     await pool.query('CREATE INDEX IF NOT EXISTS idx_store_shoppers_status_created ON store_shoppers(status, created_at DESC)');
+    // Covering index for the inbox confirmation-analytics day×method aggregate
+    // (confirmed rows only; confirmed_by resolved from the index, no heap fetch)
+    await pool.query('CREATE INDEX IF NOT EXISTS idx_store_shoppers_confirmed_by ON store_shoppers(updated_at DESC, confirmed_by) WHERE status = \'confirmed\'');
     
     // Index for orders table (JOIN operations)
     await pool.query('CREATE INDEX IF NOT EXISTS idx_orders_order_id ON orders(order_id)');
@@ -1308,6 +1311,43 @@ async function initializePerformanceIndexes() {
     
     // Shipments: partial index for tracking URL lookups (only rows with tracking URLs)
     await pool.query('CREATE INDEX IF NOT EXISTS idx_shipments_awb_tracking_partial ON shipments(awb) WHERE tracking_url IS NOT NULL AND tracking_url <> \'\'');
+
+    // ── Access-tab phone aggregates: normalized phone as an indexable expression ──
+    // supportAccessService.normSql used to inline a CASE + REGEXP_REPLACE per
+    // row, so every Access-tab load re-ran full heap scans (900ms–23s queries
+    // in the Nov 23 logs). support_normalize_phone() is that exact mapping
+    // (10 digits -> 91+10, leading 0 dropped, 0091 stripped), declared
+    // IMMUTABLE because digit-stripping an ASCII pattern is deterministic.
+    // The b-tree expression indexes below match it so the COUNT(DISTINCT ...) /GROUP BY scans
+    // can run as index-only scans. Same DDL as migrate-add-phone-norm-indexes.js,
+    // which builds the big ones CONCURRENTLY without blocking writes.
+    await pool.query(`
+      CREATE OR REPLACE FUNCTION support_normalize_phone(raw text)
+      RETURNS text LANGUAGE sql IMMUTABLE AS $fn$
+        SELECT CASE
+          WHEN LENGTH(d) = 10 THEN '91' || d
+          WHEN LENGTH(d) = 11 AND LEFT(d, 1) = '0' THEN '91' || SUBSTRING(d FROM 2)
+          WHEN LENGTH(d) > 12 AND LEFT(d, 4) = '0091' THEN '91' || SUBSTRING(d FROM 5)
+          ELSE d
+        END
+        FROM (SELECT REGEXP_REPLACE(COALESCE(raw, ''), '[^0-9]', '', 'g') AS d) q
+      $fn$
+    `);
+    await pool.query(`
+      CREATE INDEX IF NOT EXISTS idx_support_tickets_phone_norm
+      ON support_tickets ((support_normalize_phone(customer_phone)))
+      INCLUDE (status, priority, team, reason, sub, customer_name, created_at)
+    `);
+    await pool.query(`
+      CREATE INDEX IF NOT EXISTS idx_support_order_cache_phone_norm
+      ON support_order_cache ((support_normalize_phone(customer_phone)))
+      INCLUDE (stage, placed_at, total, payment)
+    `);
+    await pool.query(`
+      CREATE INDEX IF NOT EXISTS idx_store_shoppers_phone_norm
+      ON store_shoppers ((support_normalize_phone(phone)))
+      INCLUDE (name, created_at)
+    `);
 
     console.log('✅ Performance indexes initialized');
   } catch (error) {

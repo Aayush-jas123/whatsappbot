@@ -224,16 +224,41 @@ function raiseCatalog(order) {
 }
 
 // ---------- settings ----------
+// support_settings is tiny but hot: the Nov 23 log sweep shows the single-key
+// read firing 30+ times per desk page load (cost_config, sla, teams,
+// resolution_templates, portal_routing, access policy), each one paying for a
+// pool slot behind the Access-tab bursts. `key` is already the table's PRIMARY
+// KEY, so the read itself is cheap — the fix is not asking for it every time.
+// 30s of staleness is harmless for these toggles and putSetting() drops the
+// entry immediately, so a save always reads back what it just wrote.
+const SETTINGS_TTL_MS = 30 * 1000;
+const settingCache = new Map();   // key -> { value, at }
+let allSettingsEntry = null;      // { value, at } for getAllSettings
+
+// Settings are JSONB objects; hand out copies so a caller mutating its
+// result can never poison the cached value.
+const cloneSetting = (v) => (v && typeof v === 'object' ? JSON.parse(JSON.stringify(v)) : v);
+
 async function getSetting(key) {
+    const hit = settingCache.get(key);
+    if (hit && Date.now() - hit.at < SETTINGS_TTL_MS) return cloneSetting(hit.value);
     const rows = await dbAdapter.query('SELECT value FROM support_settings WHERE key = ?', [key]);
-    return rows.length ? rows[0].value : null;
+    const value = rows.length ? rows[0].value : null;
+    settingCache.set(key, { value, at: Date.now() });
+    return cloneSetting(value);
 }
 
 async function getAllSettings() {
+    if (allSettingsEntry && Date.now() - allSettingsEntry.at < SETTINGS_TTL_MS) return cloneSetting(allSettingsEntry.value);
     const rows = await dbAdapter.query('SELECT key, value FROM support_settings');
     const out = {};
-    rows.forEach(r => { out[r.key] = r.value; });
-    return out;
+    const now = Date.now();
+    rows.forEach(r => {
+        out[r.key] = r.value;
+        settingCache.set(r.key, { value: r.value, at: now });
+    });
+    allSettingsEntry = { value: out, at: now };
+    return cloneSetting(out);
 }
 
 async function putSetting(key, value) {
@@ -243,6 +268,8 @@ async function putSetting(key, value) {
          ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = CURRENT_TIMESTAMP`,
         [key, JSON.stringify(value ?? null)]
     );
+    settingCache.delete(key);
+    allSettingsEntry = null;
     return true;
 }
 

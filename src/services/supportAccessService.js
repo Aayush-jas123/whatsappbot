@@ -1,4 +1,5 @@
 const { dbAdapter } = require('../database/db');
+const { caches } = require('../utils/cache');
 const Support = require('./supportService');
 
 // ============================================================
@@ -70,6 +71,7 @@ async function savePolicy(patch) {
     const next = { ...await getPolicy(), ...(patch || {}) };
     await Support.putSetting(ACCESS_SETTING_KEY, next);
     invalidateSnapshot();
+    invalidateStatsCache();
     return getPolicy();
 }
 
@@ -90,19 +92,16 @@ async function hasExtendedColumns() {
 }
 
 // ---------- phone normalization in SQL ----------
-const digitsOf = (col) => `REGEXP_REPLACE(COALESCE(${col}, ''), '[^0-9]', '', 'g')`;
-
 // Mirrors Support.normalizePhone: 10 digits -> 91+10, leading 0 dropped,
 // 0091 stripped. Anything left over that is not exactly 12 digits is invalid
-// and gets filtered by validPhoneWhere().
+// and gets filtered by VALID_RE. This used to be an inline CASE +
+// REGEXP_REPLACE; the same mapping now lives in the IMMUTABLE
+// support_normalize_phone() SQL function (created at boot by
+// initializePerformanceIndexes and by migrate-add-phone-norm-indexes.js,
+// which builds it CONCURRENTLY), so the b-tree expression indexes below it
+// can turn the Access-tab phone aggregates into index-only scans.
 function normSql(col) {
-    const d = digitsOf(col);
-    return `(CASE
-              WHEN LENGTH(${d}) = 10 THEN '91' || ${d}
-              WHEN LENGTH(${d}) = 11 AND LEFT(${d}, 1) = '0' THEN '91' || SUBSTRING(${d} FROM 2)
-              WHEN LENGTH(${d}) > 12 AND LEFT(${d}, 4) = '0091' THEN '91' || SUBSTRING(${d} FROM 5)
-              ELSE ${d}
-            END)`;
+    return `support_normalize_phone(${col})`;
 }
 const VALID_RE = '^91[0-9]{10}$';
 
@@ -470,14 +469,46 @@ async function segmentPhones(id, ctx) {
 }
 
 // ---------- summary ----------
+// Display-only card counts, so they are cached for 2 minutes instead of
+// recomputed per Access-tab load: the Nov 23 log showed the full-table regex
+// passes costing 900ms–23s each, eight fired at once, pinning the 10-slot
+// pool and timing out unrelated queries. getOrLoad also single-flights, so
+// concurrent loads share one recompute; every mutation path below drops the
+// entry so the tab stays honest right after a grant/revoke/cleanup.
+const STATS_CACHE_KEY = 'access:segmentCounts';
+const STATS_TTL_MS = 120 * 1000;
+const STATS_CONCURRENCY = 2;
+
+function invalidateStatsCache() {
+    caches.queries.delete(STATS_CACHE_KEY);
+}
+
+// Run query thunks with at most `limit` pool connections checked out at once.
+async function runLimited(thunks, limit) {
+    const out = new Array(thunks.length);
+    let next = 0;
+    const workers = Array.from({ length: Math.min(limit, thunks.length) }, async () => {
+        while (next < thunks.length) {
+            const i = next++;
+            out[i] = await thunks[i]();
+        }
+    });
+    await Promise.all(workers);
+    return out;
+}
+
+async function segmentCounts(force) {
+    return caches.queries.getOrLoad(STATS_CACHE_KEY, computeSegmentCounts, STATS_TTL_MS, { refresh: Boolean(force) });
+}
+
 // One query per source table instead of one per segment: the Access tab renders
-// ~30 cards and still boots in three round trips.
-async function segmentCounts() {
+// ~30 cards and still boots in a couple of round trips.
+async function computeSegmentCounts() {
     const out = {};
     const ctx = await segmentCtx();
     const jobs = [
         // Distinct customers per ticket-shaped segment, in one pass.
-        dbAdapter.query(`
+        () => dbAdapter.query(`
             SELECT
                 COUNT(DISTINCT ${normSql('customer_phone')}) FILTER (WHERE ${TICKET_LIVE}) AS active_tickets,
                 COUNT(DISTINCT ${normSql('customer_phone')}) FILTER (WHERE status = 'open') AS open_tickets,
@@ -490,14 +521,14 @@ async function segmentCounts() {
                 COUNT(DISTINCT ${normSql('customer_phone')}) FILTER (WHERE created_at >= CURRENT_TIMESTAMP - INTERVAL '30 days') AS ticketed_30d
             FROM support_tickets`),
         // Ticket history grouped, for the "nothing live" segment.
-        dbAdapter.query(`
+        () => dbAdapter.query(`
             SELECT COUNT(*) FILTER (WHERE live_cnt = 0) AS closed_only FROM (
                 SELECT ${normSql('customer_phone')} AS phone,
                        COUNT(*) FILTER (WHERE ${TICKET_LIVE}) AS live_cnt
                 FROM support_tickets GROUP BY 1) t
             WHERE t.phone ~ '${VALID_RE}'`),
         // Distinct customers per order-stage segment.
-        dbAdapter.query(`
+        () => dbAdapter.query(`
             SELECT
                 COUNT(DISTINCT ${normSql('customer_phone')}) FILTER (WHERE stage NOT IN ('delivered','cancelled','rto')) AS live_orders,
                 COUNT(DISTINCT ${normSql('customer_phone')}) FILTER (WHERE stage = 'unshipped') AS unshipped,
@@ -510,7 +541,7 @@ async function segmentCounts() {
                 COUNT(DISTINCT ${normSql('customer_phone')}) FILTER (WHERE placed_at >= CURRENT_TIMESTAMP - INTERVAL '90 days') AS ordered_90d
             FROM support_order_cache`),
         // Order counts grouped per customer, for the value segments.
-        dbAdapter.query(`
+        () => dbAdapter.query(`
             SELECT COUNT(*) FILTER (WHERE n >= 2) AS repeat_buyers,
                    COUNT(*) FILTER (WHERE mx >= ${ctx.highValue}) AS high_value,
                    COUNT(*) FILTER (WHERE done) AS delivered_only
@@ -521,28 +552,31 @@ async function segmentCounts() {
                        BOOL_AND(stage IN ('delivered','cancelled','rto')) AS done
                 FROM support_order_cache GROUP BY 1) o
             WHERE o.phone ~ '${VALID_RE}'`),
-        dbAdapter.query(`SELECT COUNT(DISTINCT ${normSql('phone')}) AS shoppers_hub FROM store_shoppers
+        () => dbAdapter.query(`SELECT COUNT(DISTINCT ${normSql('phone')}) AS shoppers_hub FROM store_shoppers
                           WHERE ${normSql('phone')} ~ '${VALID_RE}'`),
         // Roster hygiene: listed but not a number we can ever match to someone.
-        dbAdapter.query(`SELECT COUNT(*)::int AS granted_invalid FROM support_whitelist w
+        () => dbAdapter.query(`SELECT COUNT(*)::int AS granted_invalid FROM support_whitelist w
             LEFT JOIN (${KNOWN_PHONES_SQL}) k ON k.phone = ${normSql('w.phone')}
             WHERE ${normSql('w.phone')} !~ '${VALID_RE}' OR k.phone IS NULL`),
         // The universe union is the expensive one; counted on its own so the
         // others can run without holding a long read transaction open. The
         // gap list rides the same scan, so the "without access" card can never
         // disagree with the segment it links to.
-        dbAdapter.query(`SELECT COUNT(*) AS all_known,
+        () => dbAdapter.query(`SELECT COUNT(*) AS all_known,
                                 COUNT(*) FILTER (WHERE w.phone IS NULL) AS ungranted_known
                          FROM (${KNOWN_PHONES_SQL}) k
                          LEFT JOIN support_whitelist w ON w.phone = k.phone
                          WHERE k.phone ~ '${VALID_RE}'`),
-        dbAdapter.query(`
+        () => dbAdapter.query(`
             SELECT COUNT(*) AS granted_dormant FROM support_whitelist w
             LEFT JOIN (${LAST_SEEN_SQL}) s ON s.phone = ${normSql('w.phone')}
             WHERE s.last_at IS NULL OR s.last_at < CURRENT_TIMESTAMP - make_interval(days => ${ctx.dormantDays})`)
     ];
 
-    const results = await Promise.all(jobs.map(p => p.catch(e => ({ __error: e.message }))));
+    const results = await runLimited(
+        jobs.map(run => () => run().catch(e => ({ __error: e.message }))),
+        STATS_CONCURRENCY
+    );
     for (const res of results) {
         if (res && !res.__error) Object.assign(out, res[0] || {});
     }
@@ -738,6 +772,7 @@ async function bulkGrant(phones, opts = {}) {
     }
 
     invalidateSnapshot();
+    invalidateStatsCache();
     return { requested: list.length, granted, updated, phones: targets, invalid, skipped, level, days, source, schemaLimited: !ext };
 }
 
@@ -758,6 +793,7 @@ async function bulkRevoke(phones) {
         );
     }
     invalidateSnapshot();
+    invalidateStatsCache();
     return { revoked };
 }
 
@@ -800,6 +836,7 @@ async function updateGrants(phones, patch = {}) {
         changed += Number(res.changes) || 0;
     }
     invalidateSnapshot();
+    invalidateStatsCache();
     return { updated: changed };
 }
 
@@ -810,6 +847,7 @@ async function cleanup(kind, opts = {}) {
         if (!ext) throw new Error('No expiry column to clean against yet.');
         const res = await dbAdapter.run('DELETE FROM support_whitelist WHERE expires_at IS NOT NULL AND expires_at < CURRENT_TIMESTAMP');
         invalidateSnapshot();
+        invalidateStatsCache();
         return { kind, removed: Number(res.changes) || 0 };
     }
     if (kind === 'invalid') {
@@ -819,6 +857,7 @@ async function cleanup(kind, opts = {}) {
         const ph = bad.map(() => '?').join(',');
         const res = await dbAdapter.run(`DELETE FROM support_whitelist WHERE phone IN (${ph})`, bad);
         invalidateSnapshot();
+        invalidateStatsCache();
         return { kind, removed: Number(res.changes) || 0 };
     }
     if (kind === 'duplicates') {
@@ -835,6 +874,7 @@ async function cleanup(kind, opts = {}) {
         const res = await dbAdapter.run(
             `DELETE FROM support_whitelist WHERE id IN (${dupIds.map(() => '?').join(',')})`, dupIds);
         invalidateSnapshot();
+        invalidateStatsCache();
         return { kind, removed: Number(res.changes) || 0 };
     }
     if (kind === 'dormant') {
@@ -1000,7 +1040,7 @@ module.exports = {
     ACCESS_SETTING_KEY, POLICY_DEFAULTS, MODES, LEVELS, VALID_RE, MAX_BULK,
     getPolicy, savePolicy,
     getSnapshot, invalidateSnapshot, checkAccess, isListed, isWhitelistedCached,
-    SEGMENT_IDS, segmentDef, segmentPhones, segmentCounts,
+    SEGMENT_IDS, segmentDef, segmentPhones, segmentCounts, invalidateStatsCache,
     listRoster, candidates, overview,
     bulkGrant, bulkRevoke, syncListToSegment, updateGrants, cleanup, parseImport,
     maybeAutoGrant, normalizeList, hasExtendedColumns, normSql
