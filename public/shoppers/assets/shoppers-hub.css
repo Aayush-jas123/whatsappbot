@@ -2629,6 +2629,127 @@
         }
         .inbox-method-badge.whatsapp { background: rgba(37,211,102,0.2); color: #25d366; border: 1px solid rgba(37,211,102,0.3); }
         .inbox-method-badge.manual { background: rgba(83,189,235,0.2); color: #53bdeb; border: 1px solid rgba(83,189,235,0.3); }
+        
+        /* Inbox Confirmation Analytics Panel (confirmed tab) */
+        .inbox-analytics-panel {
+            background: rgba(255,255,255,0.03);
+            border: 1px solid rgba(255,255,255,0.08);
+            border-radius: 12px;
+            margin-bottom: 1.5rem;
+            overflow: hidden;
+        }
+        .inbox-analytics-head {
+            display: flex;
+            align-items: center;
+            gap: 0.6rem;
+            padding: 0.85rem 1.1rem;
+            cursor: default;
+        }
+        .inbox-analytics-toggle {
+            background: none;
+            border: none;
+            color: rgba(255,255,255,0.55);
+            cursor: pointer;
+            font-size: 0.7rem;
+            padding: 0.2rem 0.35rem;
+        }
+        .inbox-analytics-toggle:hover { color: #fff; }
+        .inbox-analytics-title {
+            font-family: 'Outfit', sans-serif;
+            font-weight: 600;
+            font-size: 0.9rem;
+            letter-spacing: 0.5px;
+            display: flex;
+            align-items: center;
+            gap: 0.6rem;
+            flex: 1;
+        }
+        .inbox-analytics-range { font-size: 0.72rem; font-weight: 400; color: rgba(255,255,255,0.45); }
+        .inbox-analytics-refresh {
+            background: none;
+            border: 1px solid rgba(255,255,255,0.15);
+            border-radius: 8px;
+            color: rgba(255,255,255,0.6);
+            cursor: pointer;
+            font-size: 0.85rem;
+            padding: 0.25rem 0.55rem;
+        }
+        .inbox-analytics-refresh:hover { color: #fff; border-color: rgba(255,255,255,0.4); }
+        .inbox-analytics-body { padding: 0 1.1rem 1.1rem; }
+        .inbox-analytics-panel.collapsed .inbox-analytics-body { display: none; }
+        .inbox-analytics-loading { padding: 1.25rem 0; font-size: 0.8rem; color: rgba(255,255,255,0.45); }
+        .inbox-analytics-cards {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(130px, 1fr));
+            gap: 0.75rem;
+            margin-bottom: 1rem;
+        }
+        .inbox-analytics-card {
+            background: rgba(255,255,255,0.03);
+            border: 1px solid rgba(255,255,255,0.07);
+            border-radius: 10px;
+            padding: 0.8rem 0.9rem;
+        }
+        .inbox-analytics-card .iac-value {
+            font-family: 'Outfit', sans-serif;
+            font-size: 1.45rem;
+            font-weight: 700;
+            line-height: 1.1;
+            display: flex;
+            align-items: baseline;
+            gap: 0.4rem;
+        }
+        .inbox-analytics-card .iac-value i { font-style: normal; font-size: 0.7rem; font-weight: 500; color: rgba(255,255,255,0.45); }
+        .inbox-analytics-card .iac-label { font-size: 0.62rem; letter-spacing: 1.2px; text-transform: uppercase; color: rgba(255,255,255,0.45); margin-top: 0.25rem; }
+        .inbox-analytics-card .iac-sub { font-size: 0.7rem; color: rgba(255,255,255,0.55); margin-top: 0.3rem; }
+        .inbox-analytics-card.whatsapp .iac-value { color: #25d366; }
+        .inbox-analytics-card.manual .iac-value { color: #53bdeb; }
+        .inbox-analytics-delta.up { color: #25d366; }
+        .inbox-analytics-delta.down { color: #ff4757; }
+        .inbox-analytics-delta.flat { color: rgba(255,255,255,0.4); }
+        .inbox-analytics-mix { margin-bottom: 1rem; }
+        .iac-mix-label, .iac-chart-label { font-size: 0.62rem; letter-spacing: 1.2px; text-transform: uppercase; color: rgba(255,255,255,0.4); margin-bottom: 0.45rem; }
+        .iac-mix-bar {
+            display: flex;
+            height: 8px;
+            border-radius: 4px;
+            overflow: hidden;
+            background: rgba(255,255,255,0.05);
+        }
+        .iac-mix-seg { display: block; height: 100%; }
+        .iac-mix-legend { display: flex; flex-wrap: wrap; gap: 0.9rem; margin-top: 0.5rem; font-size: 0.7rem; color: rgba(255,255,255,0.6); }
+        .iac-mix-legend i { display: inline-block; width: 8px; height: 8px; border-radius: 2px; margin-right: 0.35rem; }
+        .inbox-analytics-chart .iac-bars { display: flex; align-items: flex-end; gap: 3px; height: 110px; }
+        .iac-bar-col {
+            flex: 1;
+            display: flex;
+            flex-direction: column;
+            justify-content: flex-end;
+            align-items: center;
+            height: 100%;
+            min-width: 0;
+            cursor: default;
+        }
+        .iac-bar-total { font-size: 0.6rem; color: rgba(255,255,255,0.5); margin-bottom: 2px; }
+        .iac-bar {
+            width: 100%;
+            max-width: 22px;
+            height: 78px;
+            display: flex;
+            flex-direction: column-reverse;
+            border-radius: 3px;
+            overflow: hidden;
+            background: rgba(255,255,255,0.04);
+        }
+        .iac-bar-seg { display: block; width: 100%; }
+        .iac-bar-day { font-size: 0.55rem; color: rgba(255,255,255,0.3); margin-top: 3px; }
+        .iac-bar-col:hover .iac-bar { outline: 1px solid rgba(255,255,255,0.3); }
+        @media (max-width: 768px) {
+            .inbox-analytics-body { padding: 0 0.75rem 0.75rem; }
+            .inbox-analytics-chart .iac-bars { height: 90px; }
+            .iac-bar { max-width: 14px; }
+            .iac-bar-day { display: none; }
+        }
 
         /* Inbox Unread Count */
         .inbox-unread-count {

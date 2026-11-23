@@ -6,7 +6,7 @@
     <title>Shopper Management | OFFCOMFRT</title>
     <!-- Google Fonts: Outfit, Inter, Archivo Narrow -->
         <link href="https://fonts.googleapis.com/css2?family=Outfit:wght@300;400;500;700&family=Inter:wght@400;500;600&family=Archivo+Narrow:wght@400;500;600;700&display=swap" rel="stylesheet">
-        <link rel="stylesheet" href="/shoppers/assets/shoppers-hub.css?build=20261120-editableprojected1">
+        <link rel="stylesheet" href="/shoppers/assets/shoppers-hub.css?build=20261123-inboxconfanalytics1">
 </head>
 <body class="dark-theme">
     <!-- Login View -->
@@ -939,6 +939,20 @@
                         <div class="stat-number" id="inboxStatEdits">0</div>
                         <div class="stat-label">Edit Requests</div>
                     </div>
+                </div>
+            </div>
+
+            <!-- Confirmation Analytics (confirmed tab only) -->
+            <div class="inbox-analytics-panel inbox-confirmed-filter hidden" id="inboxAnalyticsPanel">
+                <div class="inbox-analytics-head">
+                    <button type="button" class="inbox-analytics-toggle" id="inboxAnalyticsToggle" aria-expanded="true">▼</button>
+                    <div class="inbox-analytics-title">Confirmation Analytics
+                        <span class="inbox-analytics-range" id="inboxAnalyticsRange"></span>
+                    </div>
+                    <button type="button" class="inbox-analytics-refresh" id="inboxAnalyticsRefresh">↻</button>
+                </div>
+                <div class="inbox-analytics-body" id="inboxAnalyticsBody">
+                    <div class="inbox-analytics-loading">Loading analytics…</div>
                 </div>
             </div>
 
@@ -2030,7 +2044,7 @@
     </section>
 
     <!-- Scripts -->
-    <script src="/shoppers/assets/shoppers-app.js?build=20261116-deepfocus1"></script>
+    <script src="/shoppers/assets/shoppers-app.js?build=20261123-inboxconfanalytics1"></script>
     <script src="/shoppers/assets/shoppers-forecast-engine.js?v=20261024-1"></script>
     <script src="/shoppers/assets/shoppers-forecast-workspace.js?v=20261024-1"></script>
     <script src="/shoppers/assets/shoppers-inventory-tower.js?v=20261024-forecast1"></script>

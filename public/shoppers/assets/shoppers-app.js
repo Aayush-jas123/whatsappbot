@@ -714,8 +714,10 @@ function setupEventListeners() {
             toggleInboxConfirmedFilters();
             inboxDeselectAll();
             fetchInboxData();
+            scheduleInboxAnalytics();
         });
     });
+    setupInboxAnalyticsEvents();
     document.getElementById('inboxPrevBtn')?.addEventListener('click', () => {
         inboxPageOffset = Math.max(0, inboxPageOffset - inboxLimitPerPage);
         fetchInboxData();
@@ -1823,9 +1825,12 @@ function updateMoActiveFilters() {
     });
 }
 
-async function fetchInboxData() {
+async function fetchInboxData(forceFresh) {
     const container = document.getElementById('inboxListContainer');
     if (!container) return;
+    // Explicit refresh (click event or truthy flag) must bypass the analytics
+    // dedupe key so mutated rows are reflected immediately
+    if (forceFresh) inboxAnalyticsLastQs = null;
 
     container.innerHTML = '<div style="display:flex;flex-direction:column;align-items:center;justify-content:center;padding:4rem;"><div class="spinner"></div><span style="font-family:\'Archivo Narrow\',sans-serif;letter-spacing:2px;font-weight:500;opacity:0.7;margin-top:1rem;">LOADING...</span></div>';
 
@@ -1854,6 +1859,7 @@ async function fetchInboxData() {
         if (data && data.success) {
             renderInboxList(data.shoppers, data.total);
             fetchInboxCounts(); // refresh counts/badges
+            if (currentInboxTab === 'confirmed') scheduleInboxAnalytics();
         } else {
             throw new Error(data?.error || 'Failed to fetch');
         }
@@ -2267,6 +2273,163 @@ function onInboxDateFieldChange() {
     inboxPageOffset = 0;
     fetchInboxData();
     updateInboxFilterChip();
+    scheduleInboxAnalytics();
+}
+
+// ==========================================
+// INBOX CONFIRMATION ANALYTICS (confirmed tab)
+// The backend aggregates day×method in one indexed pass; this panel only
+// renders the compact payload. Fetches are debounced and keyed so filter
+// churn doesn't stampede, and pagination is excluded from the key.
+// ==========================================
+
+let inboxAnalyticsCollapsed = false;
+let inboxAnalyticsTimer = null;
+let inboxAnalyticsLastQs = null;
+let inboxAnalyticsReqSeq = 0;
+
+function scheduleInboxAnalytics(force = false) {
+    if (currentInboxTab !== 'confirmed') return;
+    clearTimeout(inboxAnalyticsTimer);
+    inboxAnalyticsTimer = setTimeout(() => fetchInboxAnalytics(force), force ? 0 : 250);
+}
+
+// After a status mutation the backend cache may still hold pre-mutation counts
+// for up to its 60s TTL — drop the dedupe key and force a cache-bypassing fetch
+function invalidateInboxAnalytics() {
+    inboxAnalyticsLastQs = null;
+    if (currentInboxTab === 'confirmed') scheduleInboxAnalytics(true);
+}
+
+function inboxAnalyticsQs(recent) {
+    const qs = [];
+    if (inboxStartDate) qs.push(`startDate=${inboxStartDate}`);
+    if (inboxEndDate) qs.push(`endDate=${inboxEndDate}`);
+    if (inboxSearch) qs.push(`search=${encodeURIComponent(inboxSearch)}`);
+    if (inboxConfirmedBy) qs.push(`confirmedBy=${inboxConfirmedBy}`);
+    if (inboxPaymentMethod) qs.push(`paymentMethod=${inboxPaymentMethod}`);
+    if (inboxDeliveryType) qs.push(`deliveryType=${inboxDeliveryType}`);
+    if (inboxDateField) qs.push(`dateField=${inboxDateField}`);
+    if (recent) qs.push('recent=true');
+    return qs.join('&');
+}
+
+async function fetchInboxAnalytics(recent = false) {
+    if (currentInboxTab !== 'confirmed') return;
+    const body = document.getElementById('inboxAnalyticsBody');
+    if (!body) return;
+    const qs = inboxAnalyticsQs(recent);
+    // Same filter already loaded and fresh — don't re-hit the API on pagination
+    if (!recent && inboxAnalyticsLastQs === qs) return;
+    if (!inboxAnalyticsLastQs && !recent) body.innerHTML = '<div class="inbox-analytics-loading">Loading analytics…</div>';
+    const seq = ++inboxAnalyticsReqSeq;
+    try {
+        const data = await apiCall(`/inbox/confirmation-analytics${qs ? `?${qs}` : ''}`);
+        if (seq !== inboxAnalyticsReqSeq) return; // a newer request won the race
+        if (!data || !data.success) throw new Error(data?.error || 'Failed to fetch');
+        renderInboxAnalytics(data);
+        inboxAnalyticsLastQs = qs;
+    } catch (err) {
+        console.error('Inbox analytics error:', err);
+        if (seq === inboxAnalyticsReqSeq) body.innerHTML = '<div class="inbox-analytics-loading">Couldn\'t load analytics — hit ↻ to retry</div>';
+    }
+}
+
+function fmtAnalyticsDay(iso) {
+    const d = new Date(`${iso}T00:00:00Z`);
+    if (isNaN(d)) return iso;
+    return d.toLocaleDateString('en-IN', { day: '2-digit', month: 'short', timeZone: 'UTC' });
+}
+
+function analyticsChangeHtml(pct) {
+    if (pct === null || pct === undefined) return '<span class="inbox-analytics-delta flat">—</span>';
+    const cls = pct > 0 ? 'up' : (pct < 0 ? 'down' : 'flat');
+    const arrow = pct > 0 ? '▲' : (pct < 0 ? '▼' : '');
+    return `<span class="inbox-analytics-delta ${cls}">${arrow} ${Math.abs(pct)}%</span>`;
+}
+
+function analyticsCard(cls, value, label, sub) {
+    return `<div class="inbox-analytics-card ${cls}"><div class="iac-value">${value}</div><div class="iac-label">${label}</div>${sub ? `<div class="iac-sub">${sub}</div>` : ''}</div>`;
+}
+
+function renderInboxAnalytics(data) {
+    const body = document.getElementById('inboxAnalyticsBody');
+    const rangeEl = document.getElementById('inboxAnalyticsRange');
+    if (!body) return;
+
+    const s = data.summary || {};
+    const range = data.range || {};
+    if (rangeEl) rangeEl.textContent = range.startDate
+        ? `${fmtAnalyticsDay(range.startDate)} → ${fmtAnalyticsDay(range.endDate)}${range.clamped ? ` (capped at last ${range.spanDays} days)` : ''}`
+        : '';
+
+    if (!s.total) {
+        body.innerHTML = '<div class="inbox-analytics-loading">No confirmations in this period</div>';
+        return;
+    }
+
+    const ch = s.change_pct || {};
+    const cards = [
+        analyticsCard('total', s.total, 'Confirmed', `${analyticsChangeHtml(ch.total)} vs prev ${range.spanDays || ''}d`.trim()),
+        analyticsCard('whatsapp', `${s.whatsapp}<i>${s.whatsapp_pct}%</i>`, 'WhatsApp', analyticsChangeHtml(ch.whatsapp)),
+        analyticsCard('manual', `${s.manual}<i>${s.manual_pct}%</i>`, 'Manual', analyticsChangeHtml(ch.manual))
+    ];
+    if (s.other) cards.push(analyticsCard('other', `${s.other}<i>${s.other_pct}%</i>`, 'Other', ''));
+    cards.push(analyticsCard('avg', s.avg_per_day, 'Per Day', s.peak_day ? `Peak ${s.peak_day.total} · ${fmtAnalyticsDay(s.peak_day.date)}` : ''));
+
+    // Method mix bar (each confirmed_by value gets a segment)
+    const METHOD_COLORS = { whatsapp: '#25d366', manual: '#53bdeb' };
+    const OTHER_COLOR = 'rgba(255,255,255,0.25)';
+    const methods = (data.methods || []).filter(m => m.count > 0);
+    const mixBar = methods.length > 0 ? `
+        <div class="inbox-analytics-mix">
+            <div class="iac-mix-label">Method mix</div>
+            <div class="iac-mix-bar">${methods.map(m =>
+                `<span class="iac-mix-seg" style="width:${m.pct}%;background:${METHOD_COLORS[m.method] || OTHER_COLOR}" title="${escapeHtml(m.method)}: ${m.count} (${m.pct}%)"></span>`
+            ).join('')}</div>
+            <div class="iac-mix-legend">${methods.map(m =>
+                `<span><i style="background:${METHOD_COLORS[m.method] || OTHER_COLOR}"></i>${escapeHtml(m.method)} ${m.count} · ${m.pct}%</span>`
+            ).join('')}</div>
+        </div>` : '';
+
+    // Daily stacked bars, oldest → newest
+    const days = (data.daily || []).slice().sort((a, b) => (a.date > b.date ? 1 : -1));
+    const maxTotal = days.reduce((m, d) => Math.max(m, d.total), 0) || 1;
+    const chart = `
+        <div class="inbox-analytics-chart">
+            <div class="iac-chart-label">Daily confirmations${days.length > 31 ? ` (last 31 days)` : ''}</div>
+            <div class="iac-bars">${days.slice(-31).map(d => {
+                const parts = [['whatsapp', METHOD_COLORS.whatsapp], ['manual', METHOD_COLORS.manual], ['other', OTHER_COLOR]]
+                    .map(([k, color]) => d[k] > 0
+                        ? `<span class="iac-bar-seg" style="height:${(d[k] / maxTotal) * 100}%;background:${color}" title="${k}: ${d[k]}"></span>`
+                        : '')
+                    .join('');
+                const title = `${fmtAnalyticsDay(d.date)} — ${d.total} confirmed\nWhatsApp ${d.whatsapp} · Manual ${d.manual}${d.other ? ` · Other ${d.other}` : ''}`;
+                return `<div class="iac-bar-col" title="${escapeHtml(title)}"><div class="iac-bar-total">${d.total}</div><div class="iac-bar">${parts}</div><div class="iac-bar-day">${d.date.slice(8, 10)}</div></div>`;
+            }).join('')}</div>
+        </div>`;
+
+    body.innerHTML = `<div class="inbox-analytics-cards">${cards.join('')}</div>${mixBar}${chart}`;
+}
+
+function setupInboxAnalyticsEvents() {
+    const toggleBtn = document.getElementById('inboxAnalyticsToggle');
+    const panel = document.getElementById('inboxAnalyticsPanel');
+    const refreshBtn = document.getElementById('inboxAnalyticsRefresh');
+    if (toggleBtn && panel) {
+        toggleBtn.addEventListener('click', () => {
+            inboxAnalyticsCollapsed = !inboxAnalyticsCollapsed;
+            panel.classList.toggle('collapsed', inboxAnalyticsCollapsed);
+            toggleBtn.textContent = inboxAnalyticsCollapsed ? '▶' : '▼';
+            toggleBtn.setAttribute('aria-expanded', String(!inboxAnalyticsCollapsed));
+        });
+    }
+    if (refreshBtn) {
+        refreshBtn.addEventListener('click', () => {
+            inboxAnalyticsLastQs = null;
+            scheduleInboxAnalytics(true);
+        });
+    }
 }
 
 // Checkbox change handler for individual items
@@ -2620,6 +2783,7 @@ async function bulkUpdateStatus(status) {
     clearSelection();
     fetchShoppersData();
     fetchInboxCounts()
+    invalidateInboxAnalytics();
 }
 
 async function bulkDelete() {
@@ -4083,6 +4247,7 @@ async function updateStatus(id, status) {
             }
             fetchShoppersData();
             fetchInboxCounts()
+            invalidateInboxAnalytics();
         } else {
             alert('Failed to update status');
         }
@@ -6928,6 +7093,7 @@ async function confirmCancelWithReason() {
     fetchShoppersData();
     fetchInboxCounts();
     if (typeof fetchMultiOrdersData === 'function') fetchMultiOrdersData();
+    invalidateInboxAnalytics();
 }
 
 window.openCancelReasonModal = openCancelReasonModal;
