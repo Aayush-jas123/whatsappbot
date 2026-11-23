@@ -357,6 +357,75 @@ test('targeted bulk-out clamped at home still clears Shopify stock it still hold
     assert.equal(client.adjusts[0].availableDelta, -14);
 });
 
+/* ─────────────── batched GraphQL absolute push ─────────────── */
+
+function batchClient(overrides = {}) {
+    const client = immediateClient(overrides);
+    client.batches = [];
+    client.setInventoryQuantities = async ({ quantities }) => {
+        client.batches.push(quantities);
+        return { ok: true, error: null };
+    };
+    return client;
+}
+
+test('absolute push batches 100 SKUs per GraphQL request when the client supports it', async () => {
+    const client = batchClient(); // every item reads as loc1=4 + loc2=10, total 14
+    const tasks = Array.from({ length: 101 }, (_, i) => ({
+        sku_key: `k${i}`, product_name: 'P', size: 'M', inventory_item_id: 900 + i, delta: 6, target: 20,
+    }));
+    const job = await sync.runPushJob({ client, db: fakeDb(), tasks, mode: 'absolute' });
+    await until(() => job.finishedAt);
+    assert.equal(client.batches.length, 2, '101 SKUs travel in two chunks');
+    assert.equal(client.batches[0].length, 100);
+    // set at the busiest location so the item TOTAL lands on the target:
+    // available 10 + (20 − 14) = 16 — not 20, which would strand loc1's 4
+    assert.deepEqual(client.batches[1][0], { inventoryItemId: 1000, locationId: 2, quantity: 16 });
+    assert.equal(job.succeeded, 101);
+    assert.equal(client.adjusts.length, 0, 'no per-SKU REST writes when batching works');
+});
+
+test('a rejected chunk falls back to per-SKU REST writes rather than failing the SKUs', async () => {
+    const client = batchClient();
+    client.setInventoryQuantities = async () => ({ ok: false, error: 'quantities.0.locationId: Location not found' });
+    const job = await sync.runPushJob({ client, db: fakeDb(),
+        tasks: [{ sku_key: 'k1', product_name: 'P', size: 'M', inventory_item_id: 911, delta: 6, target: 20 }],
+        mode: 'absolute' });
+    await until(() => job.finishedAt);
+    assert.equal(client.adjusts.length, 1, 'the SKU was still written, one at a time');
+    assert.equal(client.adjusts[0].availableDelta, 6); // 20 − live 14, recomputed
+    assert.equal(job.succeeded, 1);
+    assert.equal(job.status, 'done');
+});
+
+test('a scope rejection on a batch aborts the job without spamming per-SKU writes', async () => {
+    const client = batchClient();
+    client.setInventoryQuantities = async ({ quantities }) => {
+        client.batches.push(quantities); // the override replaces the recorder
+        return {
+            ok: false, permissionError: true,
+            error: 'This action requires merchant approval for write_inventory scope',
+        };
+    };
+    const tasks = [0, 1].map(i => ({ sku_key: `k${i}`, product_name: 'P', size: 'M', inventory_item_id: 911 + i, delta: 6, target: 20 }));
+    const job = await sync.runPushJob({ client, db: fakeDb(), tasks, mode: 'absolute' });
+    await until(() => job.finishedAt);
+    assert.equal(client.batches.length, 1, 'one batch attempt, then stop');
+    assert.equal(client.adjusts.length, 0, 'the REST fallback would fail identically — never tried');
+    assert.equal(job.failed, 2);
+    assert.match(job.error, /write_inventory/);
+});
+
+test('delta-only tasks keep the per-SKU path even when the client can batch', async () => {
+    const client = batchClient();
+    const job = await sync.runPushJob({ client, db: fakeDb(),
+        tasks: [{ sku_key: 'k1', product_name: 'P', size: 'M', inventory_item_id: 911, delta: 3 }],
+        mode: 'delta' });
+    await until(() => job.finishedAt);
+    assert.equal(client.batches.length, 0, 'no absolute target means no set-quantities batch');
+    assert.equal(client.adjusts.length, 1);
+});
+
 test('job snapshots bound the result tail and expose progress counters', async () => {
     const client = immediateClient();
     const tasks = Array.from({ length: 250 }, (_, i) => ({ sku_key: `k${i}`, product_name: 'P', size: 'M', inventory_item_id: 900 + i, delta: 1 }));

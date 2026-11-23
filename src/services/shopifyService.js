@@ -655,6 +655,58 @@ class ShopifyService {
         }
     }
 
+    /**
+     * Batched absolute set via GraphQL inventorySetQuantities (2024-01): up to
+     * 100 {inventoryItemId, locationId, quantity} lines per call, so a
+     * whole-catalog push costs a handful of requests instead of one REST
+     * adjust per SKU at ~1.8/sec. ignoreCompareQuantity is true deliberately:
+     * the push direction declares the hub the source of truth (the workbench
+     * measures impact against live levels before the job is ever created),
+     * and it keeps semantics identical to the per-SKU path this replaces.
+     * reason "correction" is what the REST adjust leaves in the admin audit
+     * trail too. Never throws; returns { ok, error?, userErrors?,
+     * permissionError? }.
+     */
+    async setInventoryQuantities({ quantities }) {
+        if (!Array.isArray(quantities) || quantities.length === 0) {
+            return { ok: false, error: 'setInventoryQuantities requires a non-empty quantities array' };
+        }
+        if (quantities.length > 100) {
+            return { ok: false, error: 'Shopify accepts at most 100 quantities per inventorySetQuantities request' };
+        }
+        const mutation = 'mutation hubInventorySet($input: InventorySetQuantitiesInput!) { inventorySetQuantities(input: $input) { userErrors { field message code } } }';
+        try {
+            const data = await this._rateLimitedRequest(() => this.graphql(mutation, {
+                input: {
+                    name: 'available',
+                    reason: 'correction',
+                    ignoreCompareQuantity: true,
+                    quantities: quantities.map(q => ({
+                        inventoryItemId: `gid://shopify/InventoryItem/${Number(q.inventoryItemId)}`,
+                        locationId: `gid://shopify/Location/${Number(q.locationId)}`,
+                        quantity: Number(q.quantity),
+                    })),
+                },
+            }));
+            const errs = data?.inventorySetQuantities?.userErrors || [];
+            if (errs.length > 0) {
+                return {
+                    ok: false,
+                    error: errs.map(e => `${(e.field || []).join('.') || e.code || 'userErrors'}: ${e.message}`).join('; '),
+                    userErrors: errs,
+                };
+            }
+            return { ok: true, error: null, userErrors: [] };
+        } catch (error) {
+            const raw = this._shopifyErrorMsg(error);
+            return {
+                ok: false,
+                error: this._withScopeHint(error, 'write_inventory'),
+                permissionError: /requires merchant approval|_inventory scope|Permission/i.test(raw),
+            };
+        }
+    }
+
     // ==========================================
     // ADMIN EDIT → SHOPIFY SYNC
     // Pushes Shoppers Hub order edits (items, payment method, shipping address)
