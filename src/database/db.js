@@ -444,6 +444,10 @@ async function initializeShoppersTable() {
       { name: 'response_count', type: 'INTEGER DEFAULT 0' },
       { name: 'delivery_type', type: 'VARCHAR(20)' },
       { name: 'confirmed_by', type: 'VARCHAR(50)' },
+      // Which hub identity performed the action that set confirmed_by. Channel
+      // ('manual'/'whatsapp'/'website') lives in confirmed_by; this is the person.
+      // NULL for automated confirmations and for manual ones predating the column.
+      { name: 'confirmed_by_operator', type: 'VARCHAR(100)' },
       { name: 'conversation_lock_until', type: 'TIMESTAMP' },
       { name: 'gokwik_order_id', type: 'TEXT' },
       { name: 'rto_risk', type: 'VARCHAR(20)' },
@@ -1219,6 +1223,9 @@ async function initializePerformanceIndexes() {
     // Covering index for the inbox confirmation-analytics day×method aggregate
     // (confirmed rows only; confirmed_by resolved from the index, no heap fetch)
     await pool.query('CREATE INDEX IF NOT EXISTS idx_store_shoppers_confirmed_by ON store_shoppers(updated_at DESC, confirmed_by) WHERE status = \'confirmed\'');
+    // Same partial scan for the per-operator breakdown added to the confirmation
+    // analytics panel (day × operator aggregation on confirmed rows only)
+    await pool.query('CREATE INDEX IF NOT EXISTS idx_store_shoppers_confirmed_operator ON store_shoppers(updated_at DESC, confirmed_by_operator) WHERE status = \'confirmed\'');
     
     // Index for orders table (JOIN operations)
     await pool.query('CREATE INDEX IF NOT EXISTS idx_orders_order_id ON orders(order_id)');

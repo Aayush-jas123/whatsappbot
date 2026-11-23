@@ -6,7 +6,7 @@
     <title>Shopper Management | OFFCOMFRT</title>
     <!-- Google Fonts: Outfit, Inter, Archivo Narrow -->
         <link href="https://fonts.googleapis.com/css2?family=Outfit:wght@300;400;500;700&family=Inter:wght@400;500;600&family=Archivo+Narrow:wght@400;500;600;700&display=swap" rel="stylesheet">
-        <link rel="stylesheet" href="/shoppers/assets/shoppers-hub.css?build=20261123-inboxconfanalytics1">
+        <link rel="stylesheet" href="/shoppers/assets/shoppers-hub.css?build=20261123-inboxopattrib1">
 </head>
 <body class="dark-theme">
     <!-- Login View -->
@@ -992,6 +992,10 @@
                     <option value="">All Methods</option>
                     <option value="whatsapp">WhatsApp</option>
                     <option value="manual">Manual</option>
+                </select>
+                <!-- Options are filled from the analytics payload, admin only -->
+                <select id="inboxOperatorFilter" class="inbox-filter-select inbox-confirmed-filter inbox-operator-only hidden" title="Confirmed by which operator">
+                    <option value="">All Operators</option>
                 </select>
                 <select id="inboxPaymentMethod" class="inbox-filter-select inbox-confirmed-filter hidden">
                     <option value="">All Payment</option>
@@ -2044,7 +2048,7 @@
     </section>
 
     <!-- Scripts -->
-    <script src="/shoppers/assets/shoppers-app.js?build=20261123-inboxconfanalytics1"></script>
+    <script src="/shoppers/assets/shoppers-app.js?build=20261123-inboxopattrib1"></script>
     <script src="/shoppers/assets/shoppers-forecast-engine.js?v=20261024-1"></script>
     <script src="/shoppers/assets/shoppers-forecast-workspace.js?v=20261024-1"></script>
     <script src="/shoppers/assets/shoppers-inventory-tower.js?v=20261024-forecast1"></script>

@@ -2754,7 +2754,15 @@ router.post('/order-item-requests/:id/apply', verifyToken, requirePermission('ed
             updated_at: nowIso,
             customer_message: `Customer item change request applied by ${req.admin && req.admin.username ? req.admin.username : 'team'} (request #${id})${nowConfirmed ? ' — order confirmed' : ''}`
         };
-        if (nowConfirmed) updateData.status = 'confirmed';
+        if (nowConfirmed) {
+            updateData.status = 'confirmed';
+            // Same human-approval signal as the status route above. Note this path
+            // deliberately does NOT rewrite confirmed_by: the order reached
+            // edit_details through the WhatsApp bot and changing the channel here
+            // would move rows between buckets the existing method analytics counts.
+            const actor = operatorIdentity(req);
+            if (actor) updateData.confirmed_by_operator = actor;
+        }
         if (paymentMethod) updateData.payment_method = paymentMethod;
         await dbAdapter.update('store_shoppers', updateData, { id: shopper.id });
         invalidateCache('shoppers');
@@ -2842,10 +2850,10 @@ router.post('/order-item-requests/:id/dismiss', verifyToken, requirePermission('
             try {
                 const flip = await dbAdapter.query(
                     `UPDATE store_shoppers
-                     SET status = 'confirmed', updated_at = ?
+                     SET status = 'confirmed', updated_at = ?, confirmed_by_operator = COALESCE(?, confirmed_by_operator)
                      WHERE status = 'edit_details' AND (id = ? OR order_id = ?)
                      RETURNING id`,
-                    [new Date().toISOString(), String(requestRows[0].shopper_id || ''), String(requestRows[0].order_id || '')]
+                    [new Date().toISOString(), operatorIdentity(req), String(requestRows[0].shopper_id || ''), String(requestRows[0].order_id || '')]
                 );
                 orderConfirmed = !!(flip && flip.length);
                 if (orderConfirmed) invalidateCache('shoppers');
@@ -2914,6 +2922,20 @@ async function notifyCustomerOfCancellation(shopper, reason) {
     );
 }
 
+// Which hub identity performed a shopper lifecycle action. `confirmed_by` already
+// records the CHANNEL (manual / whatsapp / website); this records the person, so
+// the analytics panel can answer "confirmed by which operator". Resolved from the
+// JWT, never from the request body. The master admin resolves to its login name
+// ('shopper_admin' for the hub passcode, ADMIN_USERNAME for the backend), which is
+// exactly what separates owner-made confirms from operator-made ones — activity
+// logging skips admin entirely (see logOperatorActivity), so without this column
+// there is no way to attribute those rows at all.
+function operatorIdentity(req) {
+    const identity = req.admin || {};
+    const raw = identity.username || (identity.role === 'admin' ? 'admin' : null);
+    return raw ? String(raw).slice(0, 100) : null;
+}
+
 // Update shopper status manually (Confirm/Reject)
 router.post('/shoppers/:id/status', verifyToken, requirePermission('edit_orders'), async (req, res) => {
     try {
@@ -2945,6 +2967,8 @@ router.post('/shoppers/:id/status', verifyToken, requirePermission('edit_orders'
         // Track confirmation method for non-pending statuses
         if (['confirmed', 'cancelled', 'edit_details'].includes(status)) {
             updateData.confirmed_by = 'manual';
+            const actor = operatorIdentity(req);
+            if (actor) updateData.confirmed_by_operator = actor;
         }
         if (status === 'cancelled') {
             updateData.cancel_reason = reason;
@@ -3424,12 +3448,18 @@ router.get('/shoppers/export', verifyToken, requirePermission('export'), async (
 // Inbox Export - export orders/messages from inbox with filters
 router.get('/inbox/export', verifyToken, requirePermission('export'), async (req, res) => {
     try {
-        const { tab = 'confirmed', startDate, endDate, confirmedBy, paymentMethod, deliveryType, search, format = 'xlsx', orderIds, dateField = 'updated_at' } = req.query;
+        const { tab = 'confirmed', startDate, endDate, confirmedBy, paymentMethod, deliveryType, search, format = 'xlsx', orderIds, dateField = 'updated_at', operator } = req.query;
         logOperatorActivity(req, 'export', `Inbox export (tab: ${tab}, format: ${format})`);
 
         // Validate dateField
         const validDateFields = ['created_at', 'updated_at'];
         const safeDateField = validDateFields.includes(dateField) ? dateField : 'updated_at';
+
+        // Operator attribution follows the same admin-only rule as the inbox list
+        // and the analytics panel, so an exported sheet cannot carry a column the
+        // operator UI is not allowed to show.
+        const canSeeOperator = req.admin && req.admin.role === 'admin';
+        const operatorFilter = canSeeOperator && operator ? String(operator).slice(0, 100) : null;
 
         let whereClause = 'WHERE 1=1';
         const params = [];
@@ -3453,6 +3483,10 @@ router.get('/inbox/export', verifyToken, requirePermission('export'), async (req
             if (confirmedBy) {
                 whereClause += ' AND s.confirmed_by = ?';
                 params.push(confirmedBy);
+            }
+            if (operatorFilter) {
+                whereClause += ' AND s.confirmed_by_operator = ?';
+                params.push(operatorFilter);
             }
             if (paymentMethod) {
                 whereClause += ' AND s.payment_method = ?';
@@ -3510,7 +3544,7 @@ router.get('/inbox/export', verifyToken, requirePermission('export'), async (req
         const sql = `
             SELECT s.name, s.phone, s.email, s.order_id, s.address, s.city, s.province, s.zip,
                    s.payment_method, s.items_json, s.status, s.created_at, s.customer_message,
-                   s.delivery_type, s.confirmed_by, s.updated_at,
+                   s.delivery_type, s.confirmed_by, s.updated_at, ${canSeeOperator ? 's.confirmed_by_operator,' : ''}
                    COALESCE(s.order_total, o.total) as order_total,
                    o.awb, o.courier_name
             FROM store_shoppers s
@@ -3552,6 +3586,7 @@ router.get('/inbox/export', verifyToken, requirePermission('export'), async (req
                 'Payment Method': s.payment_method || '',
                 'Delivery Type': s.delivery_type || 'Standard',
                 'Confirmed By': s.confirmed_by || '',
+                ...(canSeeOperator ? { 'Confirmed By Operator': s.confirmed_by_operator || 'unrecorded' } : {}),
                 'Products': productsStr,
                 'City': s.city || '',
                 'AWB': s.awb || '',
@@ -4189,11 +4224,17 @@ router.post('/chat/send-template', verifyToken, requirePermission('send_messages
 // Get recently confirmed orders
 router.get('/shoppers/recent-confirmed', verifyToken, async (req, res) => {
     try {
-        const { limit = 20, offset = 0, startDate, endDate, confirmedBy, paymentMethod, deliveryType, search, dateField = 'updated_at' } = req.query;
+        const { limit = 20, offset = 0, startDate, endDate, confirmedBy, paymentMethod, deliveryType, search, dateField = 'updated_at', operator } = req.query;
 
         // Validate dateField to prevent SQL injection
         const validDateFields = ['created_at', 'updated_at'];
         const safeDateField = validDateFields.includes(dateField) ? dateField : 'updated_at';
+
+        // Per-operator attribution is admin-only (agreed visibility rule): the
+        // column is neither selected nor filterable for an operator token, so it
+        // never reaches the payload a colleague could read.
+        const canSeeOperator = req.admin && req.admin.role === 'admin';
+        const operatorFilter = canSeeOperator && operator ? String(operator).slice(0, 100) : null;
 
         // Build date filter
         let dateClause = '';
@@ -4215,6 +4256,12 @@ router.get('/shoppers/recent-confirmed', verifyToken, async (req, res) => {
         if (confirmedBy) {
             dateClause += ' AND s.confirmed_by = ?';
             dateParams.push(confirmedBy);
+        }
+
+        // Confirmed-by-operator filter
+        if (operatorFilter) {
+            dateClause += ' AND s.confirmed_by_operator = ?';
+            dateParams.push(operatorFilter);
         }
 
         // Payment method filter
@@ -4241,7 +4288,7 @@ router.get('/shoppers/recent-confirmed', verifyToken, async (req, res) => {
             SELECT s.id, s.phone, s.name, s.order_id, s.status, s.customer_message,
                    s.last_response_at, s.created_at, s.updated_at, s.order_total, s.delivery_type,
                    s.payment_method, s.items_json, s.email, s.address, s.city, s.province, s.zip,
-                   s.confirmed_by,
+                   s.confirmed_by, ${canSeeOperator ? 's.confirmed_by_operator,' : ''}
                    o.awb, o.courier_name, o.status as order_status, o.tracking_url,
                    COALESCE(s.order_total, o.total) as order_total
             FROM store_shoppers s
@@ -4271,6 +4318,10 @@ router.get('/shoppers/recent-confirmed', verifyToken, async (req, res) => {
         if (confirmedBy) {
             countDateClause += ' AND confirmed_by = ?';
             countParams.push(confirmedBy);
+        }
+        if (operatorFilter) {
+            countDateClause += ' AND confirmed_by_operator = ?';
+            countParams.push(operatorFilter);
         }
         if (paymentMethod) {
             countDateClause += ' AND payment_method = ?';
@@ -4362,10 +4413,17 @@ router.get('/analytics/orders', verifyToken, async (req, res) => {
 const MAX_ANALYTICS_SPAN_DAYS = 182;
 router.get('/inbox/confirmation-analytics', verifyToken, async (req, res) => {
     try {
-        const { startDate, endDate, confirmedBy, paymentMethod, deliveryType, search, dateField = 'updated_at', recent } = req.query;
+        const { startDate, endDate, confirmedBy, paymentMethod, deliveryType, search, dateField = 'updated_at', recent, operator } = req.query;
 
         const validDateFields = ['created_at', 'updated_at'];
         const safeDateField = validDateFields.includes(dateField) ? dateField : 'updated_at';
+
+        // The per-operator dimension is admin-only. It is resolved here rather than
+        // filtered out at render time so the column never enters a non-admin
+        // payload, and the cache key below carries the identity class so an
+        // admin-shaped response can never be served to an operator token.
+        const canSeeOperator = req.admin && req.admin.role === 'admin';
+        const operatorFilter = canSeeOperator && operator ? String(operator).slice(0, 100) : null;
 
         // Default window: last 30 days (IST) — bounded keeps the scan cheap
         let startStr = startDate;
@@ -4398,6 +4456,7 @@ router.get('/inbox/confirmation-analytics', verifyToken, async (req, res) => {
         baseParams.push(utcStart, utcEnd);
 
         if (confirmedBy) { where += ' AND s.confirmed_by = ?'; baseParams.push(confirmedBy); }
+        if (operatorFilter) { where += ' AND s.confirmed_by_operator = ?'; baseParams.push(operatorFilter); }
         if (paymentMethod) { where += ' AND s.payment_method = ?'; baseParams.push(paymentMethod); }
         if (deliveryType) { where += ' AND s.delivery_type = ?'; baseParams.push(deliveryType); }
         let searchClause = '';
@@ -4407,7 +4466,7 @@ router.get('/inbox/confirmation-analytics', verifyToken, async (req, res) => {
             baseParams.push(searchParam, searchParam, searchParam);
         }
 
-        const cacheKey = `inbox_conf_analytics:${safeDateField}:${startStr.slice(0, 10)}:${endStr.slice(0, 10)}:${confirmedBy || 'all'}:${paymentMethod || 'all'}:${deliveryType || 'all'}`;
+        const cacheKey = `inbox_conf_analytics:${safeDateField}:${startStr.slice(0, 10)}:${endStr.slice(0, 10)}:${confirmedBy || 'all'}:${paymentMethod || 'all'}:${deliveryType || 'all'}:${operatorFilter || 'all'}:${canSeeOperator ? 'admin' : 'op'}`;
         const useCache = !search && recent !== 'true';
         if (useCache) {
             const cached = getCached(cacheKey);
@@ -4437,6 +4496,10 @@ router.get('/inbox/confirmation-analytics', verifyToken, async (req, res) => {
         const prevParams = [utcPrevStart, utcPrevEnd];
         let prevWhere = `WHERE s.status = 'confirmed' AND s.${safeDateField} >= ? AND s.${safeDateField} <= ?`;
         if (confirmedBy) { prevWhere += ' AND s.confirmed_by = ?'; prevParams.push(confirmedBy); }
+        // Added before prevSql is built so the headline trend stays on the same
+        // filter set as the current period, instead of comparing all operators
+        // against one operator.
+        if (operatorFilter) { prevWhere += ' AND s.confirmed_by_operator = ?'; prevParams.push(operatorFilter); }
         if (paymentMethod) { prevWhere += ' AND s.payment_method = ?'; prevParams.push(paymentMethod); }
         if (deliveryType) { prevWhere += ' AND s.delivery_type = ?'; prevParams.push(deliveryType); }
         const prevSql = `
@@ -4446,9 +4509,40 @@ router.get('/inbox/confirmation-analytics', verifyToken, async (req, res) => {
             GROUP BY 1
         `;
 
-        const [dayRows, prevRows] = await Promise.all([
+        // Second pass, admin only: day × who. 'automated' is a bot or website
+        // confirmation (no person involved), 'unrecorded' is a human confirmation
+        // from before the attribution column existed. Separating them is what stops
+        // the operator table implying nobody was working. Same WHERE as the method
+        // scan, so both ride idx_store_shoppers_confirmed_operator and the whole
+        // panel stays at four aggregate queries with no row payload.
+        const actorExpr = `COALESCE(s.confirmed_by_operator, CASE WHEN s.confirmed_by = 'manual' THEN 'unrecorded' ELSE 'automated' END)`;
+        const actorDaySql = canSeeOperator ? `
+            SELECT TO_CHAR(DATE(s.${safeDateField} AT TIME ZONE 'UTC' AT TIME ZONE 'Asia/Kolkata'), 'YYYY-MM-DD') as date,
+                   ${actorExpr} as actor,
+                   COUNT(*)::int as count
+            FROM store_shoppers s
+            ${where}${searchClause}
+            GROUP BY 1, 2
+            ORDER BY 1 DESC, 2
+        ` : null;
+        const prevActorSql = canSeeOperator ? `
+            SELECT ${actorExpr} as actor, COUNT(*)::int as count
+            FROM store_shoppers s
+            ${prevWhere}
+            GROUP BY 1
+        ` : null;
+
+        const [dayRows, prevRows, actorRows, prevActorRows] = await Promise.all([
             dbAdapter.query(daySql, baseParams),
-            search ? Promise.resolve([]) : dbAdapter.query(prevSql, prevParams)
+            search ? Promise.resolve([]) : dbAdapter.query(prevSql, prevParams),
+            // The operator half degrades on its own: if this new column or index is
+            // somehow absent on a restarted container, the method/daily panel still
+            // renders instead of the whole endpoint 500ing.
+            actorDaySql ? dbAdapter.query(actorDaySql, baseParams).catch(err => {
+                console.warn('[InboxAnalytics] operator pass skipped:', err.message);
+                return [];
+            }) : Promise.resolve([]),
+            (actorDaySql && !search) ? dbAdapter.query(prevActorSql, prevParams).catch(() => []) : Promise.resolve([])
         ]);
 
         // Shape day rows → { daily, methodTotals } without a second query
@@ -4465,6 +4559,29 @@ router.get('/inbox/confirmation-analytics', verifyToken, async (req, res) => {
             day.methods[r.method] = (day.methods[r.method] || 0) + c;
             methodTotals[r.method] = (methodTotals[r.method] || 0) + c;
         }
+
+        // day × actor → daily[].byActor (drives the per-date operator table and the
+        // stacked-by-operator chart) plus a per-actor day map for peak/active days.
+        const actorRollup = new Map();
+        for (const r of actorRows || []) {
+            if (!r.date || !r.actor) continue;
+            const c = Number(r.count) || 0;
+            const day = byDate.get(r.date);
+            if (day) {
+                if (!day.byActor) day.byActor = {};
+                day.byActor[r.actor] = (day.byActor[r.actor] || 0) + c;
+            }
+            if (!actorRollup.has(r.actor)) actorRollup.set(r.actor, { count: 0, byDay: {} });
+            const a = actorRollup.get(r.actor);
+            a.count += c;
+            a.byDay[r.date] = (a.byDay[r.date] || 0) + c;
+        }
+        const prevActorTotals = {};
+        for (const r of prevActorRows || []) {
+            if (!r.actor) continue;
+            prevActorTotals[r.actor] = (prevActorTotals[r.actor] || 0) + (Number(r.count) || 0);
+        }
+
         const daily = Array.from(byDate.values()).sort((a, b) => (a.date < b.date ? 1 : -1));
 
         const sum = (days, key) => days.reduce((acc, d) => acc + d[key], 0);
@@ -4484,9 +4601,47 @@ router.get('/inbox/confirmation-analytics', verifyToken, async (req, res) => {
         const peak = daily.reduce((best, d) => (!best || d.total > best.total ? d : best), null);
         const pctOf = (n) => total > 0 ? Math.round((n / total) * 1000) / 10 : 0;
 
+        // Operator ranking. avg_per_day divides by the days that person actually
+        // worked rather than the whole window, so someone who joined last week is
+        // not reported as slow. automated/unrecorded stay in the list — hiding them
+        // would make the named rows look like they sum to everything.
+        const AUTOMATED = 'automated';
+        const UNRECORDED = 'unrecorded';
+        const operatorList = Array.from(actorRollup.entries()).map(([actor, a]) => {
+            const dates = Object.keys(a.byDay).sort();
+            let peakDay = null;
+            for (const d of dates) {
+                if (!peakDay || a.byDay[d] > peakDay.count) peakDay = { date: d, count: a.byDay[d] };
+            }
+            return {
+                actor,
+                count: a.count,
+                pct: pctOf(a.count),
+                share_pct: null,
+                days_active: dates.length,
+                avg_per_day: Math.round((a.count / (dates.length || 1)) * 10) / 10,
+                peak_day: peakDay,
+                last_date: dates.length ? dates[dates.length - 1] : null,
+                change_pct: pct(a.count, prevActorTotals[actor] || 0)
+            };
+        }).sort((x, y) => y.count - x.count);
+
+        const automatedCount = (actorRollup.get(AUTOMATED) || {}).count || 0;
+        const unrecordedCount = (actorRollup.get(UNRECORDED) || {}).count || 0;
+        const humanTotal = total - automatedCount;
+        const attributed = operatorList
+            .filter(o => o.actor !== AUTOMATED && o.actor !== UNRECORDED)
+            .reduce((acc, o) => acc + o.count, 0);
+        // share_pct is against human confirms only: "Pooja did 46% of the manual
+        // work" rather than 46% of everything including the bot.
+        for (const o of operatorList) {
+            o.share_pct = o.actor === AUTOMATED ? null
+                : (humanTotal > 0 ? Math.round((o.count / humanTotal) * 1000) / 10 : 0);
+        }
+
         const response = {
             success: true,
-            range: { startDate: startStr.slice(0, 10), endDate: endStr.slice(0, 10), dateField: safeDateField, spanDays, clamped: requestedDays > spanDays },
+            range: { startDate: startStr.slice(0, 10), endDate: endStr.slice(0, 10), dateField: safeDateField, spanDays, clamped: requestedDays > spanDays, operator: operatorFilter || null },
             summary: {
                 total,
                 manual, whatsapp, other,
@@ -4502,6 +4657,14 @@ router.get('/inbox/confirmation-analytics', verifyToken, async (req, res) => {
             methods: Object.entries(methodTotals)
                 .map(([method, count]) => ({ method, count, pct: pctOf(count) }))
                 .sort((a, b) => b.count - a.count),
+            operators: canSeeOperator ? operatorList : [],
+            attribution: canSeeOperator ? {
+                human_total: humanTotal,
+                attributed,
+                unrecorded: unrecordedCount,
+                automated: automatedCount,
+                coverage_pct: humanTotal > 0 ? Math.round((attributed / humanTotal) * 1000) / 10 : 0
+            } : null,
             daily
         };
 

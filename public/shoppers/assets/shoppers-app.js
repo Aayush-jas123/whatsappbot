@@ -92,6 +92,13 @@ function applyRolePermissions() {
     const teamBtn = document.getElementById('teamBtn');
     if (teamBtn) teamBtn.style.display = isAdmin ? 'flex' : 'none';
 
+    // Operator attribution is admin-only. Uses its own class rather than the
+    // shared `hidden` one because toggleInboxConfirmedFilters() owns that class
+    // per tab and would re-show the control on every tab switch.
+    document.querySelectorAll('.inbox-operator-only').forEach(el => {
+        el.classList.toggle('role-hidden', !isAdmin);
+    });
+
     // Logout — clears the session for both admin and operator accounts
     const logoutBtn = document.getElementById('hubLogoutBtn');
     if (logoutBtn) {
@@ -739,6 +746,7 @@ function setupEventListeners() {
     document.getElementById('inboxSearch')?.addEventListener('input', debounceInboxSearch);
     document.getElementById('inboxActionType')?.addEventListener('change', onInboxActionTypeChange);
     document.getElementById('inboxConfirmedBy')?.addEventListener('change', onInboxFilterChange);
+    document.getElementById('inboxOperatorFilter')?.addEventListener('change', onInboxFilterChange);
     document.getElementById('inboxPaymentMethod')?.addEventListener('change', onInboxFilterChange);
     document.getElementById('inboxDeliveryType')?.addEventListener('change', onInboxFilterChange);
     document.getElementById('inboxDateField')?.addEventListener('change', onInboxDateFieldChange);
@@ -1331,6 +1339,7 @@ let inboxEndDate = '';
 let inboxQuickDate = null;
 let inboxActionType = '';
 let inboxConfirmedBy = '';
+let inboxOperator = '';
 let inboxPaymentMethod = '';
 let inboxDeliveryType = '';
 let inboxSearch = '';
@@ -1845,6 +1854,7 @@ async function fetchInboxData(forceFresh) {
         }
         if (currentInboxTab === 'confirmed') {
             if (inboxConfirmedBy) qs.push(`confirmedBy=${inboxConfirmedBy}`);
+            if (inboxOperator) qs.push(`operator=${encodeURIComponent(inboxOperator)}`);
             if (inboxPaymentMethod) qs.push(`paymentMethod=${inboxPaymentMethod}`);
             if (inboxDeliveryType) qs.push(`deliveryType=${inboxDeliveryType}`);
             if (inboxDateField) qs.push(`dateField=${inboxDateField}`);
@@ -1926,6 +1936,17 @@ function renderInboxList(shoppers, total) {
         } else if (s.confirmed_by === 'manual') {
             methodBadge = '<span class="inbox-method-badge manual">Manual</span>';
         }
+
+        // Operator attribution — admin payload only, so it stays empty for
+        // operator tokens. Pairs the handle with the confirm date so each card
+        // answers "who confirmed this, and when" without opening the chat.
+        let operatorBadge = '';
+        if (currentInboxTab !== 'unread' && s.confirmed_by_operator) {
+            const when = s.updated_at ? formatDate(s.updated_at) : '';
+            operatorBadge = `<span class="inbox-operator-badge" title="Confirmed by ${escapeHtml(s.confirmed_by_operator)}${when ? ` on ${escapeHtml(when)}` : ''}">@ ${escapeHtml(operatorLabel(s.confirmed_by_operator))}</span>`;
+        } else if (currentInboxTab !== 'unread' && s.confirmed_by === 'manual') {
+            operatorBadge = '<span class="inbox-operator-badge unrecorded" title="Confirmed before operator tracking was switched on">@ —</span>';
+        }
     
         // Preview content
         let preview = '';
@@ -1987,7 +2008,7 @@ function renderInboxList(shoppers, total) {
                 </div>
                 <div class="inbox-avatar ${avatarClass}">${initials}</div>
                 <div class="inbox-customer-info">
-                    <div class="inbox-customer-name">${currentInboxTab === 'unread' ? '<span class="unread-dot"></span>' : ''}${escapeHtml(s.name || 'Customer')} ${methodBadge}</div>
+                    <div class="inbox-customer-name">${currentInboxTab === 'unread' ? '<span class="unread-dot"></span>' : ''}${escapeHtml(s.name || 'Customer')} ${methodBadge}${operatorBadge}</div>
                     <div class="inbox-customer-order">${orderIdVal || 'N/A'}</div>
                     <span class="inbox-status ${statusVal}">${statusVal.toUpperCase()}</span>
                 </div>
@@ -2067,6 +2088,11 @@ function updateInboxFilterChip() {
         tags.push(`<span class="chip-tag" onclick="clearInboxFilter('confirmedBy')" title="Clear method filter">Method: ${methodLabel} <span class=\"chip-close\">\u2715</span></span>`);
     }
 
+    // Confirmed-by-operator chip (admin only)
+    if (inboxOperator && currentInboxTab === 'confirmed') {
+        tags.push(`<span class="chip-tag" onclick="clearInboxFilter('operator')" title="Clear operator filter">Operator: ${escapeHtml(operatorLabel(inboxOperator))} <span class=\"chip-close\">\u2715</span></span>`);
+    }
+
     // Payment method chip
     if (inboxPaymentMethod && currentInboxTab === 'confirmed') {
         tags.push(`<span class="chip-tag" onclick="clearInboxFilter('paymentMethod')" title="Clear payment filter">Payment: ${inboxPaymentMethod} <span class=\"chip-close\">\u2715</span></span>`);
@@ -2102,6 +2128,11 @@ function clearInboxFilter(filterName) {
             inboxConfirmedBy = '';
             const cbEl = document.getElementById('inboxConfirmedBy');
             if (cbEl) cbEl.value = '';
+            break;
+        case 'operator':
+            inboxOperator = '';
+            const opEl = document.getElementById('inboxOperatorFilter');
+            if (opEl) opEl.value = '';
             break;
         case 'paymentMethod':
             inboxPaymentMethod = '';
@@ -2188,6 +2219,12 @@ function clearInboxFilters() {
     inboxEndDate = '';
     inboxQuickDate = null;
     inboxActionType = '';
+    // The confirmed-tab dropdowns were never reset here, so "Clear" left the list
+    // filtered by method/payment/delivery/operator while the chip row went empty.
+    inboxConfirmedBy = '';
+    inboxOperator = '';
+    inboxPaymentMethod = '';
+    inboxDeliveryType = '';
 
     const startEl = document.getElementById('inboxStartDate');
     const endEl = document.getElementById('inboxEndDate');
@@ -2195,6 +2232,10 @@ function clearInboxFilters() {
     if (startEl) startEl.value = '';
     if (endEl) endEl.value = '';
     if (actionEl) actionEl.value = '';
+    ['inboxConfirmedBy', 'inboxOperatorFilter', 'inboxPaymentMethod', 'inboxDeliveryType'].forEach(id => {
+        const el = document.getElementById(id);
+        if (el) el.value = '';
+    });
 
     document.querySelectorAll('.inbox-quick-date').forEach(b => b.classList.remove('active'));
 
@@ -2247,6 +2288,7 @@ function debounceInboxSearch() {
 // Inbox dropdown filter change handler
 function onInboxFilterChange() {
     inboxConfirmedBy = document.getElementById('inboxConfirmedBy')?.value || '';
+    inboxOperator = document.getElementById('inboxOperatorFilter')?.value || '';
     inboxPaymentMethod = document.getElementById('inboxPaymentMethod')?.value || '';
     inboxDeliveryType = document.getElementById('inboxDeliveryType')?.value || '';
     inboxPageOffset = 0;
@@ -2307,6 +2349,7 @@ function inboxAnalyticsQs(recent) {
     if (inboxEndDate) qs.push(`endDate=${inboxEndDate}`);
     if (inboxSearch) qs.push(`search=${encodeURIComponent(inboxSearch)}`);
     if (inboxConfirmedBy) qs.push(`confirmedBy=${inboxConfirmedBy}`);
+    if (inboxOperator) qs.push(`operator=${encodeURIComponent(inboxOperator)}`);
     if (inboxPaymentMethod) qs.push(`paymentMethod=${inboxPaymentMethod}`);
     if (inboxDeliveryType) qs.push(`deliveryType=${inboxDeliveryType}`);
     if (inboxDateField) qs.push(`dateField=${inboxDateField}`);
@@ -2339,6 +2382,38 @@ function fmtAnalyticsDay(iso) {
     const d = new Date(`${iso}T00:00:00Z`);
     if (isNaN(d)) return iso;
     return d.toLocaleDateString('en-IN', { day: '2-digit', month: 'short', timeZone: 'UTC' });
+}
+
+// Hub logins are stored as-is ('pooja.desk', 'shopper_admin'). Show the readable
+// stem; the raw handle stays in the title/tooltip so nothing is lost.
+function operatorLabel(actor) {
+    if (!actor) return '—';
+    if (actor === 'shopper_admin' || actor === 'admin') return 'Admin';
+    const first = String(actor).split('.')[0].replace(/[_-]/g, ' ').trim();
+    if (!first) return actor;
+    return first.charAt(0).toUpperCase() + first.slice(1);
+}
+
+// Rank order is stable within a render, so bars keep the same colour between
+// refreshes as long as nobody changes position in the leaderboard.
+const OPERATOR_COLORS = ['#53bdeb', '#f5a623', '#b06cf0', '#25d366', '#ff6b81', '#4dd0e1', '#c0ca33', '#ff8a65'];
+const SYNTHETIC_ACTORS = { automated: 'Auto', unrecorded: '—' };
+
+// The operator dropdown is built from data rather than hardcoded, so a new hub
+// account needs no code change to become filterable.
+function syncOperatorOptions(operators) {
+    const sel = document.getElementById('inboxOperatorFilter');
+    if (!sel) return;
+    const named = (operators || []).filter(o => o.actor && !SYNTHETIC_ACTORS[o.actor]);
+    const previous = sel.value;
+    sel.innerHTML = '<option value="">All Operators</option>' + named.map(o =>
+        `<option value="${escapeHtml(o.actor)}">${escapeHtml(operatorLabel(o.actor))} (${o.count})</option>`
+    ).join('');
+    // Keep the active filter even if that person has no confirms in this window
+    if (previous && !named.some(o => o.actor === previous)) {
+        sel.insertAdjacentHTML('afterbegin', `<option value="${escapeHtml(previous)}">${escapeHtml(operatorLabel(previous))} (0)</option>`);
+    }
+    sel.value = previous || '';
 }
 
 function analyticsChangeHtml(pct) {
@@ -2409,7 +2484,119 @@ function renderInboxAnalytics(data) {
             }).join('')}</div>
         </div>`;
 
-    body.innerHTML = `<div class="inbox-analytics-cards">${cards.join('')}</div>${mixBar}${chart}`;
+    body.innerHTML = `<div class="inbox-analytics-cards">${cards.join('')}</div>${mixBar}${chart}${renderOperatorSection(data)}${renderDateSection(data)}`;
+}
+
+// "Confirmed by which operator" — ranked bars over human confirms only, so the
+// bot does not dwarf the people. share_pct comes from the backend against the
+// human total; the delta is versus the previous equal-length window.
+function renderOperatorSection(data) {
+    const operators = (data.operators || []).filter(o => o.count > 0);
+    if (!operators.length) return '';
+
+    syncOperatorOptions(operators);
+
+    const named = operators.filter(o => !SYNTHETIC_ACTORS[o.actor]);
+    const synthetic = operators.filter(o => SYNTHETIC_ACTORS[o.actor]);
+    if (!named.length && !synthetic.length) return '';
+
+    const max = named.reduce((m, o) => Math.max(m, o.count), 0) || 1;
+    const rows = named.map((o, i) => {
+        const color = OPERATOR_COLORS[i % OPERATOR_COLORS.length];
+        const title = `${o.actor} — ${o.count} confirmed · ${o.days_active} day(s) active\n` +
+            `Avg ${o.avg_per_day}/day · Peak ${o.peak_day ? o.peak_day.count : 0} on ${o.peak_day ? fmtAnalyticsDay(o.peak_day.date) : '—'}\n` +
+            `Last confirmation ${o.last_date ? fmtAnalyticsDay(o.last_date) : '—'}`;
+        return `
+            <div class="iac-op-row${inboxOperator === o.actor ? ' active' : ''}" data-analytics-operator="${escapeHtml(o.actor)}" title="${escapeHtml(title.trim())}">
+                <span class="iac-op-name">${escapeHtml(operatorLabel(o.actor))}</span>
+                <span class="iac-op-track"><span class="iac-op-fill" style="width:${Math.max(2, (o.count / max) * 100)}%;background:${color}"></span></span>
+                <span class="iac-op-count">${o.count}<i>${o.share_pct}%</i></span>
+                <span class="iac-op-meta">${analyticsChangeHtml(o.change_pct)} · ${o.days_active}d · ${o.avg_per_day}/d</span>
+            </div>`;
+    }).join('');
+
+    const foot = synthetic.map(o =>
+        `<span class="iac-op-synthetic">${SYNTHETIC_ACTORS[o.actor]}: ${o.count}</span>`
+    ).join('');
+    const att = data.attribution;
+    const caveat = att && att.unrecorded > 0
+        ? `<div class="iac-note">${att.unrecorded} manual confirm${att.unrecorded === 1 ? '' : 's'} in this window predate operator tracking — ${att.coverage_pct}% of manual work is attributed.</div>`
+        : '';
+
+    return `
+        <div class="inbox-analytics-ops">
+            <div class="iac-section-title">Confirmed by operator${att ? ` <span class="iac-section-sub">${att.attributed} of ${att.human_total} manual</span>` : ''}</div>
+            ${rows || '<div class="iac-note">No named operator confirmations in this period.</div>'}
+            ${foot ? `<div class="iac-op-synthetic-row">${foot}</div>` : ''}
+            ${caveat}
+        </div>`;
+}
+
+// "Confirmed orders of which date" — one row per IST day with that day's
+// operator split. Rows are clickable: they scope the list to the single day, and
+// the operator chips scope it to that person on that day.
+function renderDateSection(data) {
+    const daily = (data.daily || []).slice(0, 14);
+    if (!daily.length) return '';
+    const hasOperators = daily.some(d => d.byActor && Object.keys(d.byActor).length);
+
+    const rows = daily.map(d => {
+        const actors = Object.entries(d.byActor || {}).sort((a, b) => b[1] - a[1]);
+        const chips = actors.map(([actor, n]) =>
+            SYNTHETIC_ACTORS[actor]
+                ? `<span class="iac-day-chip synthetic" title="${actor}">${SYNTHETIC_ACTORS[actor]} ${n}</span>`
+                : `<span class="iac-day-chip" data-analytics-operator="${escapeHtml(actor)}" title="${escapeHtml(actor)} on ${d.date}">${escapeHtml(operatorLabel(actor))} ${n}</span>`
+        ).join('');
+        return `
+            <tr class="iac-date-row${inboxStartDate === d.date && inboxEndDate === d.date ? ' active' : ''}" data-analytics-date="${d.date}" title="Show only ${fmtAnalyticsDay(d.date)}">
+                <td class="iac-day-date">${fmtAnalyticsDay(d.date)}</td>
+                <td class="iac-day-total">${d.total}</td>
+                <td>${d.whatsapp}</td>
+                <td>${d.manual}</td>
+                ${hasOperators ? `<td class="iac-day-actors">${chips || '<span class="iac-day-chip synthetic">—</span>'}</td>` : ''}
+            </tr>`;
+    }).join('');
+
+    return `
+        <div class="inbox-analytics-dates">
+            <div class="iac-section-title">Confirmed by date <span class="iac-section-sub">${daily.length === 14 ? 'latest 14 days · ' : ''}click a day to filter</span></div>
+            <table class="iac-date-table${hasOperators ? ' with-operators' : ''}">
+                <thead><tr><th>Date</th><th>Total</th><th>WhatsApp</th><th>Manual</th>${hasOperators ? '<th>Operators</th>' : ''}</tr></thead>
+                <tbody>${rows}</tbody>
+            </table>
+        </div>`;
+}
+
+// Clicking an operator in the panel applies the same filter the dropdown would,
+// and clicking again removes it — the table is a control, not just a readout.
+function applyInboxOperatorFilter(actor) {
+    if (!actor) return;
+    inboxOperator = inboxOperator === actor ? '' : actor;
+    const sel = document.getElementById('inboxOperatorFilter');
+    if (sel) sel.value = inboxOperator;
+    inboxPageOffset = 0;
+    fetchInboxData();
+    updateInboxFilterChip();
+    scheduleInboxAnalytics(true);
+}
+
+// Clicking a date row scopes the list to that single IST day (toggle off on the
+// second click). Uses the existing date inputs so the bar above stays truthful
+// about what is applied.
+function applyInboxDayDrill(date) {
+    if (!date) return;
+    const isActive = inboxStartDate === date && inboxEndDate === date;
+    inboxStartDate = isActive ? '' : date;
+    inboxEndDate = isActive ? '' : date;
+    inboxQuickDate = null;
+    const startEl = document.getElementById('inboxStartDate');
+    const endEl = document.getElementById('inboxEndDate');
+    if (startEl) startEl.value = inboxStartDate;
+    if (endEl) endEl.value = inboxEndDate;
+    document.querySelectorAll('.inbox-quick-date').forEach(b => b.classList.remove('active'));
+    inboxPageOffset = 0;
+    fetchInboxData();
+    updateInboxFilterChip();
 }
 
 function setupInboxAnalyticsEvents() {
@@ -2428,6 +2615,17 @@ function setupInboxAnalyticsEvents() {
         refreshBtn.addEventListener('click', () => {
             inboxAnalyticsLastQs = null;
             scheduleInboxAnalytics(true);
+        });
+    }
+    // Delegated once: renderInboxAnalytics replaces the panel body on every fetch,
+    // so per-row listeners would be dropped (or stacked) on each refresh.
+    const panelBody = document.getElementById('inboxAnalyticsBody');
+    if (panelBody) {
+        panelBody.addEventListener('click', (e) => {
+            const opEl = e.target.closest('[data-analytics-operator]');
+            if (opEl) { applyInboxOperatorFilter(opEl.dataset.analyticsOperator); return; }
+            const dayEl = e.target.closest('[data-analytics-date]');
+            if (dayEl) applyInboxDayDrill(dayEl.dataset.analyticsDate);
         });
     }
 }
@@ -2525,6 +2723,7 @@ async function exportInboxOrders(selectedOnly) {
 
     if (currentInboxTab === 'confirmed') {
         if (inboxConfirmedBy) qs.push(`confirmedBy=${inboxConfirmedBy}`);
+        if (inboxOperator) qs.push(`operator=${encodeURIComponent(inboxOperator)}`);
         if (inboxPaymentMethod) qs.push(`paymentMethod=${inboxPaymentMethod}`);
         if (inboxDeliveryType) qs.push(`deliveryType=${inboxDeliveryType}`);
         if (inboxDateField) qs.push(`dateField=${inboxDateField}`);
