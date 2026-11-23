@@ -327,6 +327,36 @@ test('delta push job (bulk in/out mirror) resolves keys through the catalog inde
     assert.ok(client.adjusts.some(a => a.inventoryItemId === 913 && a.availableDelta === -2));
 });
 
+test('bulk mirror entry carrying a target lands Shopify on the target, not current + delta', async () => {
+    const client = immediateClient(); // live totals read as 14 per item
+    const { job } = await sync.startDeltaPushJob({
+        client, db: fakeDb(), catalog: catalog(),
+        deltas: [
+            { sku_key: 'tee-002', product_name: 'TEE', size: 'FREE', delta: 10, target: 30 }, // Projected
+            { sku_key: 'sw-001-blk-xl', product_name: 'S', size: 'XL', delta: -2 },           // old delta-only wire
+        ],
+    });
+    await until(() => job.finishedAt);
+    assert.equal(client.adjusts.length, 2);
+    // target wins over the hub-side delta: 30 − live 14 = +16, not 14 + 10
+    assert.ok(client.adjusts.some(a => a.inventoryItemId === 921 && a.availableDelta === 16));
+    // delta-only entries keep the relative behaviour
+    assert.ok(client.adjusts.some(a => a.inventoryItemId === 913 && a.availableDelta === -2));
+});
+
+test('targeted bulk-out clamped at home still clears Shopify stock it still holds', async () => {
+    // Local went 0 → 0 (delta 0) but Shopify holds 14; the Projected target of
+    // 0 must take it down anyway.
+    const client = immediateClient();
+    const { job } = await sync.startDeltaPushJob({
+        client, db: fakeDb(), catalog: catalog(),
+        deltas: [{ sku_key: 'tee-002', product_name: 'TEE', size: 'FREE', delta: 0, target: 0 }],
+    });
+    await until(() => job.finishedAt);
+    assert.equal(client.adjusts.length, 1);
+    assert.equal(client.adjusts[0].availableDelta, -14);
+});
+
 test('job snapshots bound the result tail and expose progress counters', async () => {
     const client = immediateClient();
     const tasks = Array.from({ length: 250 }, (_, i) => ({ sku_key: `k${i}`, product_name: 'P', size: 'M', inventory_item_id: 900 + i, delta: 1 }));

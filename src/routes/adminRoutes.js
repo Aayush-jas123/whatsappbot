@@ -3626,7 +3626,7 @@ router.get('/chat/unread', verifyToken, async (req, res) => {
         const filterClause = [];
         const filterParams = [];
         if (search) {
-            filterClause.push('(c.name LIKE ? OR u.phone LIKE ? OR ls.order_id LIKE ?)');
+            filterClause.push('(cf.name LIKE ? OR u.phone LIKE ? OR ls.order_id LIKE ?)');
             const searchParam = `%${search}%`;
             filterParams.push(searchParam, searchParam, searchParam);
         }
@@ -3635,19 +3635,26 @@ router.get('/chat/unread', verifyToken, async (req, res) => {
             filterParams.push(actionType);
         }
         const outerWhere = filterClause.length ? ` AND ${filterClause.join(' AND ')}` : '';
-        // The page always joins (it returns name/order/shopper columns); the count
-        // only joins when a filter actually references them.
-        const pageJoins = 'LEFT JOIN latest_shopper ls ON ls.phone = u.phone LEFT JOIN customers c ON c.phone = u.phone';
-        const countJoins = outerWhere ? pageJoins : '';
+        const needsShopperFilter = Boolean(search || actionType);
+        const needsCustomerFilter = Boolean(search);
+        // Only the columns a filter actually touches are joined, and they are
+        // aliased cf/ls so they cannot collide with the hydration joins outside
+        // the page sub-select.
+        const filterJoins = [
+            needsShopperFilter ? 'LEFT JOIN latest_shopper ls ON ls.phone = u.phone' : '',
+            needsCustomerFilter ? 'LEFT JOIN customers cf ON cf.phone = u.phone' : ''
+        ].filter(Boolean).join(' ');
 
-        // Latest shopper row per phone. DISTINCT ON walks
-        // idx_store_shoppers_phone_created; the previous shape recomputed this
-        // with a GROUP BY self-join over the whole table on every request.
+        // Latest shopper row per phone, narrowed to the two columns a filter can
+        // reference. (phone, created_at DESC) INCLUDE (order_id, status, ...) is
+        // exactly idx_store_shoppers_phone_order_cover, so this runs index-only:
+        // 54,779 rows in ~80ms. The wide projection it replaces had to walk the
+        // 227MB heap of ~2KB rows in index order for the same 54,779 rows
+        // (measured 11,055ms), and it did so for every unread conversation
+        // (~29k) to render a page of 20 — that one node is what tripped the
+        // 30s statement_timeout in production.
         const latestShopperCte = `latest_shopper AS (
-                SELECT DISTINCT ON (s1.phone)
-                       s1.phone, s1.id, s1.order_id, s1.status, s1.order_total,
-                       s1.delivery_type, s1.payment_method, s1.confirmed_by,
-                       s1.created_at, s1.updated_at, s1.last_response_at
+                SELECT DISTINCT ON (s1.phone) s1.phone, s1.order_id, s1.status
                 FROM store_shoppers s1
                 ORDER BY s1.phone, s1.created_at DESC
             )`;
@@ -3656,8 +3663,7 @@ router.get('/chat/unread', verifyToken, async (req, res) => {
         // The old GROUP BY + MAX(message_content) + MAX() per shopper column
         // aggregated every unread message (41k rows), spilled a 5MB sort to disk
         // and took ~7.9s — long enough to consume the whole pool.
-        const unreadSql = `
-            WITH unread AS (
+        const unreadCte = `unread AS (
                 SELECT DISTINCT ON (m.customer_phone)
                        m.customer_phone AS phone,
                        m.created_at     AS last_message_at,
@@ -3667,18 +3673,41 @@ router.get('/chat/unread', verifyToken, async (req, res) => {
                   AND NOT EXISTS (SELECT 1 FROM message_reads mr WHERE mr.message_id = m.id)
                   ${dateClause}
                 ORDER BY m.customer_phone, m.created_at DESC
-            ),
-            ${latestShopperCte}
-            SELECT u.phone, u.last_message_at, u.latest_message,
+            )`;
+
+        // Page first, hydrate second: LIMIT chooses the 20 conversations, then the
+        // shopper and name lookups run 20 times each off idx_store_shoppers_phone
+        // and the unique idx_customers_phone, instead of hashing all 84k customers
+        // into every request. Both hydration joins are at-most-one-row per phone
+        // (LATERAL ... LIMIT 1, unique key), so they cannot change the row set or
+        // its order and pagination stays equivalent to the old single query.
+        const unreadSql = `
+            WITH ${unreadCte}${needsShopperFilter ? `,${latestShopperCte}` : ''},
+            page AS (
+                SELECT u.phone, u.last_message_at, u.latest_message
+                FROM unread u
+                ${filterJoins}
+                WHERE 1=1 ${outerWhere}
+                ORDER BY u.last_message_at DESC
+                LIMIT ? OFFSET ?
+            )
+            SELECT p.phone, p.last_message_at, p.latest_message,
                    ls.id AS shopper_id, ls.order_id, ls.status, ls.order_total,
                    ls.delivery_type, ls.payment_method, ls.confirmed_by,
                    ls.created_at, ls.updated_at, ls.last_response_at,
                    c.name
-            FROM unread u
-            ${pageJoins}
-            WHERE 1=1 ${outerWhere}
-            ORDER BY u.last_message_at DESC
-            LIMIT ? OFFSET ?
+            FROM page p
+            LEFT JOIN LATERAL (
+                SELECT s2.id, s2.order_id, s2.status, s2.order_total, s2.delivery_type,
+                       s2.payment_method, s2.confirmed_by, s2.created_at, s2.updated_at,
+                       s2.last_response_at
+                FROM store_shoppers s2
+                WHERE s2.phone = p.phone
+                ORDER BY s2.created_at DESC
+                LIMIT 1
+            ) ls ON TRUE
+            LEFT JOIN customers c ON c.phone = p.phone
+            ORDER BY p.last_message_at DESC
         `;
         const pageRows = await dbAdapter.query(unreadSql, [...dateParams, ...filterParams, parseInt(limit), parseInt(offset)]);
 
@@ -3713,10 +3742,10 @@ router.get('/chat/unread', verifyToken, async (req, res) => {
                   ${dateClause}
                 ORDER BY m.customer_phone, m.created_at DESC
             )
-            ${outerWhere ? `, ${latestShopperCte}` : ''}
+            ${outerWhere ? `,${latestShopperCte}` : ''}
             SELECT COUNT(*)::int AS total
             FROM unread u
-            ${countJoins}
+            ${outerWhere ? filterJoins : ''}
             WHERE 1=1 ${outerWhere}
         `;
         const countParams = outerWhere ? [...dateParams, ...filterParams] : [...dateParams];
@@ -8529,12 +8558,15 @@ router.post('/inventory/bulk-in', verifyToken, async (req, res) => {
         const { invalidateCache } = require('../utils/cache');
         invalidateCache();
 
-        // Optional mirror to Shopify: queue a rate-limited delta push job (same
-        // pipeline the sync workbench uses). Non-blocking — the UI polls the job.
+        // Optional mirror to Shopify: queue a rate-limited push job (same
+        // pipeline the sync workbench uses). The Projected figure is the
+        // target — Shopify is set to quantity_after, not shifted by our delta.
+        // Non-blocking — the UI polls the job.
         let shopifySync = null;
         if (sync_shopify) {
             shopifySync = await queueBulkShopifyPush(results.map(r => ({
-                sku_key: r.sku_key, product_name: r.product_name, size: r.size, delta: r.quantity_added,
+                sku_key: r.sku_key, product_name: r.product_name, size: r.size,
+                delta: r.quantity_added, target: r.quantity_after,
             })), reference || 'bulk_in', performed_by || 'hub_operator');
         }
 
@@ -8614,7 +8646,8 @@ router.post('/inventory/bulk-out', verifyToken, async (req, res) => {
         let shopifySync = null;
         if (sync_shopify) {
             shopifySync = await queueBulkShopifyPush(results.map(r => ({
-                sku_key: r.sku_key, product_name: r.product_name, size: r.size, delta: -r.quantity_removed,
+                sku_key: r.sku_key, product_name: r.product_name, size: r.size,
+                delta: -r.quantity_removed, target: r.quantity_after,
             })), reference || 'bulk_out', performed_by || 'hub_operator');
         }
 
@@ -8737,8 +8770,9 @@ router.post('/inventory/sync-from-shopify', verifyToken, async (req, res) => {
 
 // ── SHOPIFY ⇄ STOCK ROOM two-way sync workbench ──
 // Pull: Shopify-side bulk edits land here (adds + quantity alignment) via
-// batched SQL. Push: hub quantities (or Bulk In/Out deltas) are written to
-// Shopify through a rate-limited background job the UI polls for progress.
+// batched SQL. Push: hub quantities (or Bulk In/Out projected targets) are
+// written to Shopify through a rate-limited background job the UI polls for
+// progress.
 
 // Shared by bulk-in/bulk-out when sync_shopify is requested. Never throws —
 // a Shopify mirror failure must not fail the local bulk operation.

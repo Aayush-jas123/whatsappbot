@@ -474,7 +474,11 @@ async function _persistRunFinish(db, job) {
 // decrease never strands more than one location in the negative); fall back
 // to the store's first location for fresh items.
 async function runPushJob({ client, db, tasks, reference, performedBy, mode, direction }) {
-    const work = (tasks || []).filter(t => t && t.inventory_item_id && Number(t.delta) !== 0);
+    // A task carrying a target stays in even when the hub-side delta is 0:
+    // Bulk Out clamps locally (0 − 5 = 0) yet Shopify may still hold stock the
+    // target has to clear. delta-only tasks keep the old "nothing to do" skip.
+    const work = (tasks || []).filter(t => t && t.inventory_item_id &&
+        (Number(t.delta) !== 0 || Number.isFinite(Number(t.target))));
     const skipped = (tasks || []).length - work.length;
 
     const job = {
@@ -625,6 +629,11 @@ async function startAbsolutePushJob({ client, db, catalog, hubRows, selectedSkuK
 }
 
 // Delta push: apply known deltas (Bulk In/Out) onto Shopify directly.
+// An entry may also carry `target` — the bulk row's Projected figure, which is
+// what manual_inventory was just set to. The runner then lands Shopify ON the
+// target (recomputed against the live level) instead of adding the hub-side
+// delta onto whatever Shopify currently holds, so "Projected 40" means 40 in
+// Shopify even when the two sides started from different numbers.
 async function startDeltaPushJob({ client, db, catalog, deltas, reference, performedBy }) {
     const index = indexCatalog(catalog);
     const tasks = [];
@@ -632,12 +641,16 @@ async function startDeltaPushJob({ client, db, catalog, deltas, reference, perfo
     for (const d of deltas || []) {
         const m = matchHubRow(index, { sku_key: d.sku_key });
         if (!m || !m.entry.variant.inventory_item_id) { unmatched.push(d.sku_key); continue; }
+        const target = Number.isFinite(Number(d.target)) ? Number(d.target) : null;
         tasks.push({
             sku_key: d.sku_key, product_name: d.product_name, size: d.size,
-            inventory_item_id: m.entry.variant.inventory_item_id, delta: Number(d.delta) || 0,
+            inventory_item_id: m.entry.variant.inventory_item_id,
+            delta: Number(d.delta) || 0,
+            ...(target !== null ? { target } : {}),
         });
     }
-    const job = await runPushJob({ client, db, tasks, reference, performedBy, mode: 'delta', direction: 'push_delta' });
+    const absolute = tasks.length > 0 && tasks.every(t => Number.isFinite(t.target));
+    const job = await runPushJob({ client, db, tasks, reference, performedBy, mode: absolute ? 'absolute' : 'delta', direction: 'push_delta' });
     return { job, unmatched };
 }
 

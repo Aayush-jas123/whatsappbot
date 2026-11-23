@@ -38,7 +38,7 @@
         bulkReference: '',
         bulkNotes: '',
         bulkOutMode: false,   // false = Bulk In (add), true = Bulk Out (subtract)
-        bulkPushShopify: localStorage.getItem('srBulkPushShopify') === '1', // mirror bulk deltas to Shopify
+        bulkPushShopify: localStorage.getItem('srBulkPushShopify') === '1', // mirror bulk moves to Shopify (lands on Projected)
     };
 
     /* ── API ── */
@@ -134,7 +134,8 @@
        SHOPIFY SYNC WORKBENCH — two-way bulk sync
        Pull  : Shopify → Stock Room (compare, select, batched apply)
        Push  : Stock Room → Shopify (rate-limited background job + polling)
-       Bulk In/Out can mirror their deltas to Shopify directly (toggle).
+       Bulk In/Out can mirror to Shopify directly (toggle): Shopify is set to
+       the Projected figures, not shifted by our local delta.
        ════════════════════════════════════════════════════════════════════ */
     const SW = {
         built: false,
@@ -941,7 +942,7 @@
                 </div>
                 <label class="sr-bulk-shopify-toggle">
                     <input type="checkbox" id="srBulkShopify" ${SR.bulkPushShopify ? 'checked' : ''}>
-                    Also apply the same ${isOut ? 'reductions' : 'additions'} to Shopify stock
+                    Also set Shopify stock to these Projected figures
                 </label>
             </div>`;
 
@@ -1021,7 +1022,7 @@
         const endpoint = isOut ? '/api/admin/inventory/bulk-out' : '/api/admin/inventory/bulk-in';
         const label = isOut ? 'Bulk Inventory-Out' : 'Bulk Inventory-In';
 
-        if (!window.confirm(`Confirm ${label}\n\n${SR.bulkItems.length} SKU(s) · ${totalQty} total units\nReference: ${SR.bulkReference || 'None'}${SR.bulkPushShopify ? '\n\n＋ Same deltas will be pushed to Shopify.' : ''}`)) return;
+        if (!window.confirm(`Confirm ${label}\n\n${SR.bulkItems.length} SKU(s) · ${totalQty} total units\nReference: ${SR.bulkReference || 'None'}${SR.bulkPushShopify ? '\n\n＋ Shopify stock will be set to the Projected figures.' : ''}`)) return;
         try {
             const result = await apiFetch(endpoint, {
                 method: 'POST',
