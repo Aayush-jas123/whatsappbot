@@ -4,6 +4,7 @@ const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
 const multer = require('multer');
 const whatsappService = require('../services/whatsappService');
+const Support = require('../services/supportService');
 const { dbAdapter } = require('../database/db');
 const { caches } = require('../utils/cache');
 
@@ -208,6 +209,35 @@ async function verifyPhoneInPortal(phone, portal) {
     });
 }
 
+// Ticket ownership rule, shared by every per-ticket route below. A ticket is in
+// the portal when portal_id matches; a time_based portal additionally sees
+// unassigned tickets created inside its shift window. Returns the row or null.
+// (Extracted from the identical blocks that PUT /tickets/:id and
+// PATCH /tickets/:id/mark-read each carried.)
+async function ticketInPortalOr403(portal, id) {
+    let ticketQuery = 'SELECT * FROM support_tickets WHERE id = ?';
+    const ticketParams = [id];
+
+    if (portal.type !== 'time_based') {
+        ticketQuery += ' AND portal_id = ?';
+        ticketParams.push(portal.id);
+    }
+
+    const tickets = await dbAdapter.query(ticketQuery, ticketParams);
+    if (!tickets || tickets.length === 0) return null;
+
+    const t = tickets[0];
+    if (portal.type === 'time_based') {
+        if (t.portal_id) {
+            if (String(t.portal_id) !== String(portal.id)) return null;
+        } else {
+            const config = portal.config ? JSON.parse(portal.config) : {};
+            if (!isTicketInTimeRange(t, config)) return null;
+        }
+    }
+    return t;
+}
+
 // Portal authentication
 router.post('/auth', async (req, res) => {
     try {
@@ -291,7 +321,16 @@ router.get('/:slug/tickets', verifyPortalToken, async (req, res) => {
         const { status, channel } = req.query;
         const tickets = await getPortalTickets(portal.id, portal.type, portal.config, status, channel);
 
-        res.json({ success: true, tickets });
+        // thread_mode is decided server-side from the same predicate the desk uses
+        // (Support.isStorefrontTicket), so the UI never re-derives which tickets are
+        // worked as a thread instead of a WhatsApp chat. Mapping a copy keeps the
+        // 30s cache entry free of the extra field.
+        const withMode = tickets.map(t => ({
+            ...t,
+            thread_mode: Support.isStorefrontTicket(t) ? 'thread' : 'chat'
+        }));
+
+        res.json({ success: true, tickets: withMode });
     } catch (error) {
         console.error('Portal tickets error:', error);
         res.status(500).json({ success: false, error: 'Failed to fetch tickets' });
@@ -562,34 +601,9 @@ router.put('/:slug/tickets/:id', verifyPortalToken, async (req, res) => {
         }
 
         const portal = portals[0];
-        let ticketQuery = 'SELECT * FROM support_tickets WHERE id = ?';
-        const ticketParams = [id];
-
-        if (portal.type !== 'time_based') {
-            ticketQuery += ' AND portal_id = ?';
-            ticketParams.push(portal.id);
-        }
-
-        const tickets = await dbAdapter.query(ticketQuery, ticketParams);
-
-        if (!tickets || tickets.length === 0) {
+        const ownedTicket = await ticketInPortalOr403(portal, id);
+        if (!ownedTicket) {
             return res.status(403).json({ error: 'Ticket not found in this portal' });
-        }
-
-        // For time-based, verify ownership: explicitly-assigned tickets (split/transfer)
-        // belong only to their portal; otherwise the ticket must fall in the time range.
-        if (portal.type === 'time_based') {
-            const t = tickets[0];
-            if (t.portal_id) {
-                if (String(t.portal_id) !== String(portal.id)) {
-                    return res.status(403).json({ error: 'Ticket not in this portal' });
-                }
-            } else {
-                const config = portal.config ? JSON.parse(portal.config) : {};
-                if (!isTicketInTimeRange(t, config)) {
-                    return res.status(403).json({ error: 'Ticket not in portal time range' });
-                }
-            }
         }
 
         // Build the status update. Marking follow-up stores the optional reminder
@@ -636,6 +650,138 @@ router.put('/:slug/tickets/:id', verifyPortalToken, async (req, res) => {
     }
 });
 
+// ── Help & Tickets (storefront) thread ──
+// A storefront ticket's whole conversation lives in this row's `thread`, not in
+// `messages`, so /chat/:phone can neither show nor answer it: the team member got
+// the customer's unrelated WhatsApp history instead of the request. These routes
+// give the portal that lane. Widget (WDG-) tickets deliberately keep the chat view
+// - Support.isStorefrontTicket is the single switch, shared with the desk.
+
+// Read the ticket thread (staff view: internal events included).
+router.get('/:slug/tickets/:id/thread', verifyPortalToken, async (req, res) => {
+    try {
+        const { slug, id } = req.params;
+
+        if (slug !== req.portal.slug) {
+            return res.status(403).json({ error: 'Portal mismatch' });
+        }
+
+        const portals = await dbAdapter.query(
+            'SELECT * FROM support_portals WHERE slug = ?',
+            [slug]
+        );
+
+        if (!portals || portals.length === 0) {
+            return res.status(404).json({ error: 'Portal not found' });
+        }
+
+        const ticket = await ticketInPortalOr403(portals[0], id);
+        if (!ticket) {
+            return res.status(403).json({ error: 'Ticket not found in this portal' });
+        }
+
+        // Opening the thread counts as reading it, exactly like opening a chat
+        if (!ticket.is_read) {
+            await dbAdapter.run(
+                'UPDATE support_tickets SET is_read = true WHERE id = ? AND is_read = false',
+                [ticket.id]
+            );
+            // Invalidate portal ticket cache
+            caches.tickets.keys().filter(k => k.startsWith('portal_tickets_full:')).forEach(k => caches.tickets.delete(k));
+        }
+
+        const images = await Support.listTicketImages(ticket.id);
+
+        res.json({
+            success: true,
+            mode: Support.isStorefrontTicket(ticket) ? 'thread' : 'chat',
+            ticket: {
+                id: ticket.id, ticket_number: ticket.ticket_number, order_id: ticket.order_id,
+                reason_label: ticket.reason_label, sub_label: ticket.sub_label, other_text: ticket.other_text,
+                preference: ticket.preference, contact_via: ticket.contact_via,
+                new_address: ticket.new_address, video_url: ticket.video_url,
+                status: ticket.status, priority: ticket.priority, team: ticket.team,
+                created_at: ticket.created_at,
+                images
+            },
+            entries: Support.portalThreadView(ticket)
+        });
+    } catch (error) {
+        console.error('Portal ticket thread error:', error);
+        res.status(500).json({ success: false, error: 'Failed to fetch ticket thread' });
+    }
+});
+
+// Reply into the thread. Nothing is sent on WhatsApp: for a storefront ticket the
+// Help & Tickets tab the customer is already reading IS the delivery channel, and
+// an outbound template there would need an approved template outside the 24h window.
+router.post('/:slug/tickets/:id/reply', verifyPortalToken, async (req, res) => {
+    try {
+        const { slug, id } = req.params;
+        // The portal composer posts { message }; { text } is the desk's spelling.
+        const body = req.body || {};
+        const text = String(body.text != null ? body.text : (body.message || '')).trim();
+
+        if (slug !== req.portal.slug) {
+            return res.status(403).json({ error: 'Portal mismatch' });
+        }
+
+        if (!text) {
+            return res.status(400).json({ success: false, error: 'Reply text is required' });
+        }
+        if (text.length > 5000) {
+            return res.status(400).json({ success: false, error: 'Reply is too long (5000 characters max)' });
+        }
+
+        const portals = await dbAdapter.query(
+            'SELECT * FROM support_portals WHERE slug = ?',
+            [slug]
+        );
+
+        if (!portals || portals.length === 0) {
+            return res.status(404).json({ error: 'Portal not found' });
+        }
+
+        const ticket = await ticketInPortalOr403(portals[0], id);
+        if (!ticket) {
+            return res.status(403).json({ error: 'Ticket not found in this portal' });
+        }
+
+        const patch = Support.portalAgentReplyPatch(ticket, {
+            text,
+            agentId: 'portal:' + slug,
+            now: Date.now()
+        });
+        if (!patch) {
+            return res.status(400).json({ success: false, error: 'Reply text is required' });
+        }
+
+        const updated = await Support.updateTicket(ticket.id, patch);
+        if (!updated) {
+            return res.status(500).json({ success: false, error: 'Failed to save reply' });
+        }
+
+        // Invalidate portal ticket cache
+        caches.tickets.keys().filter(k => k.startsWith('portal_tickets_full:')).forEach(k => caches.tickets.delete(k));
+
+        // The ticket just left 'open', so refresh the portal's active-work counter
+        // the same way the status route does - auto-routing reads it for capacity.
+        const countResult = await dbAdapter.query(
+            `SELECT COUNT(*) as count FROM support_tickets WHERE portal_id = ? AND status IN ('open', 'follow_up')`,
+            [portals[0].id]
+        );
+        await dbAdapter.run(
+            'UPDATE support_portals SET assigned_count = ? WHERE id = ?',
+            [countResult[0]?.count || 0, portals[0].id]
+        );
+
+        res.json({ success: true, entries: Support.portalThreadView(updated) });
+    } catch (error) {
+        console.error('Portal ticket reply error:', error);
+        res.status(500).json({ success: false, error: 'Failed to send reply' });
+    }
+});
+
 // Mark ticket as read via portal
 router.patch('/:slug/tickets/:id/mark-read', verifyPortalToken, async (req, res) => {
     try {
@@ -656,34 +802,9 @@ router.patch('/:slug/tickets/:id/mark-read', verifyPortalToken, async (req, res)
         }
 
         const portal = portals[0];
-        let ticketQuery = 'SELECT * FROM support_tickets WHERE id = ?';
-        const ticketParams = [id];
-
-        if (portal.type !== 'time_based') {
-            ticketQuery += ' AND portal_id = ?';
-            ticketParams.push(portal.id);
-        }
-
-        const tickets = await dbAdapter.query(ticketQuery, ticketParams);
-
-        if (!tickets || tickets.length === 0) {
+        const ownedTicket = await ticketInPortalOr403(portal, id);
+        if (!ownedTicket) {
             return res.status(403).json({ error: 'Ticket not found in this portal' });
-        }
-
-        // Time-based ownership: assigned tickets (split/transfer) belong only to their portal;
-        // otherwise the ticket must fall within this portal's time range.
-        if (portal.type === 'time_based') {
-            const t = tickets[0];
-            if (t.portal_id) {
-                if (String(t.portal_id) !== String(portal.id)) {
-                    return res.status(403).json({ error: 'Ticket not in this portal' });
-                }
-            } else {
-                const config = portal.config ? JSON.parse(portal.config) : {};
-                if (!isTicketInTimeRange(t, config)) {
-                    return res.status(403).json({ error: 'Ticket not in portal time range' });
-                }
-            }
         }
 
         await dbAdapter.query(
