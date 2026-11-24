@@ -945,7 +945,7 @@ async function autoRouteTicket(created) {
         }
         if (!best) return created;
         const thread = Array.isArray(created.thread) ? created.thread : [];
-        thread.push({ kind: 'event', text: 'Auto-routed to ' + best.name + ' (shift portal, least load)', at: Date.now() });
+        thread.push({ kind: 'event', text: 'Auto-routed to ' + best.name + ' (shift portal, least load)', at: Date.now(), internal: true });
         const updated = await updateTicket(created.id, { portal_id: best.id, thread });
         // Keep the portal's running load counter honest: the round-robin engine
         // in utils/portalAssignment reads assigned_count for its capacity check,
@@ -1074,9 +1074,26 @@ const QUEUE_COLS = [
 // widget tickets visible so nothing becomes unreachable from the desk.
 const DESK_WEBSITE_COND = "channel = 'website' AND ticket_number NOT LIKE 'WDG-%'";
 
+// Events the storefront must never see: internal routing, team hand-offs,
+// triage levels and named-staff actions. Rows written before the `internal`
+// flag existed are caught by the text pattern, so no backfill is needed —
+// the desk keeps reading the unfiltered thread and the DB stays honest.
+const INTERNAL_EVENT_RE = /^(auto-routed to|assigned to|taken by|priority set to|reopened by)\b/i;
+
+function isCustomerVisibleEntry(m) {
+    if (!m) return false;                       // never ship a hole to the theme
+    if (m.kind !== 'event') return true;        // messages always pass
+    if (m.internal === true) return false;
+    return !INTERNAL_EVENT_RE.test(String(m.text || ''));
+}
+
 // Customer-safe detail projection. The desk row carries internal columns
 // (notes, assigned_to, the customer snapshot in history) that must never be
 // serialised to the storefront, and trimming them also shrinks the response.
+// The thread is filtered by the same rule: auto-route / assignment / hand-off
+// events describe who inside Off-Comfort is working on the ticket, which is
+// operations detail the customer never needs to see (and which pins staff
+// names and the internal team map onto a browsable payload).
 function customerTicket(t) {
     if (!t) return null;
     return {
@@ -1089,7 +1106,8 @@ function customerTicket(t) {
         resolution_label: t.resolution_label, resolution_at: t.resolution_at,
         csat: t.csat, reopen_count: t.reopen_count || 0,
         payment_link: t.payment_link || null,
-        thread: Array.isArray(t.thread) ? t.thread : []
+        // Customer sees only outcomes, never the internal team map.
+        thread: Array.isArray(t.thread) ? t.thread.filter(isCustomerVisibleEntry) : []
     };
 }
 
@@ -1182,6 +1200,6 @@ module.exports = {
     contextFor, normOrderId, attachItemImages,
     isWhitelisted, listWhitelist, addWhitelist, removeWhitelist,
     listTicketsByPhone, countTicketsByPhone, getTicket, getTicketByNumber, openTicketForOrder,
-    createTicket, updateTicket, listTicketImages, deskQueryTickets, deskStatsAgg, publicTicket, customerTicket,
+    createTicket, updateTicket, listTicketImages, deskQueryTickets, deskStatsAgg, publicTicket, customerTicket, isCustomerVisibleEntry,
     getPortalIndex, describePortal
 };

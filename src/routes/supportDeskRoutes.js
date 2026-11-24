@@ -335,7 +335,10 @@ router.patch('/tickets/:id', async (req, res) => {
         }
         if (events.length) {
             const thread = Array.isArray(t.thread) ? t.thread : [];
-            events.forEach(e => thread.push({ kind: 'event', text: e, at: Date.now() }));
+            // Triage/team/hand-off lines are desk-only bookkeeping: they name
+            // staff and expose the internal team map, so they carry the
+            // internal flag the customer projection filters on.
+            events.forEach(e => thread.push({ kind: 'event', text: e, at: Date.now(), internal: true }));
             patch.thread = thread;
         }
         const updated = await Support.updateTicket(t.id, patch);
@@ -419,7 +422,8 @@ router.post('/tickets/:id/reopen', async (req, res) => {
         const t = await Support.getTicket(req.params.id);
         if (!t) return res.status(404).json({ error: 'Ticket not found' });
         const thread = Array.isArray(t.thread) ? t.thread : [];
-        thread.push({ kind: 'event', text: 'Reopened by ' + agentName(req), at: Date.now() });
+        // Named-staff action stays desk-side; the customer sees the status move.
+        thread.push({ kind: 'event', text: 'Reopened by ' + agentName(req), at: Date.now(), internal: true });
         const updated = await Support.updateTicket(t.id, {
             status: 'open', thread, last_customer_at: new Date().toISOString(), updated_at: new Date().toISOString()
         });
