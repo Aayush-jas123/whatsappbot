@@ -122,12 +122,15 @@ pool.on('error', (err) => {
 });
 
 // Monitor pool utilization every 30 seconds when active (>50%)
+// unref(): a monitoring timer must never be what keeps a process alive - it is
+// the reason offline scripts and `node --test` hang after finishing their work.
+// The server keeps its own listening handles, so the warning still fires.
 setInterval(() => {
   const utilization = (pool.totalCount / pool.options.max) * 100;
   if (utilization > 50) {
     console.warn(`📊 DB POOL: ${pool.totalCount}/${pool.options.max} (${utilization.toFixed(0)}%) | Waiting: ${pool.waitingCount}`);
   }
-}, 30000);
+}, 30000).unref();
 
 // CRITICAL FIX: pg Pool does NOT have endIdleClients() — implement it manually
 // This drains idle connections to free native TLS buffers (~5-10MB per idle connection)
