@@ -540,6 +540,34 @@ function setupEventListeners() {
     document.getElementById('backToShoppersFromInbox')?.addEventListener('click', hideInboxView);
     document.getElementById('refreshInboxBtn')?.addEventListener('click', fetchInboxData);
 
+    const inboxList = document.getElementById('inboxListContainer');
+    if (inboxList) {
+        inboxList.addEventListener('click', (event) => {
+            const action = event.target.closest('[data-inbox-action]');
+            if (action) {
+                const item = action.closest('.inbox-item');
+                if (action.dataset.inboxAction === 'chat' && item) openInboxChatFromItem(item);
+                if (action.dataset.inboxAction === 'mark-read' && item) markInboxAsRead(item.dataset.phone);
+                if (action.dataset.inboxAction === 'retry') fetchInboxData(true);
+                if (action.dataset.inboxAction === 'clear') clearInboxFilters();
+                if (action.dataset.inboxAction === 'back') hideInboxView();
+                return;
+            }
+            if (event.target.closest('a, button, input, label, select')) return;
+            const item = event.target.closest('.inbox-item');
+            if (item) openInboxChatFromItem(item);
+        });
+        inboxList.addEventListener('change', (event) => {
+            if (event.target.matches('.inbox-item-checkbox')) onInboxItemCheck(event.target);
+        });
+        inboxList.addEventListener('keydown', (event) => {
+            if ((event.key === 'Enter' || event.key === ' ') && event.target.matches('.inbox-item')) {
+                event.preventDefault();
+                openInboxChatFromItem(event.target);
+            }
+        });
+    }
+
     // Multi Orders
     document.getElementById('multiOrdersBtn')?.addEventListener('click', showMultiOrdersView);
     document.getElementById('backToShoppersFromMultiOrders')?.addEventListener('click', hideMultiOrdersView);
@@ -716,8 +744,12 @@ function setupEventListeners() {
         tab.addEventListener('click', () => {
             currentInboxTab = tab.dataset.inboxTab;
             inboxPageOffset = 0;
-            document.querySelectorAll('.inbox-tab').forEach(t => t.classList.remove('active'));
+            document.querySelectorAll('.inbox-tab').forEach(t => {
+                t.classList.remove('active');
+                t.setAttribute('aria-selected', 'false');
+            });
             tab.classList.add('active');
+            tab.setAttribute('aria-selected', 'true');
             toggleInboxConfirmedFilters();
             inboxDeselectAll();
             fetchInboxData();
@@ -1346,6 +1378,30 @@ let inboxSearch = '';
 let inboxSelectedItems = new Set();
 let inboxDateField = 'updated_at';
 
+const INBOX_ICON_PATHS = Object.freeze({
+    chat: '<path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/><path d="M8 9h8M8 13h5"/>',
+    check: '<polyline points="20 6 9 17 4 12"/>',
+    user: '<circle cx="12" cy="8" r="4"/><path d="M4 21a8 8 0 0 1 16 0"/>',
+    whatsapp: '<path d="M21 11.5a8.4 8.4 0 0 1-12.4 7.4L3 20l1.1-5.4A8.5 8.5 0 1 1 21 11.5z"/><path d="M8.2 7.8c.3-.7.6-.7.9-.7h.7c.2 0 .4.1.5.4l.9 2.1c.1.3.1.5-.1.7l-.7.8c-.2.2-.1.4 0 .6.6 1.1 1.5 2 2.6 2.6.2.1.4.2.6 0l.8-1c.2-.2.4-.3.7-.2l2.1.9c.3.1.4.3.4.5 0 .4-.2 1.6-.8 2.1-.5.5-1.3.8-2.2.7-1.1-.1-2.7-.6-4.7-2.2-2.4-1.9-3.8-4.2-3.9-5.7-.1-.8.2-1.5.5-1.9z"/>',
+    alert: '<path d="M12 9v4M12 17h.01"/><path d="M10.3 3.9 2.4 18a2 2 0 0 0 1.7 3h15.8a2 2 0 0 0 1.7-3L13.7 3.9a2 2 0 0 0-3.4 0z"/>',
+    'chevron-down': '<polyline points="6 9 12 15 18 9"/>',
+    'chevron-right': '<polyline points="9 6 15 12 9 18"/>'
+});
+
+function inboxIcon(name, size = 16) {
+    return `<svg width="${size}" height="${size}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">${INBOX_ICON_PATHS[name] || ''}</svg>`;
+}
+
+function openInboxChatFromItem(item) {
+    if (!item) return;
+    openChat(
+        item.dataset.phone || '',
+        encodeURIComponent(item.dataset.name || ''),
+        item.dataset.orderId || '',
+        item.dataset.status || 'pending'
+    );
+}
+
 async function fetchInboxCounts() {
     try {
         // Build date params for count queries
@@ -1841,7 +1897,13 @@ async function fetchInboxData(forceFresh) {
     // dedupe key so mutated rows are reflected immediately
     if (forceFresh) inboxAnalyticsLastQs = null;
 
-    container.innerHTML = '<div style="display:flex;flex-direction:column;align-items:center;justify-content:center;padding:4rem;"><div class="spinner"></div><span style="font-family:\'Archivo Narrow\',sans-serif;letter-spacing:2px;font-weight:500;opacity:0.7;margin-top:1rem;">LOADING...</span></div>';
+    container.innerHTML = `
+        <div class="inbox-loading" role="status">
+            <div class="inbox-loading-spinner" aria-hidden="true"></div>
+            <div class="inbox-loading-title">Loading queue</div>
+            <div class="inbox-loading-text">Fetching the latest customer activity</div>
+        </div>
+    `;
 
     try {
         // Build query params
@@ -1875,7 +1937,14 @@ async function fetchInboxData(forceFresh) {
         }
     } catch (err) {
         console.error('Failed to fetch inbox data:', err);
-        container.innerHTML = '<div class="inbox-empty"><div class="inbox-empty-icon">⚠️</div><div class="inbox-empty-title">Error loading data</div><div class="inbox-empty-text">Please try again</div></div>';
+        container.innerHTML = `
+            <div class="inbox-empty inbox-error" role="alert">
+                <div class="inbox-empty-mark">${inboxIcon('alert', 30)}</div>
+                <div class="inbox-empty-title">The queue couldn’t load</div>
+                <div class="inbox-empty-text">Check your connection and try again.</div>
+                <button class="inbox-empty-action" data-inbox-action="retry">Try again</button>
+            </div>
+        `;
     }
 }
 
@@ -1885,39 +1954,39 @@ function renderInboxList(shoppers, total) {
     const prevBtn = document.getElementById('inboxPrevBtn');
     const nextBtn = document.getElementById('inboxNextBtn');
     const listTitle = document.getElementById('inboxListTitle');
+    const queueCount = document.getElementById('inboxQueueCount');
 
     if (!container) return;
 
     if (listTitle) {
-        listTitle.textContent = currentInboxTab === 'unread' ? 'Unread Customer Messages' : 'Recently Confirmed Orders';
+        listTitle.textContent = currentInboxTab === 'unread' ? 'Unread customer messages' : 'Recently confirmed orders';
+    }
+    if (queueCount) {
+        queueCount.textContent = `${total || 0} ${currentInboxTab === 'unread' ? 'conversation' : 'order'}${total === 1 ? '' : 's'}`;
     }
 
-    // Update date bar context label
     const dateBarLabel = document.getElementById('inboxDateBarLabel');
     if (dateBarLabel) {
-        if (currentInboxTab === 'unread') {
-            dateBarLabel.textContent = '📅 Messages from:';
-        } else {
-            dateBarLabel.textContent = inboxDateField === 'updated_at' ? '📅 Confirmed from:' : '📅 Ordered from:';
-        }
+        dateBarLabel.textContent = currentInboxTab === 'unread'
+            ? 'Message date'
+            : (inboxDateField === 'updated_at' ? 'Confirmation date' : 'Order date');
     }
 
-    // Update active filter chip
     updateInboxFilterChip();
 
     if (!shoppers || shoppers.length === 0) {
         const isUnread = currentInboxTab === 'unread';
         const hasDateFilter = inboxStartDate || inboxEndDate || inboxQuickDate;
-        const filterHint = hasDateFilter ? `<div class="inbox-empty-hint" style="margin-top:0.75rem;font-size:0.8rem;opacity:0.5;">A date filter is active — <a href="#" onclick="clearInboxFilters(); return false;" style="color:#25d366;text-decoration:underline;">Clear filter</a> to see all</div>` : '';
         container.innerHTML = `
             <div class="inbox-empty">
-                <div class="inbox-empty-icon">${isUnread ? '💬' : '✓'}</div>
+                <div class="inbox-empty-mark">${inboxIcon(isUnread ? 'chat' : 'check', 30)}</div>
                 <div class="inbox-empty-title">${isUnread ? 'No unread messages' : 'No recent confirmations'}</div>
-                <div class="inbox-empty-text">${isUnread ? 'All customer messages have been attended to' : 'Confirmed orders will appear here'}</div>
-                ${filterHint}
+                <div class="inbox-empty-text">${isUnread ? 'Your customer queue is clear. Nicely done.' : 'Confirmed orders will appear here as they come in.'}</div>
+                ${hasDateFilter ? '<div class="inbox-empty-hint">A date filter is active. Try a wider range to see more.</div>' : ''}
+                <button class="inbox-empty-action" data-inbox-action="${hasDateFilter ? 'clear' : 'back'}">${hasDateFilter ? 'Clear filters' : 'Back to shoppers'}</button>
             </div>
         `;
-        if (pageInfo) pageInfo.textContent = 'Showing 0-0 of 0';
+        if (pageInfo) pageInfo.textContent = 'Showing 0–0 of 0';
         if (prevBtn) prevBtn.disabled = true;
         if (nextBtn) nextBtn.disabled = true;
         return;
@@ -1928,59 +1997,58 @@ function renderInboxList(shoppers, total) {
         const avatarClass = currentInboxTab === 'unread' ? 'unread' : 'confirmed';
         const timeAgo = formatTimeAgo(s.last_message_at || s.last_response_at || s.updated_at);
         const absTime = formatDate(s.last_message_at || s.updated_at || s.created_at);
-    
-        // Confirmation method badge
+
         let methodBadge = '';
         if (s.confirmed_by === 'whatsapp') {
-            methodBadge = '<span class="inbox-method-badge whatsapp">WhatsApp</span>';
+            methodBadge = `<span class="inbox-method-badge whatsapp">${inboxIcon('whatsapp', 11)} WhatsApp</span>`;
         } else if (s.confirmed_by === 'manual') {
-            methodBadge = '<span class="inbox-method-badge manual">Manual</span>';
+            methodBadge = `<span class="inbox-method-badge manual">${inboxIcon('user', 11)} Manual</span>`;
         }
 
-        // Operator attribution — admin payload only, so it stays empty for
-        // operator tokens. Pairs the handle with the confirm date so each card
-        // answers "who confirmed this, and when" without opening the chat.
         let operatorBadge = '';
         if (currentInboxTab !== 'unread' && s.confirmed_by_operator) {
             const when = s.updated_at ? formatDate(s.updated_at) : '';
-            operatorBadge = `<span class="inbox-operator-badge" title="Confirmed by ${escapeHtml(s.confirmed_by_operator)}${when ? ` on ${escapeHtml(when)}` : ''}">@ ${escapeHtml(operatorLabel(s.confirmed_by_operator))}</span>`;
+            operatorBadge = `<span class="inbox-operator-badge" title="Confirmed by ${escapeHtml(s.confirmed_by_operator)}${when ? ` on ${escapeHtml(when)}` : ''}">By ${escapeHtml(operatorLabel(s.confirmed_by_operator))}</span>`;
         } else if (currentInboxTab !== 'unread' && s.confirmed_by === 'manual') {
-            operatorBadge = '<span class="inbox-operator-badge unrecorded" title="Confirmed before operator tracking was switched on">@ —</span>';
+            operatorBadge = '<span class="inbox-operator-badge unrecorded" title="Confirmed before operator tracking was switched on">Operator not recorded</span>';
         }
-    
-        // Preview content
+
         let preview = '';
         if (currentInboxTab === 'unread') {
             const msgText = s.latest_message || s.customer_message || '';
-            const shortMsg = msgText.split('\n')[0].substring(0, 100);
-            preview = `<span class="msg-prefix">MSG:</span> ${escapeHtml(shortMsg)}`;
+            const shortMsg = msgText.split('\n')[0].substring(0, 120);
+            preview = escapeHtml(shortMsg || 'New customer message');
             if (s.unread_count && s.unread_count > 1) {
-                preview += ` <span class="inbox-unread-count">${s.unread_count} unread</span>`;
+                preview += ` <span class="inbox-unread-count">${s.unread_count} new</span>`;
             }
         } else {
             let items = [];
-            try { items = JSON.parse(s.items_json || '[]'); } catch(e) {}
-            const itemNames = items.slice(0, 3).map(i => i.title || i.name).join(', ') + (items.length > 3 ? ` +${items.length - 3} more` : '');
+            try {
+                const parsed = JSON.parse(s.items_json || '[]');
+                items = Array.isArray(parsed) ? parsed : [];
+            } catch (e) {}
+            const itemNames = items.slice(0, 3).map(i => i.title || i.name).filter(Boolean).join(', ') + (items.length > 3 ? ` +${items.length - 3} more` : '');
             preview = escapeHtml(itemNames) || 'No items';
         }
-    
+
         const phoneVal = s.phone || '';
         const orderIdVal = s.order_id || s.shopper_id || '';
         const statusVal = s.status || 'pending';
+        const statusLabel = statusVal.replace(/_/g, ' ');
         const itemKey = orderIdVal || phoneVal;
-        const isChecked = inboxSelectedItems.has(itemKey) ? 'checked' : '';
-    
-        // Time display - different for unread vs confirmed
+        const isChecked = inboxSelectedItems.has(itemKey);
+        const numericTotal = Number(s.order_total || 0);
+        const amount = (Number.isFinite(numericTotal) ? numericTotal : 0).toLocaleString('en-IN', { maximumFractionDigits: 2 });
+
         let timeDisplay = '';
         if (currentInboxTab === 'unread') {
             timeDisplay = `
                 <div class="inbox-time">
-                    <div class="inbox-time-relative">${timeAgo}</div>
+                    <div class="inbox-time-relative">${timeAgo || 'Just now'}</div>
                     <div class="inbox-time-absolute">${absTime}</div>
                 </div>
             `;
         } else {
-            // Confirmed tab: show both created_at and updated_at
             const orderTime = s.created_at ? formatDate(s.created_at) : 'N/A';
             const confirmedTime = s.updated_at ? formatDate(s.updated_at) : 'N/A';
             const orderTimeAgo = s.created_at ? formatTimeAgo(s.created_at) : '';
@@ -1989,48 +2057,70 @@ function renderInboxList(shoppers, total) {
                 <div class="inbox-time inbox-time-dual">
                     <div class="inbox-time-block">
                         <div class="inbox-time-label">Ordered</div>
-                        <div class="inbox-time-relative">${orderTimeAgo}</div>
+                        <div class="inbox-time-relative">${orderTimeAgo || '—'}</div>
                         <div class="inbox-time-absolute">${orderTime}</div>
                     </div>
                     <div class="inbox-time-block">
                         <div class="inbox-time-label">Confirmed</div>
-                        <div class="inbox-time-relative">${confirmedTimeAgo}</div>
+                        <div class="inbox-time-relative">${confirmedTimeAgo || '—'}</div>
                         <div class="inbox-time-absolute">${confirmedTime}</div>
                     </div>
                 </div>
             `;
         }
-    
+
         return `
-            <div class="inbox-item" onclick="openChat('${phoneVal}', '${encodeURIComponent(s.name || '')}', '${orderIdVal}', '${statusVal}')">
-                <div class="inbox-item-checkbox-wrap" onclick="event.stopPropagation()">
-                    <input type="checkbox" class="inbox-item-checkbox" data-phone="${phoneVal}" data-order-id="${orderIdVal}" data-key="${itemKey}" ${isChecked} onchange="onInboxItemCheck(this)">
+            <div class="inbox-item ${currentInboxTab === 'unread' ? 'is-unread' : 'is-confirmed'}${isChecked ? ' selected' : ''}"
+                 role="button" tabindex="0"
+                 data-phone="${escapeHtml(phoneVal)}" data-name="${escapeHtml(s.name || 'Customer')}"
+                 data-order-id="${escapeHtml(orderIdVal)}" data-status="${escapeHtml(statusVal)}"
+                 aria-label="Open conversation with ${escapeHtml(s.name || 'Customer')}">
+                <div class="inbox-item-select">
+                    <input type="checkbox" class="inbox-item-checkbox" data-phone="${escapeHtml(phoneVal)}" data-order-id="${escapeHtml(orderIdVal)}" data-key="${escapeHtml(itemKey)}" ${isChecked ? 'checked' : ''} aria-label="Select ${escapeHtml(s.name || 'customer')}">
                 </div>
-                <div class="inbox-avatar ${avatarClass}">${initials}</div>
-                <div class="inbox-customer-info">
-                    <div class="inbox-customer-name">${currentInboxTab === 'unread' ? '<span class="unread-dot"></span>' : ''}${escapeHtml(s.name || 'Customer')} ${methodBadge}${operatorBadge}</div>
-                    <div class="inbox-customer-order">${orderIdVal || 'N/A'}</div>
-                    <span class="inbox-status ${statusVal}">${statusVal.toUpperCase()}</span>
+                <div class="inbox-identity">
+                    <div class="inbox-avatar ${avatarClass}">
+                        <span>${initials}</span>
+                        ${currentInboxTab === 'unread' ? '<span class="inbox-avatar-presence" aria-hidden="true"></span>' : ''}
+                    </div>
+                    <div class="inbox-customer-info">
+                        <div class="inbox-customer-name-row">
+                            <div class="inbox-customer-name">${escapeHtml(s.name || 'Customer')}</div>
+                            ${methodBadge}
+                        </div>
+                        <div class="inbox-customer-meta">
+                            <span class="inbox-customer-order">${escapeHtml(orderIdVal || 'N/A')}</span>
+                            <span class="inbox-meta-divider" aria-hidden="true"></span>
+                            <span class="inbox-status ${escapeHtml(statusVal)}">${escapeHtml(statusLabel)}</span>
+                        </div>
+                        ${operatorBadge}
+                    </div>
                 </div>
-                <div class="inbox-preview">${preview}</div>
-                <div>
-                    <div class="inbox-amount">\u20B9${s.order_total || '0'}</div>
-                    <div class="inbox-pay-method">${s.payment_method || 'COD'}</div>
+                <div class="inbox-message">
+                    <div class="inbox-message-label">${currentInboxTab === 'unread' ? 'Latest message' : 'Order items'}</div>
+                    <div class="inbox-preview">${preview}</div>
                 </div>
-                ${timeDisplay}
-                <div class="inbox-actions">
-                    ${currentInboxTab === 'unread' ? `<button class="inbox-action-btn mark-read" onclick="event.stopPropagation(); markInboxAsRead('${phoneVal}')" title="Mark as Read">\u2713 Read</button>` : ''}
-                    <button class="inbox-action-btn chat" onclick="event.stopPropagation(); openChat('${phoneVal}', '${encodeURIComponent(s.name || '')}', '${orderIdVal}', '${statusVal}')">Chat</button>
-                    <a class="inbox-action-btn wa" href="https://wa.me/${formatPhone(phoneVal)}" target="_blank" onclick="event.stopPropagation();">WA</a>
+                <div class="inbox-side">
+                    <div class="inbox-side-top">
+                        <div class="inbox-value">
+                            <div class="inbox-amount">₹${amount}</div>
+                            <div class="inbox-pay-method">${escapeHtml(s.payment_method || 'COD')}</div>
+                        </div>
+                        ${timeDisplay}
+                    </div>
+                    <div class="inbox-actions">
+                        ${currentInboxTab === 'unread' ? `<button class="inbox-action-btn mark-read" data-inbox-action="mark-read" title="Mark as read">${inboxIcon('check', 14)} Read</button>` : ''}
+                        <button class="inbox-action-btn chat" data-inbox-action="chat">${inboxIcon('chat', 14)} Chat</button>
+                        <a class="inbox-action-btn wa" href="https://wa.me/${formatPhone(phoneVal)}" target="_blank" rel="noopener" aria-label="Open WhatsApp chat" title="Open WhatsApp">${inboxIcon('whatsapp', 15)}</a>
+                    </div>
                 </div>
             </div>
         `;
     }).join('');
 
-    // Pagination
     const startNum = inboxPageOffset + 1;
     const endNum = Math.min(inboxPageOffset + inboxLimitPerPage, total);
-    if (pageInfo) pageInfo.textContent = `Showing ${startNum}-${endNum} of ${total}`;
+    if (pageInfo) pageInfo.textContent = `Showing ${startNum}–${endNum} of ${total}`;
     if (prevBtn) prevBtn.disabled = inboxPageOffset === 0;
     if (nextBtn) nextBtn.disabled = endNum >= total;
 }
@@ -2310,7 +2400,7 @@ function onInboxDateFieldChange() {
     // Update the date bar label
     const dateBarLabel = document.getElementById('inboxDateBarLabel');
     if (dateBarLabel) {
-        dateBarLabel.textContent = inboxDateField === 'updated_at' ? '\uD83D\uDCC5 Confirmed from:' : '\uD83D\uDCC5 Ordered from:';
+        dateBarLabel.textContent = inboxDateField === 'updated_at' ? 'Confirmation date' : 'Order date';
     }
     inboxPageOffset = 0;
     fetchInboxData();
@@ -2374,7 +2464,7 @@ async function fetchInboxAnalytics(recent = false) {
         inboxAnalyticsLastQs = qs;
     } catch (err) {
         console.error('Inbox analytics error:', err);
-        if (seq === inboxAnalyticsReqSeq) body.innerHTML = '<div class="inbox-analytics-loading">Couldn\'t load analytics — hit ↻ to retry</div>';
+        if (seq === inboxAnalyticsReqSeq) body.innerHTML = '<div class="inbox-analytics-loading">Couldn’t load analytics. Use refresh to try again.</div>';
     }
 }
 
@@ -2394,9 +2484,9 @@ function operatorLabel(actor) {
     return first.charAt(0).toUpperCase() + first.slice(1);
 }
 
-// Rank order is stable within a render, so bars keep the same colour between
-// refreshes as long as nobody changes position in the leaderboard.
-const OPERATOR_COLORS = ['#53bdeb', '#f5a623', '#b06cf0', '#25d366', '#ff6b81', '#4dd0e1', '#c0ca33', '#ff8a65'];
+// Rank order is stable within a render, so bars keep the same tonal treatment
+// between refreshes as long as nobody changes position in the leaderboard.
+const OPERATOR_COLORS = ['rgba(255,255,255,0.92)', 'rgba(255,255,255,0.72)', 'rgba(255,255,255,0.54)', 'rgba(255,255,255,0.38)', 'rgba(255,255,255,0.82)', 'rgba(255,255,255,0.64)', 'rgba(255,255,255,0.46)', 'rgba(255,255,255,0.30)'];
 const SYNTHETIC_ACTORS = { automated: 'Auto', unrecorded: '—' };
 
 // The operator dropdown is built from data rather than hardcoded, so a new hub
@@ -2419,8 +2509,8 @@ function syncOperatorOptions(operators) {
 function analyticsChangeHtml(pct) {
     if (pct === null || pct === undefined) return '<span class="inbox-analytics-delta flat">—</span>';
     const cls = pct > 0 ? 'up' : (pct < 0 ? 'down' : 'flat');
-    const arrow = pct > 0 ? '▲' : (pct < 0 ? '▼' : '');
-    return `<span class="inbox-analytics-delta ${cls}">${arrow} ${Math.abs(pct)}%</span>`;
+    const sign = pct > 0 ? '+' : (pct < 0 ? '−' : '');
+    return `<span class="inbox-analytics-delta ${cls}">${sign}${Math.abs(pct)}%</span>`;
 }
 
 function analyticsCard(cls, value, label, sub) {
@@ -2453,8 +2543,8 @@ function renderInboxAnalytics(data) {
     cards.push(analyticsCard('avg', s.avg_per_day, 'Per Day', s.peak_day ? `Peak ${s.peak_day.total} · ${fmtAnalyticsDay(s.peak_day.date)}` : ''));
 
     // Method mix bar (each confirmed_by value gets a segment)
-    const METHOD_COLORS = { whatsapp: '#25d366', manual: '#53bdeb' };
-    const OTHER_COLOR = 'rgba(255,255,255,0.25)';
+    const METHOD_COLORS = { whatsapp: 'rgba(255,255,255,0.92)', manual: 'rgba(255,255,255,0.48)' };
+    const OTHER_COLOR = 'rgba(255,255,255,0.22)';
     const methods = (data.methods || []).filter(m => m.count > 0);
     const mixBar = methods.length > 0 ? `
         <div class="inbox-analytics-mix">
@@ -2607,7 +2697,7 @@ function setupInboxAnalyticsEvents() {
         toggleBtn.addEventListener('click', () => {
             inboxAnalyticsCollapsed = !inboxAnalyticsCollapsed;
             panel.classList.toggle('collapsed', inboxAnalyticsCollapsed);
-            toggleBtn.textContent = inboxAnalyticsCollapsed ? '▶' : '▼';
+            toggleBtn.innerHTML = inboxIcon(inboxAnalyticsCollapsed ? 'chevron-right' : 'chevron-down', 14);
             toggleBtn.setAttribute('aria-expanded', String(!inboxAnalyticsCollapsed));
         });
     }
@@ -2638,6 +2728,7 @@ function onInboxItemCheck(checkbox) {
     } else {
         inboxSelectedItems.delete(key);
     }
+    checkbox.closest('.inbox-item')?.classList.toggle('selected', checkbox.checked);
     updateInboxBulkBar();
 }
 
@@ -2647,6 +2738,7 @@ function inboxSelectAll() {
     const allChecked = [...checkboxes].every(cb => cb.checked);
     checkboxes.forEach(cb => {
         cb.checked = !allChecked;
+        cb.closest('.inbox-item')?.classList.toggle('selected', !allChecked);
         const key = cb.dataset.key;
         if (!allChecked) {
             inboxSelectedItems.add(key);
@@ -2655,22 +2747,23 @@ function inboxSelectAll() {
         }
     });
     const selectAllBtn = document.getElementById('inboxSelectAllBtn');
-    if (selectAllBtn) {
-        selectAllBtn.textContent = allChecked ? 'Select All' : 'Deselect All';
-        selectAllBtn.classList.toggle('active', !allChecked);
-    }
+    const selectAllLabel = document.getElementById('inboxSelectAllLabel');
+    if (selectAllBtn) selectAllBtn.classList.toggle('active', !allChecked);
+    if (selectAllLabel) selectAllLabel.textContent = allChecked ? 'Select all' : 'Deselect all';
     updateInboxBulkBar();
 }
 
 // Deselect all items
 function inboxDeselectAll() {
     inboxSelectedItems.clear();
-    document.querySelectorAll('.inbox-item-checkbox').forEach(cb => cb.checked = false);
+    document.querySelectorAll('.inbox-item-checkbox').forEach(cb => {
+        cb.checked = false;
+        cb.closest('.inbox-item')?.classList.remove('selected');
+    });
     const selectAllBtn = document.getElementById('inboxSelectAllBtn');
-    if (selectAllBtn) {
-        selectAllBtn.textContent = 'Select All';
-        selectAllBtn.classList.remove('active');
-    }
+    const selectAllLabel = document.getElementById('inboxSelectAllLabel');
+    if (selectAllBtn) selectAllBtn.classList.remove('active');
+    if (selectAllLabel) selectAllLabel.textContent = 'Select all';
     updateInboxBulkBar();
 }
 
