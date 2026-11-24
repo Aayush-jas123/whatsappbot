@@ -3768,14 +3768,18 @@ router.get('/chat/unread', verifyToken, async (req, res) => {
 
         // Total conversations with unread messages. The joins are skipped when no
         // filter references them, which keeps the badge count query cheap.
+        //
+        // DISTINCT rather than DISTINCT ON + ORDER BY created_at DESC: this CTE
+        // only feeds a COUNT, and both forms yield exactly one row per phone, so
+        // carrying created_at through the sort bought nothing while making the
+        // unread scan cost the same 5.3s it does on the badge endpoint.
         const countSql = `
             WITH unread AS (
-                SELECT DISTINCT ON (m.customer_phone) m.customer_phone AS phone
+                SELECT DISTINCT m.customer_phone AS phone
                 FROM messages m
                 WHERE m.message_type = 'incoming'
                   AND NOT EXISTS (SELECT 1 FROM message_reads mr WHERE mr.message_id = m.id)
                   ${dateClause}
-                ORDER BY m.customer_phone, m.created_at DESC
             )
             ${outerWhere ? `,${latestShopperCte}` : ''}
             SELECT COUNT(*)::int AS total
@@ -3813,8 +3817,6 @@ router.get('/chat/unread/count', verifyToken, async (req, res) => {
     try {
         const { startDate, endDate } = req.query;
         const cacheKey = `chat_unread_count:${startDate || 'all'}:${endDate || 'all'}`;
-        const cached = getCached(cacheKey);
-        if (cached) return res.json(cached);
 
         let dateClause = '';
         const dateParams = [];
@@ -3831,19 +3833,27 @@ router.get('/chat/unread/count', verifyToken, async (req, res) => {
             dateParams.push(utcEndDate);
         }
 
-        const rows = await dbAdapter.query(`
-            SELECT COUNT(*)::int AS total FROM (
-                SELECT DISTINCT ON (m.customer_phone) m.customer_phone
+        // getOrLoad rather than getCached/setCache so simultaneous badge polls
+        // share one in-flight query instead of each starting their own — two
+        // dashboards opening together used to double this scan and take the
+        // pool with it (logged pool waits of 370-450ms on unrelated queries).
+        //
+        // The count needs no per-phone "latest" row, so DISTINCT ON plus its
+        // ORDER BY customer_phone, created_at DESC only made the sort carry
+        // created_at for all 94k unread messages (6.7MB) to arrive at a number.
+        // COUNT(DISTINCT customer_phone) is the same value by definition and
+        // sorts on one narrow column: measured 5270ms -> 306ms.
+        const result = await caches.unread.getOrLoad(cacheKey, async () => {
+            const rows = await dbAdapter.query(`
+                SELECT COUNT(DISTINCT m.customer_phone)::int AS total
                 FROM messages m
                 WHERE m.message_type = 'incoming'
                   AND NOT EXISTS (SELECT 1 FROM message_reads mr WHERE mr.message_id = m.id)
                   ${dateClause}
-                ORDER BY m.customer_phone, m.created_at DESC
-            ) unread
-        `, dateParams);
+            `, dateParams);
+            return { success: true, total: rows[0]?.total || 0 };
+        }, 60 * 1000);
 
-        const result = { success: true, total: rows[0]?.total || 0 };
-        setCache(cacheKey, result, 'unread', 60 * 1000);
         res.json(result);
     } catch (error) {
         console.error('Unread count fetch error:', error);
@@ -4680,18 +4690,13 @@ router.get('/inbox/confirmation-analytics', verifyToken, async (req, res) => {
 router.get('/chat/analytics/overview', verifyToken, async (req, res) => {
     try {
         const { startDate, endDate, noLimit } = req.query;
-        
-        // Check cache first (3 min TTL for analytics)
+
         const analyticsCacheKey = `analytics_overview:${startDate || 'all'}:${endDate || 'all'}:${noLimit || 'false'}`;
-        const cached = getCached(analyticsCacheKey);
-        if (cached) {
-            return res.json(cached);
-        }
-        
+
         // Build date filter - support custom date range or noLimit for all data
         let dateFilter = "";
         const dateParams = [];
-        
+
         if (startDate && endDate) {
             // Convert IST dates from frontend to UTC for database query
             const utcStartDate = fromISTtoUTC(startDate + ' 00:00:00') || (startDate + ' 00:00:00');
@@ -4703,57 +4708,71 @@ router.get('/chat/analytics/overview', verifyToken, async (req, res) => {
             dateFilter = "WHERE s.created_at >= NOW() - INTERVAL '30 days'";
         }
         // If noLimit=true and no dates, dateFilter stays empty (ALL historical data)
-        
+
         // Same derived 'shipped' semantics as the /shoppers list endpoint:
         // a confirmed shopper whose orders row carries an AWB / shipped status.
         // 'confirmed' therefore only counts confirmed-but-not-yet-shipped shoppers.
         const shippedExpr = `(o.awb IS NOT NULL OR o.status = 'shipped')`;
-        
-        // Get overall stats - lightweight aggregation
-        const stats = await dbAdapter.query(`
-            SELECT 
-                COUNT(*) as total_orders,
-                COUNT(DISTINCT s.phone) as total_shoppers,
-                SUM(CASE WHEN s.status = 'confirmed' AND NOT COALESCE(${shippedExpr}, false) THEN 1 ELSE 0 END) as confirmed_count,
-                SUM(CASE WHEN s.status = 'confirmed' AND ${shippedExpr} THEN 1 ELSE 0 END) as shipped_count,
-                SUM(CASE WHEN s.status = 'cancelled' THEN 1 ELSE 0 END) as cancelled_count,
-                SUM(CASE WHEN s.status = 'edit_details' THEN 1 ELSE 0 END) as edit_requests_count,
-                SUM(CASE WHEN s.status = 'pending' THEN 1 ELSE 0 END) as pending_count,
-                SUM(CASE WHEN s.customer_message IS NOT NULL THEN 1 ELSE 0 END) as responded_count,
-                AVG(CASE WHEN s.response_count > 0 THEN s.response_count END) as avg_response_count
-            FROM store_shoppers s
-            LEFT JOIN orders o ON o.order_id = s.order_id
-            ${dateFilter}
-        `, dateParams);
-        
-        // Get daily stats with per-status breakdown (IST timezone)
-        // created_at is TIMESTAMP (no tz) storing UTC — convert UTC→IST correctly
-        const dailyStats = await dbAdapter.query(`
-            SELECT 
-                TO_CHAR(DATE(s.created_at AT TIME ZONE 'UTC' AT TIME ZONE 'Asia/Kolkata'), 'YYYY-MM-DD') as date,
-                COUNT(*) as total,
-                SUM(CASE WHEN s.status = 'confirmed' AND NOT COALESCE(${shippedExpr}, false) THEN 1 ELSE 0 END) as confirmed,
-                SUM(CASE WHEN s.status = 'confirmed' AND ${shippedExpr} THEN 1 ELSE 0 END) as shipped,
-                SUM(CASE WHEN s.status = 'pending' THEN 1 ELSE 0 END) as pending,
-                SUM(CASE WHEN s.status = 'cancelled' THEN 1 ELSE 0 END) as cancelled,
-                SUM(CASE WHEN s.status = 'edit_details' THEN 1 ELSE 0 END) as edit_details,
-                SUM(CASE WHEN s.status != 'pending' THEN 1 ELSE 0 END) as responded
-            FROM store_shoppers s
-            LEFT JOIN orders o ON o.order_id = s.order_id
-            ${dateFilter}
-            GROUP BY DATE(s.created_at AT TIME ZONE 'UTC' AT TIME ZONE 'Asia/Kolkata')
-            ORDER BY date DESC
-        `, dateParams);
-        
-        const response = {
-            success: true,
-            overview: stats[0] || {},
-            daily: dailyStats
-        };
-        
-        // Cache for 15 minutes — analytics queries are expensive
-        setCache(analyticsCacheKey, response, 'stats', 15 * 60 * 1000);
-        
+
+        // Overall stats plus the daily per-status breakdown, run concurrently
+        // inside a single-flight loader.
+        //
+        // Both used to be sequential awaits behind a bare getCached/setCache
+        // pair, so nothing stopped two dashboards opening at once from each
+        // running the full-history aggregation: the log shows the same
+        // "COUNT(*) as total_orders" statement twice 4s apart at 2418ms and
+        // 5897ms, holding two of ten pool slots and pushing 370-450ms of
+        // queueing onto every unrelated query in between. getOrLoad shares one
+        // in-flight promise per key, and Promise.all makes the pair cost the
+        // slower of the two instead of their sum.
+        //
+        // Cache for 15 minutes — analytics queries are expensive. Stays in the
+        // 'stats' namespace so admin actions that call invalidateCache('stats')
+        // keep refreshing it early.
+        const response = await caches.stats.getOrLoad(analyticsCacheKey, async () => {
+            const [stats, dailyStats] = await Promise.all([
+                dbAdapter.query(`
+                    SELECT
+                        COUNT(*) as total_orders,
+                        COUNT(DISTINCT s.phone) as total_shoppers,
+                        SUM(CASE WHEN s.status = 'confirmed' AND NOT COALESCE(${shippedExpr}, false) THEN 1 ELSE 0 END) as confirmed_count,
+                        SUM(CASE WHEN s.status = 'confirmed' AND ${shippedExpr} THEN 1 ELSE 0 END) as shipped_count,
+                        SUM(CASE WHEN s.status = 'cancelled' THEN 1 ELSE 0 END) as cancelled_count,
+                        SUM(CASE WHEN s.status = 'edit_details' THEN 1 ELSE 0 END) as edit_requests_count,
+                        SUM(CASE WHEN s.status = 'pending' THEN 1 ELSE 0 END) as pending_count,
+                        SUM(CASE WHEN s.customer_message IS NOT NULL THEN 1 ELSE 0 END) as responded_count,
+                        AVG(CASE WHEN s.response_count > 0 THEN s.response_count END) as avg_response_count
+                    FROM store_shoppers s
+                    LEFT JOIN orders o ON o.order_id = s.order_id
+                    ${dateFilter}
+                `, dateParams),
+
+                // created_at is TIMESTAMP (no tz) storing UTC — convert UTC→IST correctly
+                dbAdapter.query(`
+                    SELECT
+                        TO_CHAR(DATE(s.created_at AT TIME ZONE 'UTC' AT TIME ZONE 'Asia/Kolkata'), 'YYYY-MM-DD') as date,
+                        COUNT(*) as total,
+                        SUM(CASE WHEN s.status = 'confirmed' AND NOT COALESCE(${shippedExpr}, false) THEN 1 ELSE 0 END) as confirmed,
+                        SUM(CASE WHEN s.status = 'confirmed' AND ${shippedExpr} THEN 1 ELSE 0 END) as shipped,
+                        SUM(CASE WHEN s.status = 'pending' THEN 1 ELSE 0 END) as pending,
+                        SUM(CASE WHEN s.status = 'cancelled' THEN 1 ELSE 0 END) as cancelled,
+                        SUM(CASE WHEN s.status = 'edit_details' THEN 1 ELSE 0 END) as edit_details,
+                        SUM(CASE WHEN s.status != 'pending' THEN 1 ELSE 0 END) as responded
+                    FROM store_shoppers s
+                    LEFT JOIN orders o ON o.order_id = s.order_id
+                    ${dateFilter}
+                    GROUP BY DATE(s.created_at AT TIME ZONE 'UTC' AT TIME ZONE 'Asia/Kolkata')
+                    ORDER BY date DESC
+                `, dateParams)
+            ]);
+
+            return {
+                success: true,
+                overview: stats[0] || {},
+                daily: dailyStats
+            };
+        }, 15 * 60 * 1000);
+
         res.json(response);
     } catch (error) {
         console.error('Chat analytics error:', error);

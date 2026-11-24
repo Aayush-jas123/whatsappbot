@@ -109,49 +109,76 @@ function timeRangeSqlClause(config, col = 'created_at') {
         : `(${mins} >= ${start} OR ${mins} < ${end})`;
 }
 
+// Every ticket column the portal consumes: the sidebar card in
+// public/portal/support/js/main.js reads id / ticket_number / customer_phone /
+// customer_name / message / status / is_read / channel / created_at /
+// follow_up_at / follow_up_note, and verifyPhoneInPortal() below needs
+// portal_id + ig_user_id. Same set the admin ticket list already ships
+// (adminRoutes buildDataSql), plus the two the ownership checks need.
+//
+// This replaces `SELECT *, LEFT(message, 600) AS message`, which looked like it
+// truncated the blob but did not: Postgres allows the duplicate output name and
+// the wire carries both columns, so every 15s poll still transferred the full
+// message text (128kB of the 175kB payload for a 200-row page) before the
+// driver threw the wide copy away.
+const PORTAL_TICKET_COLUMNS = `id, ticket_number, customer_phone, customer_name,
+        LEFT(message, 600) AS message, status, is_read, portal_id, ig_user_id, sentiment,
+        ai_scenario, ai_confidence, source, channel, follow_up_at, follow_up_note,
+        order_id, created_at, updated_at`;
+
 // Helper to get portal tickets (cached for 30s to reduce query frequency)
 async function getPortalTickets(portalId, portalType, portalConfig, status, channel) {
     const cacheKey = `portal_tickets_full:${portalId}:${status || 'all'}:${channel || 'all'}`;
     
     return await caches.tickets.getOrLoad(cacheKey, async () => {
-        let baseWhere = '';
-        const params = [portalId];
-
-        if (portalType === 'time_based') {
-            const config = portalConfig
-                ? (typeof portalConfig === 'string' ? JSON.parse(portalConfig) : portalConfig)
-                : {};
-            const rangeClause = timeRangeSqlClause(config);
-            if (rangeClause) {
-                baseWhere = `(portal_id = ? OR (portal_id IS NULL AND ${rangeClause}))`;
-            } else {
-                baseWhere = 'portal_id = ?';
-            }
-        } else {
-            baseWhere = 'portal_id = ?';
-        }
-
-        const conditions = [baseWhere];
+        const filterParams = [];
+        let filterSql = '';
         if (status) {
-            conditions.push('status = ?');
-            params.push(status);
+            filterSql += ' AND status = ?';
+            filterParams.push(status);
         }
         if (channel) {
-            conditions.push("(channel = ? OR (channel IS NULL AND ? = 'whatsapp'))");
-            params.push(channel, channel);
+            filterSql += " AND (channel = ? OR (channel IS NULL AND ? = 'whatsapp'))";
+            filterParams.push(channel, channel);
         }
 
-        const whereSql = conditions.join(' AND ');
-        // Prioritize tickets explicitly assigned to this portal first, then newest
-        // LEFT(message, 600) mirrors the admin ticket list: the portal UI only
-        // previews/searches this column (chat history comes from /chat/:phone),
-        // and full message blobs made every poll response ~500KB and pinned
-        // tens of MB in the LRU cache — a driver of the 256MB-heap OOM.
+        const rangeClause = portalType === 'time_based'
+            ? timeRangeSqlClause(portalConfig
+                ? (typeof portalConfig === 'string' ? JSON.parse(portalConfig) : portalConfig)
+                : {})
+            : null;
+
+        if (!rangeClause) {
+            // Manual/auto portals only ever see their own tickets, so the
+            // "assigned first, then newest" ordering collapses to newest-first
+            // and idx_support_tickets_portal_created serves it without a sort.
+            return await dbAdapter.query(
+                `SELECT ${PORTAL_TICKET_COLUMNS} FROM support_tickets
+                 WHERE portal_id = ?${filterSql}
+                 ORDER BY created_at DESC LIMIT 200`,
+                [portalId, ...filterParams]
+            );
+        }
+
+        // Time-based portals see their assigned tickets PLUS unassigned ones
+        // created inside their shift window, assigned-first. Written as one OR'd
+        // predicate that ordering cannot come from an index, so Postgres fetched
+        // and top-N sorted every match (measured: 6367 rows, 434kB sort, 52ms).
+        // Splitting the branches lets each one stop at 200 rows through its own
+        // index; the outer pass then only re-orders <=400 slim rows (19ms) and
+        // reproduces the old order exactly, since the global top-200 under
+        // (assigned?, created_at DESC) must lie inside the two branch top-200s.
+        const branch = (where, grp) => `(SELECT ${PORTAL_TICKET_COLUMNS}, ${grp} AS __portal_group
+            FROM support_tickets WHERE ${where}${filterSql}
+            ORDER BY created_at DESC LIMIT 200)`;
+
         return await dbAdapter.query(
-            `SELECT *, LEFT(message, 600) AS message FROM support_tickets
-             WHERE ${whereSql}
-             ORDER BY (CASE WHEN portal_id = ? THEN 0 ELSE 1 END), created_at DESC LIMIT 200`,
-            [...params, portalId]
+            `SELECT ${PORTAL_TICKET_COLUMNS} FROM (
+                ${branch('portal_id = ?', 0)}
+                UNION ALL
+                ${branch(`portal_id IS NULL AND (${rangeClause})`, 1)}
+            ) u ORDER BY __portal_group, created_at DESC LIMIT 200`,
+            [portalId, ...filterParams, ...filterParams]
         );
     }, 30000); // 30 second TTL
 }
