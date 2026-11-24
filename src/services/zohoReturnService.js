@@ -1323,11 +1323,12 @@ async function buildSwapLines({
             if (tax.igst_rate) line.igst_rate = tax.igst_rate;
             if (tax.tax_percentage) line.tax_percentage = tax.tax_percentage;
         }
-        // Resolve by NAME first — the exchange SKU can still be the ORIGINAL
-        // item's SKU, which would link the line to the wrong stock item.
-        let item = await resolver.resolve(lineName);
-        if (!item?.item_id && exItem.sku) item = await resolver.resolve(exItem.sku);
+        // Name is authoritative: the exchange SKU can still be the ORIGINAL
+        // item's SKU (and this store's SKUs are junk values that collide with
+        // unrelated Zoho items), which would move the wrong colourway's stock.
+        const { item, via, conflict } = await resolver.resolveLine({ name: lineName, sku: exItem.sku });
         if (item?.item_id) line.item_id = item.item_id;
+        else if (via === 'sku-conflict') console.warn(`⚠️ Zoho exchange: "${lineName}" NOT linked — sku "${exItem.sku}" belongs to catalog item "${conflict?.name}" (different style/colourway), so no stock movement`);
         else console.warn(`⚠️ Zoho exchange: no catalog item for "${lineName}" — line created without item_id (no stock movement)`);
         return line;
     };

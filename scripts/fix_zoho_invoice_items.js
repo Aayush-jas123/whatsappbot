@@ -9,27 +9,26 @@
  * 4. For missing items, search the local item map using normalized name matching
  * 5. Update the invoice in Zoho with the correct item_ids
  * 
- * Usage: node scripts/fix_zoho_invoice_items.js [--dry-run] [--limit=N]
+ * Matching is delegated to src/services/zohoItemResolver — the same rules the
+ * live sync uses. This script used to carry its own matcher, which could not
+ * read "BASE - SIZE / COLOUR", so the black side of every vest pack showed up
+ * here as "could not find item" too.
+ * 
+ * Writes to accounting records are opt-in: it runs as a dry report unless you
+ * pass --apply.
+ * 
+ * Usage: node scripts/fix_zoho_invoice_items.js [--apply] [--limit=N]
  */
 
 require('dotenv').config();
 const { dbAdapter } = require('../src/database/db');
 const zohoService = require('../src/services/zohoService');
+const { pickMatchingItem, isChargeLineName, normName } = require('../src/services/zohoItemResolver');
 
-const START_DATE = '2026-09-01';
-const DRY_RUN = process.argv.includes('--dry-run');
+const START_DATE = process.env.FIX_START_DATE || '2026-09-01';
+const APPLY = process.argv.includes('--apply');
+const DRY_RUN = !APPLY;
 const LIMIT = parseInt(process.argv.find(a => a.startsWith('--limit='))?.split('=')[1] || '0') || 0;
-
-// Normalize name for matching (strip all whitespace and uppercase)
-const normName = (s) => String(s || '').replace(/\s+/g, '').toUpperCase();
-
-// Convert our name format to Zoho's format: "Product - XS" -> "Product (XS)"
-function toZohoNameFormat(name) {
-    if (!name) return name;
-    // Match " - SIZE" at the end and convert to "(SIZE)"
-    return name.replace(/\s*-\s*(XS|S|M|L|XL|XXL|2XL|3XL|4XL|5XL|28|30|32|34|36|38|40|42|44|46|48|FREE|FREE SIZE|ONESIZE|ONE SIZE|DEFAULT)\s*$/i, 
-        (match, size) => ` (${size.toUpperCase()})`);
-}
 
 async function loadAllZohoItems() {
     console.log('\n📦 Loading all Zoho items into memory...');
@@ -48,59 +47,17 @@ async function loadAllZohoItems() {
     }
 
     console.log(`✅ Loaded ${items.length} Zoho items\n`);
-    
-    // Build a map: normalized name -> item
-    const itemMap = new Map();
-    for (const item of items) {
-        const norm = normName(item.name);
-        itemMap.set(norm, item);
-    }
-    
-    return { items, itemMap };
-}
-
-function findItemInMap(itemMap, name) {
-    if (!name) return null;
-    
-    // Parse the name to extract base product and size
-    const sizeMatch = name.match(/\s*[-(]\s*(XS|S|M|L|XL|XXL|2XL|3XL|4XL|5XL|28|30|32|34|36|38|40|42|44|46|48|FREE|FREE SIZE|ONESIZE|ONE SIZE|DEFAULT)\s*[)]?\s*$/i);
-    const size = sizeMatch ? sizeMatch[1].toUpperCase() : null;
-    const baseName = sizeMatch ? name.replace(sizeMatch[0], '').trim() : name;
-    
-    // Try exact match first
-    let item = itemMap.get(normName(name));
-    if (item) return item;
-    
-    // Try converting to Zoho format: "Product (XS)" -> "Product - XS"
-    if (size) {
-        const zohoName = `${baseName} - ${size}`;
-        item = itemMap.get(normName(zohoName));
-        if (item) return item;
-    }
-    
-    // Try matching with different size formats but same size
-    if (size) {
-        for (const [norm, item] of itemMap.entries()) {
-            // Parse the item name to extract its base and size
-            const itemSizeMatch = item.name.match(/\s*[-(]\s*(XS|S|M|L|XL|XXL|2XL|3XL|4XL|5XL|28|30|32|34|36|38|40|42|44|46|48|FREE|FREE SIZE|ONESIZE|ONE SIZE|DEFAULT)\s*[)]?\s*$/i);
-            const itemSize = itemSizeMatch ? itemSizeMatch[1].toUpperCase() : null;
-            const itemBase = itemSizeMatch ? item.name.replace(itemSizeMatch[0], '').trim() : item.name;
-            
-            // Match if base names are the same AND sizes are the same
-            if (normName(itemBase) === normName(baseName) && itemSize === size) {
-                return item;
-            }
-        }
-    }
-    
-    return null;
+    return { items };
 }
 
 async function main() {
-    console.log(`\n🔧 Fixing Zoho invoice item_ids from ${START_DATE} onwards${DRY_RUN ? ' (DRY RUN)' : ''}\n`);
+    console.log(`\n🔧 ${DRY_RUN ? 'Reporting' : 'FIXING (writing)'} Zoho invoice item_ids from ${START_DATE} onwards\n`);
 
     // Load all Zoho items
-    const { items: allItems, itemMap } = await loadAllZohoItems();
+    const { items: allItems } = await loadAllZohoItems();
+    // What an EXISTING item_id points at — a line linked to the wrong item
+    // deducts the wrong stock, which is worse than an unlinked line.
+    const itemById = new Map(allItems.map(i => [String(i.item_id), i]));
 
     // Query invoices from local DB
     const syncLogs = await dbAdapter.query(`
@@ -122,8 +79,14 @@ async function main() {
         updated: 0,
         skipped: 0,
         errors: 0,
-        itemsFixed: 0
+        itemsFixed: 0,
+        mislinked: 0,
+        unitsMislinked: 0,
+        unitsLinked: 0
     };
+    // Names with no catalog item under any spelling — these need a catalog row,
+    // not a code fix, so they are collected and printed once at the end.
+    const gaps = new Map();
 
     for (const log of syncLogs) {
         stats.total++;
@@ -146,28 +109,36 @@ async function main() {
                 continue;
             }
 
-            // Check which line items are missing item_id
+            // Classify every product line: already right / must be (re)linked /
+            // no catalog item at all
             const linesToUpdate = [];
             for (const li of zohoInvoice.line_items) {
-                // Skip if already has item_id
-                if (li.item_id && li.item_id !== '') continue;
-                
-                // Skip shipping lines
-                if (li.name === 'Shipping') continue;
+                const qty = parseFloat(li.quantity || 1) || 1;
+                if (isChargeLineName(li.name)) continue;
 
-                // Try to find the item in our map
-                const item = findItemInMap(itemMap, li.name);
-                
-                if (item) {
-                    linesToUpdate.push({
-                        line_item_id: li.line_item_id,
-                        item_id: item.item_id,
-                        name: li.name,
-                        zoho_item_name: item.name
-                    });
-                } else {
-                    console.log(`  ⚠️  Order #${log.shopify_order_id}: Could not find item for "${li.name}"`);
+                const item = pickMatchingItem(allItems, li.name);
+                const current = li.item_id ? itemById.get(String(li.item_id)) : null;
+
+                if (!item) {
+                    if (!current) {
+                        const g = gaps.get(li.name) || { units: 0, lines: 0 };
+                        g.units += qty; g.lines++;
+                        gaps.set(li.name, g);
+                    }
+                    continue;   // nothing to link it to — report, never guess
                 }
+                if (current && normName(current.name) === normName(item.name)) continue;   // already right
+
+                stats[current ? 'mislinked' : 'itemsFixed']++;
+                stats[current ? 'unitsMislinked' : 'unitsLinked'] += qty;
+                linesToUpdate.push({
+                    line_item_id: li.line_item_id,
+                    item_id: item.item_id,
+                    name: li.name,
+                    qty,
+                    zoho_item_name: item.name,
+                    wasLinkedTo: current ? current.name : null
+                });
             }
 
             if (linesToUpdate.length === 0) {
@@ -175,14 +146,15 @@ async function main() {
                 continue;
             }
 
+            const missing = linesToUpdate.filter(l => !l.wasLinkedTo).length;
+            const wrong = linesToUpdate.length - missing;
             console.log(`\nOrder #${log.shopify_order_id} (Invoice ${log.zoho_invoice_id}):`);
-            console.log(`  Found ${linesToUpdate.length} line items missing item_id`);
+            console.log(`  ${missing} line(s) not linked, ${wrong} line(s) linked to the WRONG item`);
 
             if (DRY_RUN) {
                 for (const lu of linesToUpdate) {
-                    console.log(`    [DRY RUN] Would set item_id=${lu.item_id} for "${lu.name}" -> "${lu.zoho_item_name}"`);
+                    console.log(`    [DRY RUN] ${lu.qty}u "${lu.name}" → item_id=${lu.item_id} "${lu.zoho_item_name}"${lu.wasLinkedTo ? ` (was "${lu.wasLinkedTo}")` : ''}`);
                 }
-                stats.itemsFixed += linesToUpdate.length;
                 stats.updated++;
             } else {
                 // Build the update payload with all line items
@@ -200,17 +172,16 @@ async function main() {
                         };
                     }),
                     // Zoho requires a reason when updating sent invoices
-                    reason: 'Fixing missing item_id linkage for inventory sync'
+                    reason: 'Fixing item_id linkage for inventory sync'
                 };
 
                 await zohoService.updateInvoice(log.zoho_invoice_id, updatePayload);
                 console.log(`  ✅ Updated invoice with ${linesToUpdate.length} item_ids`);
                 
                 for (const lu of linesToUpdate) {
-                    console.log(`    ✓ Set item_id=${lu.item_id} for "${lu.name}" -> "${lu.zoho_item_name}"`);
+                    console.log(`    ✓ ${lu.qty}u "${lu.name}" → item_id=${lu.item_id} "${lu.zoho_item_name}"${lu.wasLinkedTo ? ` (was "${lu.wasLinkedTo}")` : ''}`);
                 }
 
-                stats.itemsFixed += linesToUpdate.length;
                 stats.updated++;
             }
 
@@ -223,12 +194,21 @@ async function main() {
     }
 
     console.log(`\n\n${'═'.repeat(60)}`);
-    console.log(`✅ Fix complete!`);
+    console.log(`${DRY_RUN ? '📋 Report complete (no writes — rerun with --apply)' : '✅ Fix complete!'}`);
     console.log(`   Total invoices: ${stats.total}`);
-    console.log(`   Updated: ${stats.updated}`);
+    console.log(`   Invoices with changes: ${stats.updated}`);
     console.log(`   Skipped (no issues): ${stats.skipped}`);
     console.log(`   Errors: ${stats.errors}`);
-    console.log(`   Line items fixed: ${stats.itemsFixed}`);
+    console.log(`   Lines to link (missing item_id): ${stats.itemsFixed} lines / ${stats.unitsLinked} units`);
+    console.log(`   Lines on the WRONG item: ${stats.mislinked} lines / ${stats.unitsMislinked} units`);
+
+    if (gaps.size) {
+        console.log(`\n   ⚠️  No Zoho catalog item for these line names (any spelling) —`);
+        console.log(`      they can only be counted once the items exist:`);
+        for (const [name, g] of [...gaps].sort((a, b) => b[1].units - a[1].units)) {
+            console.log(`      ${g.units}u / ${g.lines} line(s)  "${name}"`);
+        }
+    }
     console.log(`${'═'.repeat(60)}\n`);
 
     process.exit(0);

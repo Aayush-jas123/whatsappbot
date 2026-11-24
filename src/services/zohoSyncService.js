@@ -12,6 +12,14 @@ const { caches } = require('../utils/cache');
 const MAX_RETRIES = 3;
 const SELLER_STATE = () => process.env.ZOHO_SELLER_STATE || 'Haryana';
 
+// One resolver per process: a catalog lookup miss costs up to three Zoho
+// searches, and every order repeats the same few hundred style/size names.
+let sharedResolver = null;
+function getItemResolver() {
+    if (!sharedResolver) sharedResolver = createItemResolver();
+    return sharedResolver;
+}
+
 // In-process guard: prevents duplicate invoices when Shopify redelivers a
 // webhook while the first processing is still running
 const inFlightSyncs = new Set();
@@ -116,13 +124,23 @@ async function syncOrderToZoho(shopifyOrder) {
             zohoCustomer = null;
         }
 
-        // Step 2.5: Resolve line items to real Zoho items (by SKU, then exact
-        // name) so invoices link to items and Zoho auto-deducts stock when the
-        // invoice is marked sent — this covers broken-bundle singles too.
-        const resolver = createItemResolver();
+        // Step 2.5: Link every line to a real Zoho catalog item. That linkage is
+        // the ONLY thing that makes Books deduct stock, and an unlinked line
+        // still invoices perfectly — so a miss has to be logged loudly here.
+        // The name is authoritative: li.item_id is the SHOPIFY sku, and this
+        // store's SKUs are hand-typed ("0", "6", "7") values that also exist as
+        // the sku of unrelated Zoho items, which used to bill one colourway's
+        // sales against another's stock.
+        const resolver = getItemResolver();
         for (const li of invoice.line_items) {
-            const item = await resolver.resolve(li.item_id || li.name);
+            const { item, via, conflict } = await resolver.resolveLine({ name: li.name, sku: li.item_id });
             li.resolved_item_id = item?.item_id || null;
+            if (li.resolved_item_id || via === 'charge-line') continue;
+            if (via === 'sku-conflict') {
+                console.warn(`⚠️ Zoho sync #${orderId}: "${li.name}" NOT linked — shopify sku "${li.item_id}" belongs to catalog item "${conflict?.name}" (different style/colourway), so stock will not move`);
+            } else {
+                console.warn(`⚠️ Zoho sync #${orderId}: no Zoho catalog item for "${li.name}" — invoice will bill it without deducting stock`);
+            }
         }
 
         // Step 3: Build the final Zoho invoice payload
