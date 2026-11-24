@@ -26,9 +26,14 @@ function channelIconSvg(channel, size = 14) {
     if (channel === 'whatsapp') {
         return `<svg width="${size}" height="${size}" viewBox="0 0 24 24"><path d="M17.472 14.382c-.297-.149-1.758-.867-2.03-.967-.273-.099-.471-.148-.67.15-.197.297-.767.966-.94 1.164-.173.199-.347.223-.644.075-.297-.15-1.255-.463-2.39-1.475-.883-.788-1.48-1.761-1.653-2.059-.173-.297-.018-.458.13-.606.134-.133.298-.347.446-.52.149-.174.198-.298.298-.497.099-.198.05-.371-.025-.52-.075-.149-.669-1.612-.916-2.207-.242-.579-.487-.5-.669-.51-.173-.008-.371-.01-.57-.01-.198 0-.52.074-.792.372-.272.297-1.04 1.016-1.04 2.479 0 1.462 1.065 2.875 1.213 3.074.149.198 2.096 3.2 5.077 4.487.709.306 1.262.489 1.694.625.712.227 1.36.195 1.871.118.571-.085 1.758-.719 2.006-1.413.248-.694.248-1.289.173-1.413-.074-.124-.272-.198-.57-.347z" fill="currentColor"/><path d="M12 2C6.477 2 2 6.477 2 12c0 1.89.525 3.66 1.438 5.168L2 22l4.832-1.438A9.955 9.955 0 0012 22c5.523 0 10-4.477 10-10S17.523 2 12 2zm0 18a8 8 0 01-4.243-1.214l-.29-.175-3.032.795.81-2.96-.192-.305A7.963 7.963 0 014 12a8 8 0 1116 0 8 8 0 01-8 8z" fill="currentColor"/></svg>`;
     }
+    if (channel === 'website') {
+        // Storefront Help & Tickets: a globe, not a messaging logo - this lane is
+        // the account ticket thread rather than a chat channel.
+        return `<svg width="${size}" height="${size}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><line x1="2" y1="12" x2="22" y2="12"/><path d="M12 2a15.3 15.3 0 0 1 4 10 15.3 15.3 0 0 1-4 10 15.3 15.3 0 0 1-4-10 15.3 15.3 0 0 1 4-10z"/></svg>`;
+    }
     return '';
 }
-function channelLabel(ch) { return ch === 'instagram' ? 'Instagram' : ch === 'whatsapp' ? 'WhatsApp' : ''; }
+function channelLabel(ch) { return ch === 'instagram' ? 'Instagram' : ch === 'whatsapp' ? 'WhatsApp' : ch === 'website' ? 'Help & Tickets' : ''; }
 
 // ══════════════════════════════════════════════════════════
 // INACTIVITY TIMEOUT
@@ -248,6 +253,9 @@ async function loadTickets() {
                     chat.ticket.status = t.status;
                     chat.ticket.followUpAt = t.follow_up_at || '';
                     chat.ticket.followUpNote = t.follow_up_note || '';
+                    // Keep the lane in sync with the server's verdict (a ticket can
+                    // be re-routed or its channel corrected between polls).
+                    if (t.thread_mode) chat.ticket.threadMode = t.thread_mode;
                 }
             });
             checkForNewMessages(allTickets);
@@ -346,7 +354,7 @@ function renderSidebarTickets(tickets) {
     const html = tickets.map(t => {
         const isUnread = !t.is_read;
         const channel = t.channel || 'whatsapp';
-        const chClass = channel === 'instagram' ? 'ig' : 'wa';
+        const chClass = channel === 'instagram' ? 'ig' : channel === 'website' ? 'website' : 'wa';
         const isActive = openChats.has(t.id) && t.id === activeChatId;
         const dueChip = t.status === 'follow_up' ? followUpDueChip(t.follow_up_at) : null;
         return `<div class="sidebar-ticket-card${isActive ? ' active' : ''}${isUnread ? ' unread' : ''}" data-ticket-id="${t.id}" data-phone="${escapeJs(t.customer_phone)}" data-name="${escapeJs(t.customer_name || 'Customer')}" data-status="${t.status}" data-channel="${channel}" data-followup="${escapeJs(t.follow_up_at || '')}">
@@ -381,22 +389,38 @@ function openChat(ticketId, phone, name, status, channel = 'whatsapp', followUpA
     // If already open, just focus
     if (openChats.has(ticketId)) { focusTab(ticketId); return; }
 
+    // Server-decided lane from /tickets (thread_mode): a storefront Help & Tickets
+    // ticket is worked as a thread on the row, everything else - WhatsApp, IG and
+    // the WDG- widget tickets, which continue on WhatsApp by design - stays on the
+    // phone-keyed chat view. Default 'chat' keeps old payloads behaving as before.
+    const listed = allTickets.find(t => String(t.id) === ticketId);
+    const threadMode = (listed && listed.thread_mode) || 'chat';
+
     const chatState = {
-        ticket: { id: ticketId, phone, name, status, channel, followUpAt, followUpNote: '' },
+        ticket: { id: ticketId, phone, name, status, channel, followUpAt, followUpNote: '', threadMode },
         messages: [],
+        entries: [],
+        threadLoaded: false,
+        threadLoading: false,
         pollingInterval: null,
         lastMsgCount: 0,
         lastAiReply: null
     };
     openChats.set(ticketId, chatState);
     focusTab(ticketId);
-    loadChatMessages(ticketId);
+    if (threadMode === 'thread') loadTicketThread(ticketId);
+    else loadChatMessages(ticketId);
     // Start polling for this chat
     chatState.pollingInterval = setInterval(() => {
-        if (activeChatId === ticketId) loadChatMessages(ticketId, false);
+        if (activeChatId !== ticketId) return;
+        if (threadMode === 'thread') loadTicketThread(ticketId, false);
+        else loadChatMessages(ticketId, false);
     }, 15000);
-    // Prefetch AI suggestions
-    try { prefetchAiSuggestions(phone, ticketId); } catch (_) {}
+    // Prefetch AI suggestions - chat lane only: the suggester drafts from WhatsApp
+    // history, which is not the conversation a Help & Tickets reply answers.
+    if (threadMode !== 'thread') {
+        try { prefetchAiSuggestions(phone, ticketId); } catch (_) {}
+    }
 }
 
 function focusTab(ticketId) {
@@ -413,11 +437,8 @@ function focusTab(ticketId) {
     const phoneDisplay = document.getElementById('chatCustomerPhone');
     const chIcon = channelIconSvg(t.channel, 13);
     const chLbl = channelLabel(t.channel);
-    if (t.channel === 'instagram') {
-        phoneDisplay.innerHTML = `${escapeHtml(t.phone)} <span class="chat-channel-badge instagram">${chIcon} ${escapeHtml(chLbl)}</span>`;
-    } else {
-        phoneDisplay.innerHTML = `${escapeHtml(t.phone)} <span class="chat-channel-badge whatsapp">${chIcon} ${escapeHtml(chLbl)}</span>`;
-    }
+    const chBadge = t.channel === 'instagram' ? 'instagram' : t.channel === 'website' ? 'website' : 'whatsapp';
+    phoneDisplay.innerHTML = `${escapeHtml(t.phone)} <span class="chat-channel-badge ${chBadge}">${chIcon} ${escapeHtml(chLbl)}</span>`;
     // Resolve + Follow-Up buttons (hidden once resolved — nothing left to do)
     const isResolved = t.status === 'resolved';
     const resolveBtn = document.getElementById('resolveChatBtn');
@@ -440,12 +461,19 @@ function focusTab(ticketId) {
         }
     }
 
-    // Render messages for this chat (merge with attachments for inline media)
-    (async () => {
-        const attachments = await loadAttachmentsForChat(t.phone);
-        const merged = mergeMessagesWithAttachments(chat.messages, attachments);
-        renderChatMessages(merged, true);
-    })();
+    // Render the conversation: a Help & Tickets ticket reads its thread off the
+    // ticket row (no phone-keyed messages, no WhatsApp attachment lane),
+    // everything else merges the WhatsApp/IG chat with its shared media.
+    if (t.threadMode === 'thread') {
+        renderTicketThread(chat, true);
+        if (!chat.threadLoaded) loadTicketThread(ticketId);
+    } else {
+        (async () => {
+            const attachments = await loadAttachmentsForChat(t.phone);
+            const merged = mergeMessagesWithAttachments(chat.messages, attachments);
+            renderChatMessages(merged, true);
+        })();
+    }
     renderTabs();
     renderSidebarTickets(getFilteredTickets());
     // Re-inject AI suggest button
@@ -627,6 +655,135 @@ function renderOneMessage(msg) {
     </div>`;
 }
 
+// ════════════════════════════════════════════════════════════
+// TICKET THREAD (Help & Tickets / storefront)
+// ════════════════════════════════════════════════════════════
+// A storefront ticket's whole conversation is the `thread` column: the customer
+// writes it in the account's Help & Tickets tab, so that is where the answer has
+// to go back to. /tickets/:id/thread and /tickets/:id/reply are the portal's lane
+// for it, and the staff view keeps internal events visible on purpose.
+async function loadTicketThread(ticketId, showLoading = true) {
+    const chat = openChats.get(String(ticketId));
+    if (!chat || chat.threadLoading) return;
+    chat.threadLoading = true;
+    try {
+        const data = await portalApi(`/portal/${portalSlug}/tickets/${encodeURIComponent(chat.ticket.id)}/thread`);
+        if (!data.success) throw new Error(data.error || 'Failed to load thread');
+        chat.entries = data.entries || [];
+        chat.ticket.request = data.ticket || null;
+        if (data.ticket && data.ticket.status) chat.ticket.status = data.ticket.status;
+        chat.threadLoaded = true;
+        chat.lastMsgCount = chat.entries.length;
+        if (String(ticketId) === activeChatId) renderTicketThread(chat, showLoading);
+    } catch (error) {
+        if (showLoading && String(ticketId) === activeChatId) {
+            document.getElementById('chatMessages').innerHTML = '<div class="chat-loading">Failed to load ticket thread</div>';
+        }
+    } finally {
+        chat.threadLoading = false;
+    }
+}
+
+// What the customer actually asked for - the form behind the thread, which the
+// WhatsApp view never had a way to show. Blank fields are dropped rather than
+// rendered as empty rows.
+function threadRequestCard(t) {
+    if (!t) return '';
+    const rows = [
+        ['Order', t.order_id],
+        ['Request', t.reason_label],
+        ['Details', t.sub_label],
+        ['Also said', t.other_text],
+        ['Preference', t.preference],
+        ['Contact via', t.contact_via],
+        ['New address', t.new_address]
+    ].filter(r => r[1] && String(r[1]).trim());
+    const videoHref = safeHttpUrl(t.video_url);
+    const video = videoHref
+        ? `<a class="treq-link" href="${videoHref}" target="_blank" rel="noopener">Customer video</a>`
+        : '';
+    return `<div class="ticket-request-card">
+        <div class="treq-head">
+            <span class="treq-num">${escapeHtml(t.ticket_number || 'N/A')}</span>
+            <span class="treq-status ${escapeHtml(t.status || 'open')}">${escapeHtml(statusLabel(t.status))}</span>
+        </div>
+        ${rows.map(r => `<div class="treq-row"><span class="treq-k">${escapeHtml(r[0])}</span><span class="treq-v">${escapeHtml(String(r[1]))}</span></div>`).join('')}
+        ${video}
+    </div>`;
+}
+
+// Customer uploads live on the ticket (ticket_attachments), not in the WhatsApp
+// media store, so they get their own strip in the same shape as Shared Media.
+function threadAttachmentStrip(images) {
+    if (!images || !images.length) return '';
+    return `<div class="ticket-attach-strip">
+        <div class="chat-attach-head">── Ticket Attachments ──</div>
+        ${images.map(u => `<div class="msg-attachment" onclick="openLightbox('${escapeJs(u)}', 'image')"><img src="${escapeHtml(u)}" alt="attachment" loading="lazy" decoding="async"></div>`).join('')}
+    </div>`;
+}
+
+function renderThreadEntry(m) {
+    const time = formatTime(m.at);
+    const content = escapeHtml(m.text || '').replace(/\n/g, '<br>');
+    if (m.role === 'event') {
+        return `<div class="ticket-event${m.internal ? ' internal' : ''}"><span>${content}</span>${time ? `<span class="ticket-event-time">${time}</span>` : ''}</div>`;
+    }
+    const isAgent = m.role === 'agent';
+    return `<div class="chat-message ${isAgent ? 'agent' : 'customer'}">
+        <div class="msg-bubble">
+            <div class="msg-content">${content}</div>
+            <div class="msg-meta">
+                ${isAgent ? `<span class="msg-type-badge">${m.ask ? 'Ask' : 'Reply'}</span>` : ''}
+                <span class="msg-time">${time}</span>
+            </div>
+        </div>
+    </div>`;
+}
+
+function renderTicketThread(chat, isInitialLoad = true) {
+    const container = document.getElementById('chatMessages');
+    if (!container || !chat) return;
+    if (!chat.threadLoaded) {
+        container.innerHTML = '<div class="chat-loading"><div class="spinner"></div><span>Loading ticket thread...</span></div>';
+        return;
+    }
+    const entries = chat.entries || [];
+    const body = entries.length
+        ? entries.map(renderThreadEntry).join('')
+        : '<div class="chat-loading" style="padding:24px;"><div class="sidebar-empty-text">No messages yet</div></div>';
+    const images = (chat.ticket.request && chat.ticket.request.images) || [];
+    container.innerHTML = threadRequestCard(chat.ticket.request) + body + threadAttachmentStrip(images);
+    if (isInitialLoad) container.scrollTop = container.scrollHeight;
+}
+
+// Reply into the thread. No WhatsApp send: the Help & Tickets tab the customer is
+// already reading is the delivery channel.
+async function sendTicketReply(chat, message) {
+    const input = document.getElementById('chatInput');
+    const container = document.getElementById('chatMessages');
+    const msgDiv = document.createElement('div');
+    msgDiv.className = 'chat-message agent';
+    msgDiv.innerHTML = `<div class="msg-bubble"><div class="msg-content">${escapeHtml(message).replace(/\n/g, '<br>')}</div><div class="msg-meta"><span class="msg-type-badge">Reply</span><span class="msg-time">${formatTime(new Date().toISOString())}</span><span class="msg-status msg-status-sent">&#10003;</span></div></div>`;
+    container.appendChild(msgDiv);
+    container.scrollTop = container.scrollHeight;
+    if (input) { input.value = ''; input.style.height = 'auto'; }
+
+    try {
+        const data = await portalApi(`/portal/${portalSlug}/tickets/${encodeURIComponent(chat.ticket.id)}/reply`, 'POST', { text: message });
+        if (!data.success) throw new Error(data.error || 'Failed to send reply');
+        chat.entries = data.entries || chat.entries;
+        chat.ticket.status = 'awaiting';
+        if (chat.ticket.request) chat.ticket.request.status = 'awaiting';
+        renderTicketThread(chat, true);
+        loadTickets();
+    } catch (error) {
+        msgDiv.classList.add('msg-failed');
+        const meta = msgDiv.querySelector('.msg-meta');
+        if (meta) meta.innerHTML += '<span class="msg-error">Failed</span>';
+        showToast(error.message || 'Failed to send reply', 'error');
+    }
+}
+
 async function sendMessage() {
     const input = document.getElementById('chatInput');
     const message = input.value.trim();
@@ -765,6 +922,8 @@ let followUpTicketId = null;
 
 function statusLabel(status) {
     if (status === 'follow_up') return 'Follow-Up';
+    // Set by a portal/desk reply: the ball is with the customer now.
+    if (status === 'awaiting') return 'Awaiting customer';
     return status || 'open';
 }
 
@@ -1039,6 +1198,18 @@ function escapeHtml(text) {
     return div.innerHTML;
 }
 function escapeJs(text) { if (!text) return ''; return text.replace(/\\/g, '\\\\').replace(/'/g, "\\'").replace(/"/g, '\\"'); }
+// video_url is typed straight into the storefront form, so a thread could carry an
+// arbitrary string into a staff member's href. escapeHtml leaves quotes alone, so
+// links are only rendered once they parse as http(s) and are attribute-safe.
+function safeHttpUrl(value) {
+    const raw = String(value || '').trim();
+    if (!raw) return '';
+    try {
+        const u = new URL(raw);
+        if (u.protocol !== 'http:' && u.protocol !== 'https:') return '';
+        return u.href.replace(/"/g, '&quot;').replace(/'/g, '&#39;');
+    } catch (_) { return ''; }
+}
 function truncate(text, length) { if (!text) return ''; return text.length > length ? text.substring(0, length) + '...' : text; }
 function formatFileSize(bytes) {
     if (!bytes || bytes === 0) return '';
@@ -1126,6 +1297,12 @@ document.addEventListener('DOMContentLoaded', () => {
 
     // ── Media attachment handlers ──
     document.getElementById('attachImageBtn')?.addEventListener('click', () => {
+        const chat = activeChatId ? openChats.get(String(activeChatId)) : null;
+        if (chat && chat.ticket.threadMode === 'thread') {
+            // Media uploads ride the WhatsApp lane; a thread reply is text only.
+            showToast('Attachments are not available on Help & Tickets tickets', 'info');
+            return;
+        }
         document.getElementById('chatImageInput')?.click();
     });
     document.getElementById('chatImageInput')?.addEventListener('change', handleFileSelect);
@@ -1254,6 +1431,18 @@ sendMessage = async function() {
     const message = input?.value.trim() || '';
     const chat = activeChatId ? openChats.get(String(activeChatId)) : null;
     if (!chat) return;
+
+    // Help & Tickets lane: the reply joins the ticket thread instead of going out
+    // on WhatsApp, so it never enters the phone-keyed media path below.
+    if (chat.ticket.threadMode === 'thread') {
+        if (pendingMediaFile) {
+            showToast('Attachments are not available on Help & Tickets tickets', 'info');
+            return;
+        }
+        if (!message) return;
+        await sendTicketReply(chat, message);
+        return;
+    }
 
     // If there's a pending media file, upload and send it
     if (pendingMediaFile) {
