@@ -25,6 +25,7 @@
     composer: { mode: 'reply', text: '' },
     orderExpanded: false,
     customerExpanded: true,
+    returnsExpanded: true,
     pollInterval: null,
     modal: null,          // { tab: 'sla'|'teams'|'canned'|'templates'|'cost'|'whitelist' }
     mobileShow: 'queue'   // queue | detail (small screens)
@@ -41,6 +42,10 @@
   function fmtTime(ts) {
     if (!ts) return '';
     return new Date(ts).toLocaleString('en-IN', { day: 'numeric', month: 'short', hour: '2-digit', minute: '2-digit' });
+  }
+  function fmtShortDate(ts) {
+    if (!ts) return '';
+    return new Date(ts).toLocaleDateString('en-IN', { day: '2-digit', month: 'short' });
   }
   function api(path, opts) {
     opts = opts || {};
@@ -348,6 +353,7 @@
       +   '<div class="desk-context-col">'
       +     customerCard(d, t, h, o)
       +     orderHistoryCard(d, t, o)
+      +     returnsExchangesCard(d)
       +     riskCard(d)
       +   '</div>'
       + '</div>';
@@ -433,26 +439,19 @@
     return parts.slice(-2).join(', ');
   }
 
+  function toggleCollapsible(stateKey, cardId, hintSel, forceExpand, scrollOnOpen) {
+    S[stateKey] = typeof forceExpand === 'boolean' ? forceExpand : !S[stateKey];
+    var card = $(cardId);
+    if (!card) return;
+    card.classList.toggle('is-expanded', S[stateKey]);
+    card.classList.toggle('is-collapsed', !S[stateKey]);
+    var hint = card.querySelector(hintSel || '.desk-collapse-hint');
+    if (hint) hint.textContent = S[stateKey] ? 'Click to collapse' : 'Click to expand';
+    if (S[stateKey] && scrollOnOpen) card.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+  }
+
   function toggleCustomerInfo(forceExpand) {
-    if (typeof forceExpand === 'boolean') {
-      S.customerExpanded = forceExpand;
-    } else {
-      S.customerExpanded = (S.customerExpanded === undefined) ? false : !S.customerExpanded;
-    }
-    var card = $('DeskCustomerCard');
-    if (card) {
-      if (S.customerExpanded) {
-        card.classList.remove('is-collapsed');
-        card.classList.add('is-expanded');
-        var hint = card.querySelector('.desk-cust-collapse-hint');
-        if (hint) hint.textContent = 'Click to collapse';
-      } else {
-        card.classList.remove('is-expanded');
-        card.classList.add('is-collapsed');
-        var hint = card.querySelector('.desk-cust-collapse-hint');
-        if (hint) hint.textContent = 'Click to expand';
-      }
-    }
+    toggleCollapsible('customerExpanded', 'DeskCustomerCard', '.desk-cust-collapse-hint', forceExpand, false);
   }
 
   function customerCard(d, t, h, o) {
@@ -531,26 +530,7 @@
 
   // ── 3. Order History (Current Order + Past Orders Context, Collapsible) ──
   function toggleOrderHistory(forceExpand) {
-    if (typeof forceExpand === 'boolean') {
-      S.orderExpanded = forceExpand;
-    } else {
-      S.orderExpanded = !S.orderExpanded;
-    }
-    var card = $('DeskOrderCard');
-    if (card) {
-      if (S.orderExpanded) {
-        card.classList.remove('is-collapsed');
-        card.classList.add('is-expanded');
-        var hint = card.querySelector('.desk-collapse-hint');
-        if (hint) hint.textContent = 'Click to collapse';
-        card.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
-      } else {
-        card.classList.remove('is-expanded');
-        card.classList.add('is-collapsed');
-        var hint = card.querySelector('.desk-collapse-hint');
-        if (hint) hint.textContent = 'Click to expand';
-      }
-    }
+    toggleCollapsible('orderExpanded', 'DeskOrderCard', '.desk-collapse-hint', forceExpand, true);
   }
 
   function orderHistoryCard(d, t, o) {
@@ -586,26 +566,6 @@
         +   (awbStr ? '<span class="history-awb">' + esc(awbStr) + '</span> &middot; ' : '')
         +   (po.created_at ? '<span class="history-date">' + fmtTime(po.created_at) + '</span> &middot; ' : '')
         +   '<span class="history-total">' + money(po.total) + '</span>'
-        + '</div>'
-        + '</div>';
-    }).join('');
-
-    // Open/past returns & exchanges
-    var reqs = [];
-    (ctx.returns || []).forEach(function (r) { reqs.push({ kind: 'Return', r: r }); });
-    (ctx.exchanges || []).forEach(function (r) { reqs.push({ kind: 'Exchange', r: r }); });
-    reqs.sort(function (a, b) { return new Date(b.r.created_at || 0) - new Date(a.r.created_at || 0); });
-
-    var reqRows = reqs.map(function (x) {
-      return '<div class="desk-history-row req-row">'
-        + '<div class="history-main">'
-        +   '<span class="desk-tag request">' + x.kind + '</span>'
-        +   '<span class="history-id">#' + esc(x.r.order_id) + '</span>'
-        +   '<span class="desk-pill">' + esc(String(x.r.status || '').replace(/_/g, ' ')) + '</span>'
-        + '</div>'
-        + '<div class="history-sub">'
-        +   '<span class="history-src">' + (x.r.source === 'portal' ? 'Portal request' : 'Support request') + '</span> &middot; '
-        +   '<span class="history-date">' + fmtTime(x.r.created_at) + '</span>'
         + '</div>'
         + '</div>';
     }).join('');
@@ -651,15 +611,79 @@
       +     '</div>'
       +     (items ? '<div class="desk-items-wrap"><div class="desk-items-title">Ordered Items</div><table class="desk-items"><thead><tr><th>Item Details</th><th class="num">Qty</th><th class="num">Price</th><th class="num">Subtotal</th></tr></thead><tbody>' + items + '</tbody></table></div>' : '')
       +   '</div>'
-      // Past Order History Subsection (hidden when only 1 order exists and no returns/exchanges)
-      +   (totalPastCount > 1 || reqs.length > 0 ? (
+      // Past Order History Subsection (hidden when only 1 order exists)
+      +   (totalPastCount > 1 && pastOrders ? (
             '<div class="desk-past-orders-section">'
-            + '<div class="desk-section-subhead">Customer Order &amp; Request History <span class="desk-muted">(' + totalPastCount + ' recorded)</span></div>'
-            + (reqRows ? '<div class="desk-sub-section-title">Returns &amp; Exchanges</div><div class="desk-history-list">' + reqRows + '</div>' : '')
-            + (pastOrders ? '<div class="desk-sub-section-title" style="margin-top:10px">Past Orders</div><div class="desk-history-list">' + pastOrders + '</div>' : '')
+            + '<div class="desk-section-subhead">Past Orders <span class="desk-muted">(' + totalPastCount + ' recorded)</span></div>'
+            + '<div class="desk-history-list">' + pastOrders + '</div>'
             + '</div>'
           ) : '')
       +   '</div>'
+      + '</div>';
+  }
+
+  // ── 3b. Returns & Exchanges Portal Card (Collapsible, directly under Order History) ──
+  var RETURNS_PORTAL_URL = 'https://exchange-return-tracking.onrender.com/admin';
+  function toggleReturnsExchanges(forceExpand) {
+    toggleCollapsible('returnsExpanded', 'DeskReturnsCard', '.desk-ret-collapse-hint', forceExpand, false);
+  }
+  function openReturnPortal(requestId) {
+    var url = requestId ? RETURNS_PORTAL_URL + '#requestId=' + encodeURIComponent(requestId) : RETURNS_PORTAL_URL;
+    window.open(url, '_blank', 'noopener,noreferrer');
+  }
+  function returnsExchangesCard(d) {
+    var ctx = d.context || {};
+    var reqs = [];
+    (ctx.returns || []).forEach(function (r) { reqs.push({ kind: 'RETURN', r: r }); });
+    (ctx.exchanges || []).forEach(function (r) { reqs.push({ kind: 'EXCHANGE', r: r }); });
+    reqs.sort(function (a, b) { return new Date(b.r.created_at || 0) - new Date(a.r.created_at || 0); });
+
+    var count = reqs.length;
+    var isExpanded = (S.returnsExpanded !== false);
+
+    var itemsHtml = count ? reqs.map(function (x) {
+      var r = x.r || {};
+      var ordId = String(r.order_id || r.order_number || '').replace(/^#/, '');
+      var dateStr = fmtShortDate(r.created_at);
+      var srcLabel = r.source === 'portal' ? 'Portal' : 'Local';
+      var statusStr = String(r.status || 'unknown').toUpperCase();
+      var reqId = String(r.id || r.request_id || '');
+      var typeCls = x.kind === 'EXCHANGE' ? 'type-exchange' : 'type-return';
+      var statusCls = /^(completed|delivered|approved|credited)$/.test(String(r.status || '').toLowerCase()) ? 'status-done' : 'status-active';
+      return '<div class="desk-re-item" role="button" tabindex="0"'
+        + ' onclick="DESK.openReturnPortal(\'' + esc(reqId) + '\')"'
+        + ' onkeydown="if(event.key===\'Enter\'||event.key===\' \'){event.preventDefault();DESK.openReturnPortal(\'' + esc(reqId) + '\');}"'
+        + ' title="Open in Return &amp; Exchange Portal">'
+        + '<div class="desk-re-top">'
+        +   '<span class="desk-re-type ' + typeCls + '">' + x.kind + '</span>'
+        +   '<span class="desk-re-status ' + statusCls + '">' + esc(statusStr) + '</span>'
+        + '</div>'
+        + '<div class="desk-re-meta">'
+        +   (ordId ? '<span class="desk-re-ord">#' + esc(ordId) + '</span>' : '')
+        +   (dateStr ? '<span class="desk-re-date">' + esc(dateStr) + '</span>' : '')
+        +   '<span class="desk-re-source">' + esc(srcLabel) + '</span>'
+        + '</div>'
+        + (r.reason ? '<div class="desk-re-reason" title="' + esc(r.reason) + '">' + esc(r.reason) + '</div>' : '')
+        + '</div>';
+    }).join('') : '<div class="desk-re-empty">No return or exchange requests recorded for this customer.</div>';
+
+    return '<div class="desk-card desk-returns-card' + (isExpanded ? ' is-expanded' : ' is-collapsed') + '" id="DeskReturnsCard">'
+      + '<div class="desk-card-head desk-collapsible-bar" onclick="DESK.toggleReturnsExchanges()" role="button" tabindex="0"'
+      +   ' onkeydown="if(event.key===\'Enter\'||event.key===\' \'){event.preventDefault();DESK.toggleReturnsExchanges();}"'
+      +   ' title="Click to ' + (isExpanded ? 'collapse' : 'expand') + ' returns &amp; exchanges">'
+      +   '<div class="desk-card-title">'
+      +     '<svg class="desk-head-svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 10h10a8 8 0 0 1 8 8v2M3 10l6 6m-6-6l6-6"/></svg>'
+      +     ' Returns / Exchanges'
+      +     '<span class="desk-re-count' + (count > 0 ? ' has-items' : '') + '">' + count + '</span>'
+      +     '<span class="desk-collapse-hint desk-ret-collapse-hint">' + (isExpanded ? 'Click to collapse' : 'Click to expand') + '</span>'
+      +   '</div>'
+      +   '<div class="desk-order-bar-actions">'
+      +     '<span class="desk-collapse-arrow">&#9662;</span>'
+      +   '</div>'
+      + '</div>'
+      + '<div class="desk-returns-body" id="DeskReturnsBody">'
+      +   '<div class="desk-re-list">' + itemsHtml + '</div>'
+      + '</div>'
       + '</div>';
   }
 
@@ -1249,6 +1273,8 @@
     select: select, backToQueue: backToQueue, patchTicket: patchTicket,
     toggleCustomerInfo: toggleCustomerInfo,
     toggleOrderHistory: toggleOrderHistory,
+    toggleReturnsExchanges: toggleReturnsExchanges,
+    openReturnPortal: openReturnPortal,
     setMode: setMode, setMsg: setMsg, useCanned: useCanned, sendComposer: sendComposer,
     openResolve: openResolve, pickResolution: pickResolution, confirmResolve: confirmResolve,
     agentReopen: agentReopen, approve: approve, decline: decline,
