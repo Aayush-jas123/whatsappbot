@@ -9,6 +9,8 @@ const broadcastService = require('../services/broadcastService');
 const shopifyService = require('../services/shopifyService');
 const razorpayService = require('../services/razorpayService');
 const cloudinary = require('../services/cloudinaryService');
+const supportMedia = require('../services/supportMediaService');
+const supportCloudinary = require('../services/supportCloudinaryService');
 const { verifyToken, requirePermission, requireAdmin } = require('../middleware/auth');
 
 // ============================================================
@@ -236,14 +238,17 @@ router.get('/tickets/:id', async (req, res) => {
     try {
         const t = await Support.getTicket(req.params.id);
         if (!t) return res.status(404).json({ error: 'Ticket not found' });
-        const [images, settings, portalIndex] = await Promise.all([
+        const [images, media, settings, portalIndex] = await Promise.all([
             Support.listTicketImages(t.id),
+            supportMedia.listForTicket(t.ticket_number),
             Support.getAllSettings(),
             Support.getPortalIndex()
         ]);
+        // Opening the ticket is the agent's 'seen' receipt for customer media.
+        await supportMedia.markSeen(t.ticket_number, 'outgoing');
         const key = t.reason + '/' + t.sub;
         res.json({
-            ticket: { ...t, images, portal: Support.describePortal(t, portalIndex) },
+            ticket: { ...t, images, media: media.map(supportMedia.publicView), portal: Support.describePortal(t, portalIndex) },
             sla: Support.slaOf(t, settings.sla || {}),
             requestKey: Support.REQUESTS[key] ? key : null,
             requestLabel: Support.REQUESTS[key] || null,
@@ -355,7 +360,11 @@ async function agentComposer(req, res, mode) {
         const t = await Support.getTicket(req.params.id);
         if (!t) return res.status(404).json({ error: 'Ticket not found' });
         const text = String((req.body && req.body.text) || '').trim().slice(0, 5000);
-        if (!text) return res.status(400).json({ error: 'Message is empty' });
+        const mediaIds = Array.isArray(req.body && req.body.media_ids) ? req.body.media_ids.map(Number).filter(Boolean) : [];
+        if (!text && !mediaIds.length) return res.status(400).json({ error: 'Message is empty' });
+        if (mediaIds.length > supportMedia.MAX_PER_MESSAGE) {
+            return res.status(400).json({ error: `Only ${supportMedia.MAX_PER_MESSAGE} images per message` });
+        }
         const agent = agentName(req);
         const now = Date.now();
         const patch = { updated_at: new Date(now).toISOString() };
@@ -365,11 +374,23 @@ async function agentComposer(req, res, mode) {
             patch.notes = notes;
         } else {
             const thread = Array.isArray(t.thread) ? t.thread : [];
-            thread.push({ role: 'agent', text, at: now, agentId: agent, ask: mode === 'ask' });
+            const entry = { role: 'agent', text, at: now, agentId: agent, ask: mode === 'ask' };
+            if (mediaIds.length) entry.media_ids = mediaIds;
+            const entryIdx = thread.length;
+            thread.push(entry);
             patch.thread = thread;
             patch.status = 'awaiting';
             patch.last_agent_at = new Date(now).toISOString();
+            if (mediaIds.length) patch.has_images = true;
             if (!t.first_response_at) patch.first_response_at = new Date(now).toISOString();
+            // Attach the media AFTER the thread write succeeds so the row
+            // only flips to 'sent' once it is actually part of the ticket.
+            await Support.updateTicket(t.id, patch);
+            if (mediaIds.length) {
+                await supportMedia.attachToMessage(mediaIds, { threadEntryIdx: entryIdx });
+            }
+            const updated = await Support.getTicket(t.id);
+            return res.json({ ticket: publicTicket(updated) });
         }
         const updated = await Support.updateTicket(t.id, patch);
         res.json({ ticket: publicTicket(updated) });
@@ -409,6 +430,8 @@ router.post('/tickets/:id/resolve', async (req, res) => {
             last_agent_at: new Date(now).toISOString(),
             updated_at: new Date(now).toISOString()
         });
+        // Start the 45-day media deletion timer from this closure instant.
+        await supportMedia.armRetention(t.ticket_number, new Date(now).toISOString());
         res.json({ ticket: publicTicket(updated) });
     } catch (error) {
         console.error('[Support Desk] resolve error:', error.message);
@@ -427,6 +450,8 @@ router.post('/tickets/:id/reopen', async (req, res) => {
         const updated = await Support.updateTicket(t.id, {
             status: 'open', thread, last_customer_at: new Date().toISOString(), updated_at: new Date().toISOString()
         });
+        // Reopening cancels the pending deletion timer.
+        await supportMedia.clearRetention(t.ticket_number);
         res.json({ ticket: publicTicket(updated) });
     } catch (error) {
         console.error('[Support Desk] reopen error:', error.message);
@@ -568,6 +593,7 @@ router.post('/tickets/:id/decline', async (req, res) => {
 });
 
 // ── Desk agent uploads (proof images pasted into a reply) ──
+// Legacy server-proxy path; new UI uses the signed direct-upload below.
 router.post('/upload', upload.array('images', 4), async (req, res) => {
     try {
         const urls = [];
@@ -583,6 +609,52 @@ router.post('/upload', upload.array('images', 4), async (req, res) => {
     } catch (error) {
         console.error('[Support Desk] upload error:', error.message);
         res.status(500).json({ error: 'Upload failed' });
+    }
+});
+
+// ============================================================
+// Signed browser direct-upload (Cloudinary) — agent desk surface
+// ============================================================
+router.post('/media/intent', async (req, res) => {
+    try {
+        if (!supportCloudinary.isConfigured()) {
+            return res.status(503).json({ error: 'Image upload is not configured' });
+        }
+        const b = req.body || {};
+        const intent = await supportMedia.createIntent({
+            channel: 'website',
+            ticketRef: b.ticket_ref || null,
+            direction: 'outgoing',
+            actor: agentName(req)
+        });
+        res.json(intent);
+    } catch (error) {
+        console.error('[Support Desk] media intent error:', error.message);
+        res.status(500).json({ error: 'Failed to start upload' });
+    }
+});
+
+router.post('/media/:id/finalize', async (req, res) => {
+    try {
+        const row = await supportMedia.getById(req.params.id);
+        if (!row) return res.status(404).json({ error: 'Media not found' });
+        const updated = await supportMedia.finalize({ mediaId: row.id });
+        res.json({ media: supportMedia.publicView(updated) });
+    } catch (error) {
+        console.error('[Support Desk] media finalize error:', error.message);
+        res.status(400).json({ error: error.message || 'Failed to confirm upload' });
+    }
+});
+
+router.post('/media/:id/retry', async (req, res) => {
+    try {
+        const row = await supportMedia.getById(req.params.id);
+        if (!row) return res.status(404).json({ error: 'Media not found' });
+        const fresh = await supportMedia.retry({ mediaId: row.id });
+        res.json(fresh);
+    } catch (error) {
+        console.error('[Support Desk] media retry error:', error.message);
+        res.status(400).json({ error: error.message || 'Failed to retry upload' });
     }
 });
 

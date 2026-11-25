@@ -6,6 +6,8 @@ const multer = require('multer');
 const whatsappService = require('../services/whatsappService');
 const { dbAdapter } = require('../database/db');
 const { caches } = require('../utils/cache');
+const supportMedia = require('../services/supportMediaService');
+const supportCloudinary = require('../services/supportCloudinaryService');
 
 // Multer config: disk storage (avoids holding files in RAM)
 const upload = multer({
@@ -608,6 +610,13 @@ router.put('/:slug/tickets/:id', verifyPortalToken, async (req, res) => {
             }
         } else if (status === 'resolved' || status === 'closed') {
             updates.push('follow_up_at = NULL', 'follow_up_note = NULL');
+            // Canonical closure timestamp — the 45-day media retention timer
+            // reads resolution_at, so it must be stamped here (previously it
+            // was never set on the portal/admin path).
+            updates.push('resolution_at = CURRENT_TIMESTAMP');
+        } else if (status === 'open') {
+            // Reopening clears the closure stamp so retention can be cancelled.
+            updates.push('resolution_at = NULL');
         }
 
         updateParams.push(id);
@@ -615,6 +624,23 @@ router.put('/:slug/tickets/:id', verifyPortalToken, async (req, res) => {
             `UPDATE support_tickets SET ${updates.join(', ')} WHERE id = ?`,
             updateParams
         );
+
+        // Drive the media retention timer off the new status.
+        const closedNow = (status === 'resolved' || status === 'closed');
+        const reopened = (status === 'open' || status === 'follow_up');
+        if (closedNow || reopened) {
+            try {
+                const ticketNumber = tickets[0]?.ticket_number;
+                if (closedNow) {
+                    const fresh = await dbAdapter.query('SELECT resolution_at FROM support_tickets WHERE id = ?', [id]);
+                    await supportMedia.armRetention(ticketNumber, fresh?.[0]?.resolution_at);
+                } else {
+                    await supportMedia.clearRetention(ticketNumber);
+                }
+            } catch (retErr) {
+                console.error('[Portal] retention timer update failed:', retErr.message);
+            }
+        }
 
         // Invalidate portal ticket cache
         caches.tickets.keys().filter(k => k.startsWith('portal_tickets_full:')).forEach(k => caches.tickets.delete(k));
@@ -952,7 +978,40 @@ router.get('/:slug/attachments/:phone', verifyPortalToken, async (req, res) => {
 
         const mediaService = require('../services/mediaService');
         const attachments = await mediaService.getAttachmentsForPhone(phone, 100);
-        res.json({ success: true, attachments });
+
+        // Merge in Cloudinary-backed lifecycle media (with live delivery
+        // status) so the portal chat renders real status chips, not a
+        // hard-coded tick. Shaped like a legacy attachment so the existing
+        // chronological merge keeps working.
+        let lifecycle = [];
+        try {
+            const rows = await supportMedia.listForPortalPhone(phone);
+            lifecycle = rows.map(r => {
+                const v = supportMedia.publicView(r);
+                return {
+                    id: v.id,
+                    source: 'support_media',
+                    file_type: 'image',
+                    file_url: v.full_url,
+                    thumbnail_url: v.thumb_url,
+                    direction: r.direction,
+                    mime_type: r.mime_type,
+                    file_size: r.file_size,
+                    upload_status: v.upload_status,
+                    delivery_status: v.delivery_status,
+                    // dimensions let the chat lay the photo bubble out before
+                    // the picture finishes decoding (no layout jump)
+                    width: v.width,
+                    height: v.height,
+                    expired: v.expired,
+                    created_at: r.created_at
+                };
+            });
+        } catch (mediaErr) {
+            console.error('[Portal] lifecycle media merge skipped:', mediaErr.message);
+        }
+
+        res.json({ success: true, attachments, media: lifecycle });
     } catch (error) {
         console.error('Portal attachments error:', error);
         res.status(500).json({ error: 'Failed to fetch attachments' });
@@ -1060,6 +1119,173 @@ router.post('/:slug/chat/send-file', verifyPortalToken, upload.single('file'), a
     } catch (error) {
         console.error('Portal send file error:', error);
         res.status(500).json({ error: 'Failed to send file', details: error.message });
+    }
+});
+
+// ============================================================
+// Cloudinary signed browser direct-upload + send-media (portal)
+// ============================================================
+
+// 1. Signed upload intent for one image the agent is about to attach.
+router.post('/:slug/chat/media/intent', verifyPortalToken, async (req, res) => {
+    try {
+        const { slug } = req.params;
+        if (slug !== req.portal.slug) return res.status(403).json({ error: 'Portal mismatch' });
+        if (!supportCloudinary.isConfigured()) {
+            return res.status(503).json({ error: 'Image upload is not configured' });
+        }
+        const intent = await supportMedia.createIntent({
+            channel: req.body && req.body.channel ? req.body.channel : 'whatsapp',
+            ticketRef: (req.body && req.body.ticket_ref) || null,
+            direction: 'outgoing',
+            actor: `portal:${slug}`
+        });
+        res.json(intent);
+    } catch (error) {
+        console.error('Portal media intent error:', error.message);
+        res.status(500).json({ error: 'Failed to start upload' });
+    }
+});
+
+// 2. Confirm a browser upload landed in our Cloudinary before sending.
+router.post('/:slug/chat/media/:id/finalize', verifyPortalToken, async (req, res) => {
+    try {
+        const { slug } = req.params;
+        if (slug !== req.portal.slug) return res.status(403).json({ error: 'Portal mismatch' });
+        const row = await supportMedia.getById(req.params.id);
+        if (!row) return res.status(404).json({ error: 'Media not found' });
+        const updated = await supportMedia.finalize({ mediaId: row.id });
+        res.json({ media: supportMedia.publicView(updated) });
+    } catch (error) {
+        console.error('Portal media finalize error:', error.message);
+        res.status(400).json({ error: error.message || 'Failed to confirm upload' });
+    }
+});
+
+// 3. Retry a failed upload.
+router.post('/:slug/chat/media/:id/retry', verifyPortalToken, async (req, res) => {
+    try {
+        const { slug } = req.params;
+        if (slug !== req.portal.slug) return res.status(403).json({ error: 'Portal mismatch' });
+        const row = await supportMedia.getById(req.params.id);
+        if (!row) return res.status(404).json({ error: 'Media not found' });
+        const fresh = await supportMedia.retry({ mediaId: row.id });
+        res.json(fresh);
+    } catch (error) {
+        console.error('Portal media retry error:', error.message);
+        res.status(400).json({ error: error.message || 'Failed to retry upload' });
+    }
+});
+
+// 4. Send one or more already-finalized images to the customer over the
+//    ticket's own channel (WhatsApp or Instagram), correlating the WhatsApp
+//    message id so the async delivery webhook can advance the status.
+router.post('/:slug/chat/send-media', verifyPortalToken, async (req, res) => {
+    try {
+        const { slug } = req.params;
+        const { phone, caption = '', media_ids = [] } = req.body;
+
+        if (slug !== req.portal.slug) return res.status(403).json({ error: 'Portal mismatch' });
+        if (!phone || !Array.isArray(media_ids) || !media_ids.length) {
+            return res.status(400).json({ error: 'Phone and media_ids are required' });
+        }
+        if (media_ids.length > supportMedia.MAX_PER_MESSAGE) {
+            return res.status(400).json({ error: `Only ${supportMedia.MAX_PER_MESSAGE} images per message` });
+        }
+
+        const hasAccess = await verifyPhoneInPortal(phone, req.portal);
+        if (!hasAccess) return res.status(403).json({ error: 'Phone not associated with this portal' });
+
+        // Resolve the ticket's channel + identity.
+        const ticketRows = await dbAdapter.query(
+            `SELECT id, ticket_number, channel, ig_user_id FROM support_tickets
+             WHERE customer_phone = ? AND status != 'resolved'
+             ORDER BY created_at DESC LIMIT 1`,
+            [phone]
+        );
+        const ticket = ticketRows?.[0] || null;
+        const ticketChannel = ticket?.channel || 'whatsapp';
+        const igUserId = ticket?.ig_user_id;
+
+        const cleanPhone = phone.replace(/\D/g, '');
+        const formattedPhone = cleanPhone.startsWith('91') ? `+${cleanPhone}` : `+91${cleanPhone}`;
+
+        const rows = await supportMedia.getByIds(media_ids);
+        const results = [];
+
+        for (const row of rows) {
+            // Never send media that hasn't finalized into our account.
+            if (row.upload_status !== supportMedia.STATUS.UPLOADED) {
+                results.push({ id: row.id, status: 'failed', error: 'Not uploaded' });
+                continue;
+            }
+
+            await supportMedia.setStatus(row.id, supportMedia.STATUS.SENDING);
+            const url = supportCloudinary.optimizedUrl(row.public_id);
+
+            try {
+                if (ticketChannel === 'instagram' && igUserId) {
+                    const instagramService = require('../services/instagramService');
+                    const igResult = await instagramService.sendImage(igUserId, url, caption || null);
+                    if (igResult && igResult.blocked) {
+                        await supportMedia.markFailed(row.id, igResult.reason || 'IG window expired');
+                        results.push({ id: row.id, status: 'failed', error: igResult.reason });
+                        continue;
+                    }
+                    // Instagram has no delivery-receipt webhook → stay at 'sent'.
+                    // Persist ticket_ref too so listForPortalPhone can find the
+                    // row (the lifecycle chat list joins on ticket_number).
+                    await dbAdapter.run(
+                        `UPDATE support_media SET upload_status = 'sent', ticket_ref = ?, thread_entry_idx = NULL, updated_at = CURRENT_TIMESTAMP WHERE id = ?`,
+                        [ticket?.ticket_number || row.ticket_ref, row.id]
+                    );
+                    results.push({ id: row.id, status: 'sent', channel: 'instagram' });
+                } else {
+                    const wa = await whatsappService.sendImage(formattedPhone, url, caption || '', 'manual_reply');
+                    const waMsgId = wa?.messages?.[0]?.id || null;
+                    // Persist ticket_ref + correlate the wamid so the async
+                    // webhook resolves delivered/read/failed on this row.
+                    await dbAdapter.run(
+                        `UPDATE support_media SET ticket_ref = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?`,
+                        [ticket?.ticket_number || row.ticket_ref, row.id]
+                    );
+                    await supportMedia.recordWaMessageId(row.id, waMsgId);
+                    results.push({ id: row.id, status: 'sent', channel: 'whatsapp', wa_message_id: waMsgId });
+                }
+            } catch (sendErr) {
+                await supportMedia.markFailed(row.id, sendErr.message);
+                results.push({ id: row.id, status: 'failed', error: sendErr.message });
+            }
+        }
+
+        res.json({ success: true, sent: results });
+    } catch (error) {
+        console.error('Portal send media error:', error);
+        res.status(500).json({ error: 'Failed to send media', details: error.message });
+    }
+});
+
+// 5. Re-arm a media row that failed at the SEND stage (asset is already in
+//    Cloudinary) so the client can re-invoke send-media for it.
+router.post('/:slug/chat/retry-media/:id', verifyPortalToken, async (req, res) => {
+    try {
+        const { slug } = req.params;
+        if (slug !== req.portal.slug) return res.status(403).json({ error: 'Portal mismatch' });
+        const row = await supportMedia.getById(req.params.id);
+        if (!row) return res.status(404).json({ error: 'Media not found' });
+        if (row.upload_status !== supportMedia.STATUS.FAILED) {
+            return res.status(400).json({ error: 'Only failed media can be retried' });
+        }
+        // Only push back to 'uploaded' if the asset really made it to Cloudinary.
+        try {
+            const fresh = await supportMedia.finalize({ mediaId: row.id });
+            res.json({ media: supportMedia.publicView(fresh) });
+        } catch (e) {
+            res.status(400).json({ error: 'Asset missing from Cloudinary — re-upload required' });
+        }
+    } catch (error) {
+        console.error('Portal retry media error:', error.message);
+        res.status(400).json({ error: error.message || 'Failed to retry send' });
     }
 });
 

@@ -2867,6 +2867,184 @@ input, textarea { caret-color: var(--desk-ink); }
   .desk-merged-card { min-height: 520px; }
 }
 
+/* ---------- Composer media attach + inline thread media ----------
+   Monochrome throughout, per the desk design language: status is carried by
+   the text label and border weight, never hue. */
+.desk-attach {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 6px 12px;
+  border: 1px dashed var(--desk-border-strong);
+  border-radius: 999px;
+  background: var(--desk-card);
+  color: var(--desk-sub);
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: .04em;
+  text-transform: uppercase;
+  cursor: pointer;
+  user-select: none;
+}
+.desk-attach:hover { background: var(--desk-card-sub); color: var(--desk-ink); }
+.desk-attach input[type="file"] { display: none; }
+.desk-attach-txt { line-height: 1; }
+
+.desk-composer-media { display: flex; flex-wrap: wrap; gap: 8px; }
+.desk-composer-media:empty { display: none; }
+.desk-media-chip {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 8px 6px 6px;
+  border: 1px solid var(--desk-border);
+  border-radius: var(--radius-sm);
+  background: var(--desk-card);
+  max-width: 240px;
+}
+.desk-media-chip.st-failed { border-style: dashed; border-color: var(--desk-border-strong); }
+.desk-chip-thumb {
+  position: relative;
+  width: 40px; height: 40px; flex-shrink: 0;
+  border-radius: 6px; overflow: hidden;
+  border: 1px solid var(--desk-border);
+  background: var(--desk-card-sub);
+  display: inline-flex; align-items: center; justify-content: center;
+}
+.desk-chip-thumb img { width: 100%; height: 100%; object-fit: cover; display: block; }
+.desk-chip-spin {
+  width: 16px; height: 16px; border-radius: 50%;
+  border: 2px solid var(--desk-fill-hover);
+  border-top-color: var(--desk-ink);
+  animation: desk-chip-rot .8s linear infinite;
+}
+.desk-chip-body { display: flex; flex-direction: column; gap: 4px; min-width: 0; flex: 1; }
+.desk-chip-name {
+  font-size: 11.5px; color: var(--desk-ink); font-weight: 600;
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 150px;
+}
+.desk-chip-bar {
+  height: 4px; border-radius: 2px; background: var(--desk-fill); overflow: hidden;
+  display: none;
+}
+.desk-media-chip.st-uploading .desk-chip-bar { display: block; }
+.desk-chip-fill { display: block; height: 100%; background: var(--desk-ink); transition: width .15s; }
+.desk-chip-status {
+  font-size: 10px; font-weight: 700; letter-spacing: .04em; text-transform: uppercase;
+  color: var(--desk-muted); white-space: nowrap;
+}
+.desk-media-chip.st-uploaded .desk-chip-status { color: var(--desk-ink); }
+.desk-media-chip.st-failed .desk-chip-status { color: var(--desk-ink); }
+.desk-chip-retry {
+  border: 1px solid var(--desk-border-strong); background: var(--desk-card);
+  color: var(--desk-ink); font-size: 10px; font-weight: 700; text-transform: uppercase;
+  letter-spacing: .04em; border-radius: 6px; padding: 3px 7px; cursor: pointer;
+}
+.desk-chip-retry:hover { background: var(--desk-ink); color: #FFFFFF; }
+.desk-chip-x {
+  border: none; background: transparent; color: var(--desk-hint);
+  font-size: 16px; line-height: 1; cursor: pointer; padding: 0 2px;
+}
+.desk-chip-x:hover { color: var(--desk-ink); }
+@keyframes desk-chip-rot { to { transform: rotate(360deg); } }
+
+/* ---------- photos in the thread: the picture IS the bubble ---------- */
+/* WhatsApp-style: no frame, no inner padding, the grid fills the bubble edge to
+   edge and the caption (when any) sits on top of it. Declared late so it beats
+   both bubble skins (base + detail-layer overrides). */
+.desk-msg-bubble.desk-bubble-photos {
+  padding: 0; background: transparent; border-color: transparent;
+  box-shadow: none; overflow: hidden;
+}
+.desk-bubble-photos .bubble-text {
+  padding: 12px 16px;
+  background: var(--desk-card-sub);
+  border: 1px solid var(--desk-border);
+  border-bottom: none;
+  border-radius: 10px 10px 0 0;
+  color: var(--desk-ink);
+}
+.desk-msg-bubble.agent-bubble.desk-bubble-photos .bubble-text {
+  background: var(--desk-ink); color: #FFFFFF; border-color: var(--desk-ink);
+}
+
+.desk-mb {
+  display: grid; gap: 3px;
+  width: min(320px, 100%);
+  border-radius: 10px; overflow: hidden;
+  background: var(--desk-border-strong);
+}
+.desk-mb-2, .desk-mb-3, .desk-mb-4 { grid-template-columns: 1fr 1fr; }
+.desk-mb-3 .desk-mb-tile:first-child { grid-row: 1 / span 2; aspect-ratio: auto; }
+.desk-mb-tile {
+  position: relative; display: block;
+  margin: 0; padding: 0; border: 0;
+  min-height: 96px; background: var(--desk-card-sub);
+  overflow: hidden; cursor: zoom-in;
+  -webkit-appearance: none; appearance: none;
+  text-align: inherit; color: inherit; font: inherit;
+}
+.desk-mb-2 .desk-mb-tile, .desk-mb-3 .desk-mb-tile, .desk-mb-4 .desk-mb-tile { aspect-ratio: 1 / 1; }
+.desk-mb-tile img { width: 100%; height: 100%; object-fit: cover; display: block; }
+.desk-mb-1 .desk-mb-tile { max-height: 380px; }
+.desk-mb-1 .desk-mb-tile img { max-height: 380px; }
+.desk-mb-tile.is-expired { cursor: default; }
+.desk-mb-tile:focus-visible { outline: 2px solid var(--desk-ink); outline-offset: -2px; }
+.desk-mb-gone {
+  display: flex; align-items: center; justify-content: center; gap: 5px;
+  width: 100%; height: 100%; min-height: 96px; padding: 0 10px; box-sizing: border-box;
+  background: repeating-linear-gradient(135deg, #F6F7F9, #F6F7F9 6px, #ECEEF1 6px, #ECEEF1 12px);
+  color: var(--desk-hint); font-size: 10px; font-weight: 700;
+  letter-spacing: .04em; text-transform: uppercase; text-align: center;
+}
+.desk-mb-pending {
+  display: flex; align-items: center; justify-content: center;
+  width: 100%; height: 100%; min-height: 96px;
+  color: var(--desk-hint); background: var(--desk-card-sub);
+}
+
+/* clock + tick set, bottom-right of the last tile */
+.desk-mb-receipt {
+  position: absolute; right: 6px; bottom: 6px;
+  display: inline-flex; align-items: center; gap: 5px;
+  padding: 3px 8px; border-radius: 999px;
+  background: rgba(17, 24, 39, 0.62); color: #FFFFFF;
+  pointer-events: none;
+}
+.desk-mb-time { font-family: var(--mono); font-size: 10px; letter-spacing: .02em; }
+.desk-mb-word { font-size: 9.5px; font-weight: 700; letter-spacing: .04em; text-transform: uppercase; }
+.desk-mb-receipt .desk-tick { display: block; }
+
+/* "+N" tile standing in for photos beyond the fourth */
+.desk-mb-more {
+  position: absolute; inset: 0;
+  display: flex; align-items: center; justify-content: center;
+  background: rgba(17, 24, 39, 0.45); color: #FFFFFF;
+  font-size: 18px; font-weight: 600; pointer-events: none;
+}
+
+/* viewer chrome: close, batch navigation, counter */
+.desk-lb-x {
+  position: absolute; top: 18px; right: 20px;
+  width: 36px; height: 36px; border: 0; border-radius: 9px;
+  background: rgba(255, 255, 255, 0.14); color: #FFFFFF;
+  font-size: 20px; line-height: 1; cursor: pointer;
+}
+.desk-lb-nav {
+  position: absolute; top: 50%; transform: translateY(-50%);
+  width: 40px; height: 56px; border: 0; border-radius: 10px;
+  background: rgba(255, 255, 255, 0.12); color: #FFFFFF;
+  font-size: 26px; line-height: 1; cursor: pointer;
+}
+.desk-lb-nav.prev { left: 14px; }
+.desk-lb-nav.next { right: 14px; }
+.desk-lb-x:hover, .desk-lb-nav:hover { background: rgba(255, 255, 255, 0.26); }
+.desk-lb-count {
+  position: absolute; bottom: 22px; left: 50%; transform: translateX(-50%);
+  font-family: var(--mono); font-size: 11px;
+  color: rgba(255, 255, 255, 0.85); letter-spacing: .08em;
+}
+
 /* Respect the OS-level motion preference */
 @media (prefers-reduced-motion: reduce) {
   *, *::before, *::after {

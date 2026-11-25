@@ -31,7 +31,7 @@
     expandedOrders: {},      // order-history rows opened by order id (per ticket)
     pendingContext: null,    // context payload that landed before the core did
     settings: { teams: {}, canned: [], templates: {}, sla: {}, cost: {}, portalRouting: {} },
-    composer: { mode: 'reply', text: '' },
+    composer: { mode: 'reply', text: '', media: [] },
     orderExpanded: true,
     customerExpanded: true,
     pollInterval: null,
@@ -141,6 +141,7 @@
     chart: '<svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 3v18h18"/><path d="m19 9-5 5-4-4-3 3"/></svg>',
     chat: '<svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></svg>',
     image: '<svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="18" height="18" rx="2"/><circle cx="9" cy="9" r="2"/><path d="m21 15-3.1-3.1a2 2 0 0 0-2.8 0L6 21"/></svg>',
+    clip: '<svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m21.44 11.05-9.19 9.19a6 6 0 0 1-8.49-8.49l8.57-8.57A4 4 0 1 1 18 8.84l-8.59 8.57a2 2 0 0 1-2.83-2.83l8.49-8.48"/></svg>',
     search: '<svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><circle cx="11" cy="11" r="8"/><path d="m21 21-4.3-4.3"/></svg>',
     lock: '<svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="11" width="18" height="11" rx="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/></svg>',
     bulb: '<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M9 18h6"/><path d="M10 22h4"/><path d="M12 2a7 7 0 0 0-4 12.7c.6.5 1 1.4 1 2.3h6c0-.9.4-1.8 1-2.3A7 7 0 0 0 12 2z"/></svg>',
@@ -156,6 +157,10 @@
     if (S.pollInterval) {
       clearInterval(S.pollInterval);
       S.pollInterval = null;
+    }
+    if (S.detailPollInterval) {
+      clearInterval(S.detailPollInterval);
+      S.detailPollInterval = null;
     }
     localStorage.removeItem(TOKEN_KEY);
     localStorage.removeItem(USER_KEY);
@@ -201,6 +206,10 @@
       clearInterval(S.pollInterval);
       S.pollInterval = null;
     }
+    if (S.detailPollInterval) {
+      clearInterval(S.detailPollInterval);
+      S.detailPollInterval = null;
+    }
     S.role = jwtRole(S.token);
     loadSettings().then(function () {
       renderShell();
@@ -210,6 +219,17 @@
       S.pollInterval = setInterval(function () {
         if (!document.hidden && S.token) refreshStats();
       }, 30000);
+      // Thread freshness: while an open ticket is on screen, poll it every 15s
+      // so new customer messages and media inline-status land without a reload.
+      // Nothing re-renders unless the thread/media signature actually changes,
+      // so the agent's in-progress draft is never interrupted.
+      S.detailPollInterval = setInterval(function () {
+        if (document.hidden || !S.token) return;
+        if (!S.selectedId || !S.detail || !S.detail.ticket) return;
+        var t = S.detail.ticket;
+        if (t.status === 'closed') return;
+        refreshThread(t.id);
+      }, 15000);
     });
   }
   function refreshAll() { refreshStats(); loadTickets(); }
@@ -267,7 +287,7 @@
     api('/api/support/admin/tickets/' + id).then(function (d) {
       if (S.selectedId !== id) return;
       S.detail = d;
-      S.composer = { mode: 'reply', text: '' };
+      S.composer = { mode: 'reply', text: '', media: [] };
       renderDetail();
       // Context landed before the core did \u2014 merge it now.
       if (S.pendingContext && S.pendingContext.id === id) applyContext(S.pendingContext.data);
@@ -493,6 +513,10 @@
       +   '</div>'
       +   '<div class="desk-context-col" id="DeskContextCol">' + contextColHtml() + '</div>'
       + '</div>';
+
+    // Hydrate the composer's pending-upload chips (they live in S.composer.media,
+    // rebuilt here so a poll/re-render never loses them).
+    renderComposerMedia();
 
     // Fixed app shell: panes scroll internally, so land the thread on the
     // newest message and the detail/rail regions on top when a ticket opens.
@@ -878,6 +902,7 @@
   // ── 4. Unified Conversation & Issue Details Card (Interactive Dialogue Look) ──
   function issueAndConversationCard(d, t) {
     var images = t.images || [];
+    MEDIA_GROUPS = [];
     var imagesHtml = images.length ? (
       '<div class="desk-proof-section">'
       + '<div class="desk-section-subhead">' + IC.image + ' Proof &amp; Attachments <span class="desk-muted">(' + images.length + ' image' + (images.length > 1 ? 's' : '') + ')</span></div>'
@@ -894,6 +919,39 @@
     var rawThread = Array.isArray(t.thread) ? t.thread : [];
     var notes = Array.isArray(t.notes) ? t.notes : [];
 
+    // Inline media from the new support_media lifecycle (t.media, hydrated
+    // server-side). Each thread entry carries its own media_ids list, stamped
+    // when the message went out — that is the authoritative anchor. The numeric
+    // thread_entry_idx is only a fallback for rows written before entries were
+    // stamped. Anything with no home belongs to the opening problem statement.
+    var mediaList = Array.isArray(t.media) ? t.media : [];
+    var mediaById = {};
+    mediaList.forEach(function (md) { mediaById[md.id] = md; });
+    var anchored = rawThread.map(function () { return []; });
+    var claimedMedia = {};
+    rawThread.forEach(function (m, i) {
+      var ids = Array.isArray(m.media_ids) ? m.media_ids : [];
+      ids.forEach(function (id) {
+        var md = mediaById[id];
+        if (md && !claimedMedia[md.id]) { anchored[i].push(md); claimedMedia[md.id] = true; }
+      });
+    });
+    var mediaLoose = [];
+    mediaList.forEach(function (md) {
+      if (claimedMedia[md.id]) return;
+      var idx = md.thread_entry_idx;
+      if (idx != null && idx >= 0 && idx < anchored.length) {
+        anchored[idx].push(md);
+        claimedMedia[md.id] = true;
+      }
+    });
+    mediaList.forEach(function (md) {
+      if (claimedMedia[md.id]) return;
+      // unanchored rows (raise-form photos from before stamping, inbound media
+      // the router never placed on an entry) read as part of the first message
+      mediaLoose.push(md);
+    });
+
     var custName = t.customer_name || 'Customer';
     var custInitials = custName.split(' ').map(function (w) { return w[0]; }).filter(Boolean).slice(0, 2).join('').toUpperCase() || 'C';
 
@@ -907,6 +965,20 @@
     var hasProblemInThread = rawThread.some(function (m) {
       return m.role === 'customer' && m.text && m.text.trim() === (t.message || '').trim();
     });
+    // The problem statement renders as conversation starter #1, so the thread
+    // entry duplicating it is folded away — and its photos move with it.
+    var problemIdx = -1;
+    if (hasProblemInThread) {
+      for (var pi = 0; pi < rawThread.length; pi++) {
+        var pm = rawThread[pi];
+        if (pm && pm.kind !== 'event' && pm.role === 'customer' && pm.text
+          && pm.text.trim() === (t.message || '').trim()) { problemIdx = pi; break; }
+      }
+    }
+    if (problemIdx >= 0 && anchored[problemIdx] && anchored[problemIdx].length) {
+      mediaLoose = mediaLoose.concat(anchored[problemIdx]);
+      anchored[problemIdx] = [];
+    }
 
     var problemText = t.message ? esc(t.message) : '<em>No issue description message recorded.</em>';
     var problemMeta = '';
@@ -922,6 +994,7 @@
     if (imagesHtml) {
       problemMeta += imagesHtml;
     }
+    problemMeta += bubbleMediaHtml(mediaLoose, '', false);
 
     // Always render initial customer problem as the conversation starter
     threadHtml += '<div class="desk-msg-row cust-row">'
@@ -942,13 +1015,12 @@
       + '</div>';
 
     // Follow-up thread messages
-    rawThread.forEach(function (m) {
-      if (hasProblemInThread && m.role === 'customer' && m.text && m.text.trim() === (t.message || '').trim()) {
-        return;
-      }
+    rawThread.forEach(function (m, idx) {
+      if (idx === problemIdx) return;
       if (m.kind === 'event') {
         threadHtml += '<div class="desk-ev"><span class="ev-dot">&bull;</span> ' + esc(m.text) + ' &middot; ' + fmtTime(m.at) + '</div>';
       } else if (m.role === 'customer') {
+        var custMedia = anchored[idx] || [];
         threadHtml += '<div class="desk-msg-row cust-row">'
           + '<div class="desk-chat-avatar cust" title="' + esc(custName) + '">' + esc(custInitials) + '</div>'
           + '<div class="desk-msg-content">'
@@ -957,14 +1029,16 @@
           +     '<span class="sender-pill">Customer</span>'
           +     '<span class="sender-time">' + fmtTime(m.at) + '</span>'
           +   '</div>'
-          +   '<div class="desk-msg-bubble cust-bubble">'
-          +     '<div class="bubble-text">' + esc(m.text) + '</div>'
+          +   '<div class="desk-msg-bubble cust-bubble' + (custMedia.length ? ' desk-bubble-photos' : '') + '">'
+          +     (String(m.text || '').trim() ? '<div class="bubble-text">' + esc(m.text) + '</div>' : '')
+          +     bubbleMediaHtml(custMedia, fmtTime(m.at), false)
           +   '</div>'
           + '</div>'
           + '</div>';
       } else {
         var agentName = esc(m.agentId || 'Support Team');
         var agentInitials = agentName.split(' ').map(function (w) { return w[0]; }).filter(Boolean).slice(0, 2).join('').toUpperCase() || 'ST';
+        var agentMedia = anchored[idx] || [];
         threadHtml += '<div class="desk-msg-row agent-row">'
           + '<div class="desk-msg-content agent-content">'
           +   '<div class="desk-msg-sender agent-sender">'
@@ -973,8 +1047,9 @@
           +     '<span class="sender-pill agent-pill">Support Team</span>'
           +     '<span class="sender-name">' + agentName + '</span>'
           +   '</div>'
-          +   '<div class="desk-msg-bubble agent-bubble">'
-          +     '<div class="bubble-text">' + esc(m.text) + '</div>'
+          +   '<div class="desk-msg-bubble agent-bubble' + (agentMedia.length ? ' desk-bubble-photos' : '') + '">'
+          +     (String(m.text || '').trim() ? '<div class="bubble-text">' + esc(m.text) + '</div>' : '')
+          +     bubbleMediaHtml(agentMedia, fmtTime(m.at), true)
           +   '</div>'
           + '</div>'
           + '<div class="desk-chat-avatar agent" title="' + agentName + '">' + esc(agentInitials) + '</div>'
@@ -1023,8 +1098,10 @@
         +   (canned.length ? '<select class="desk-select desk-canned-select" onchange="DESK.useCanned(this.value)"><option value="">&plusmn; Insert Saved Reply\u2026</option>'
         +     canned.map(function (c) { return '<option value="' + esc(c.key) + '">' + esc(c.label) + '</option>'; }).join('') + '</select>' : '')
         + '</div>'
+        + '<div class="desk-composer-media" id="DeskComposerMedia"></div>'
         + '<textarea id="DeskMsg" class="desk-composer-textarea" placeholder="' + esc(placeholder) + '" oninput="DESK.setMsg(this.value)">' + esc(S.composer.text) + '</textarea>'
         + '<div class="desk-composer-actions">'
+        +   (S.composer.mode !== 'note' ? '<label class="desk-attach" title="Attach up to 5 images (JPG, PNG, WebP, HEIC)">' + IC.clip + '<span class="desk-attach-txt">Photos</span><input type="file" accept="image/jpeg,image/png,image/webp,image/heic" multiple onchange="DESK.onPickFiles(this)"></label>' : '')
         +   '<button class="desk-btn desk-btn-ghost" onclick="DESK.openResolve()">Resolve &amp; Close Ticket</button>'
         +   '<button class="desk-btn' + (S.composer.mode === 'note' ? ' desk-btn-note' : '') + '" onclick="DESK.sendComposer()">'
         +     (S.composer.mode === 'note' ? 'Add Internal Note' : (S.composer.mode === 'ask' ? 'Send Question' : 'Send Reply'))
@@ -1121,7 +1198,7 @@
 
 
   // ---------- composer actions ----------
-  function setMode(m) { S.composer.mode = m; S.composer.text = ''; renderDetail(); }
+  function setMode(m) { S.composer.mode = m; S.composer.text = ''; if (m === 'note') S.composer.media = []; renderDetail(); }
   function setMsg(v) { S.composer.text = v; }
   function useCanned(key) {
     var c = S.settings.canned.filter(function (x) { return x.key === key; })[0];
@@ -1139,15 +1216,289 @@
   function sendComposer() {
     var t = S.detail.ticket;
     var text = S.composer.text.trim();
-    if (!text) { toast('Message is empty', true); return; }
+    var media = S.composer.media || [];
+    var ready = media.filter(function (m) { return m.status === 'uploaded' && m.media_id; });
+    var busy = media.filter(function (m) { return m.status === 'uploading' || m.status === 'pending'; });
+    var failed = media.filter(function (m) { return m.status === 'failed'; });
+    var canAttach = S.composer.mode !== 'note';
+    if (!text && !(canAttach && ready.length)) { toast('Message is empty', true); return; }
+    if (busy.length) { toast('Wait for the image uploads to finish', true); return; }
+    if (canAttach && failed.length) { toast('Remove or retry the failed images first', true); return; }
     var path = S.composer.mode === 'note' ? '/note' : (S.composer.mode === 'ask' ? '/ask' : '/reply');
-    api('/api/support/admin/tickets/' + t.id + path, { method: 'POST', body: { text: text } })
+    var body = { text: text };
+    if (canAttach && ready.length) body.media_ids = ready.map(function (m) { return m.media_id; });
+    api('/api/support/admin/tickets/' + t.id + path, { method: 'POST', body: body })
       .then(function () {
         S.composer.text = '';
+        S.composer.media = [];
         loadDetail(t.id);
         refreshStats();
       })
       .catch(function (e) { toast(e.message, true); });
+  }
+
+  // ---------- composer media (signed Cloudinary direct upload) ----------
+  var MEDIA_MAX = 5;
+  var MEDIA_MAX_BYTES = 10 * 1024 * 1024;
+  var MEDIA_TYPES = /^image\/(jpeg|jpg|png|webp|heic|heif)$/i;
+
+  function newMediaKey() { return 'm' + Date.now().toString(36) + Math.random().toString(36).slice(2, 7); }
+
+  // Browser -> Cloudinary direct upload with live byte progress.
+  function cloudinaryUpload(intent, file, onProgress) {
+    return new Promise(function (resolve, reject) {
+      var up = (intent && intent.upload_params) || {};
+      if (!up.cloud_name || !up.signature) { reject(new Error('Upload was not authorised')); return; }
+      var url = 'https://api.cloudinary.com/v1_1/' + encodeURIComponent(up.cloud_name) + '/image/upload';
+      var fd = new FormData();
+      fd.append('file', file);
+      fd.append('api_key', up.api_key);
+      fd.append('timestamp', up.timestamp);
+      fd.append('signature', up.signature);
+      fd.append('public_id', up.public_id);
+      if (up.eager) fd.append('eager', up.eager);
+      if (up.transformation) fd.append('transformation', up.transformation);
+      var xhr = new XMLHttpRequest();
+      xhr.open('POST', url, true);
+      if (xhr.upload) {
+        xhr.upload.onprogress = function (e) {
+          if (e.lengthComputable && onProgress) onProgress(Math.round((e.loaded / e.total) * 100));
+        };
+      }
+      xhr.onload = function () {
+        var data = {};
+        try { data = JSON.parse(xhr.responseText || '{}'); } catch (err) { data = {}; }
+        if (xhr.status >= 200 && xhr.status < 300 && !data.error) resolve(data);
+        else reject(new Error((data.error && data.error.message) || ('Upload failed (' + xhr.status + ')')));
+      };
+      xhr.onerror = function () { reject(new Error('Network error during upload')); };
+      xhr.send(fd);
+    });
+  }
+
+  // Upload the already-intented row, then confirm it server-side.
+  function runMediaUpload(m, file, intent) {
+    m.status = 'uploading'; m.progress = 0; renderComposerMedia();
+    cloudinaryUpload(intent, file, function (p) { m.progress = p; renderComposerMedia(); })
+      .then(function () {
+        return api('/api/support/admin/media/' + m.media_id + '/finalize', { method: 'POST', body: {} });
+      })
+      .then(function (r) {
+        m.status = 'uploaded'; m.progress = 100;
+        m.thumb_url = r && r.media && r.media.thumb_url;
+        m.full_url = r && r.media && r.media.full_url;
+        m.error = null;
+        renderComposerMedia();
+      })
+      .catch(function (e) {
+        m.status = 'failed'; m.error = (e && e.message) || 'Upload failed';
+        renderComposerMedia();
+        toast('Image upload failed: ' + m.error, true);
+      });
+  }
+
+  function startMediaUpload(m, file) {
+    var ticketNumber = (S.detail && S.detail.ticket && S.detail.ticket.ticket_number) || null;
+    m.status = 'pending'; m.progress = 0; renderComposerMedia();
+    api('/api/support/admin/media/intent', { method: 'POST', body: { ticket_ref: ticketNumber } })
+      .then(function (intent) {
+        m.media_id = intent.media_id;
+        m.public_id = intent.public_id;
+        runMediaUpload(m, file, intent);
+      })
+      .catch(function (e) {
+        m.status = 'failed'; m.error = (e && e.message) || 'Could not start upload';
+        renderComposerMedia();
+        toast(m.error, true);
+      });
+  }
+
+  function onPickFiles(input) {
+    var files = Array.prototype.slice.call((input && input.files) || []);
+    if (!files.length) return;
+    if (S.composer.mode === 'note') { toast('Photos can\'t be added to internal notes', true); input.value = ''; return; }
+    if (!S.composer.media) S.composer.media = [];
+    var room = Math.max(0, MEDIA_MAX - S.composer.media.length);
+    if (files.length > room) toast('Up to ' + MEDIA_MAX + ' images per message', true);
+    files.slice(0, room).forEach(function (file) {
+      if (!MEDIA_TYPES.test(file.type || '')) { toast((file.name || 'File') + ' isn\'t a supported image', true); return; }
+      if (file.size > MEDIA_MAX_BYTES) { toast((file.name || 'File') + ' is over 10 MB', true); return; }
+      var entry = { key: newMediaKey(), name: file.name || 'image', status: 'pending', progress: 0, media_id: null, file: file };
+      S.composer.media.push(entry);
+      startMediaUpload(entry, file);
+    });
+    renderComposerMedia();
+    input.value = '';
+  }
+
+  function removeMediaChip(key) {
+    S.composer.media = (S.composer.media || []).filter(function (m) { return m.key !== key; });
+    renderComposerMedia();
+  }
+
+  function retryMediaChip(key) {
+    var m = (S.composer.media || []).filter(function (x) { return x.key === key; })[0];
+    if (!m || !m.file) { toast('Re-select the image to retry', true); return; }
+    if (m.media_id) {
+      api('/api/support/admin/media/' + m.media_id + '/retry', { method: 'POST', body: {} })
+        .then(function (fresh) { m.status = 'uploading'; m.progress = 0; renderComposerMedia(); runMediaUpload(m, m.file, fresh); })
+        .catch(function (e) { toast((e && e.message) || 'Retry failed', true); });
+    } else {
+      startMediaUpload(m, m.file);
+    }
+  }
+
+  function composerMediaHtml() {
+    var media = S.composer.media || [];
+    if (!media.length) return '';
+    return media.map(function (m) {
+      var label = m.status === 'uploaded' ? 'Ready' :
+        m.status === 'uploading' ? (m.progress + '%') :
+        m.status === 'failed' ? 'Failed' : 'Queued\u2026';
+      var thumb = m.thumb_url ? '<img src="' + esc(m.thumb_url) + '" alt="">' : '<span class="desk-chip-spin"></span>';
+      var prog = m.status === 'uploading' ? '<i class="desk-chip-fill" style="width:' + (m.progress || 0) + '%"></i>' : '';
+      var retry = m.status === 'failed' ? '<button class="desk-chip-retry" onclick="DESK.retryMediaChip(\'' + m.key + '\')">Retry</button>' : '';
+      return '<div class="desk-media-chip st-' + m.status + '" title="' + esc(m.error || m.name) + '">'
+        + '<span class="desk-chip-thumb">' + thumb + '</span>'
+        + '<span class="desk-chip-body">'
+        +   '<span class="desk-chip-name">' + esc(m.name) + '</span>'
+        +   '<span class="desk-chip-bar">' + prog + '</span>'
+        + '</span>'
+        + '<span class="desk-chip-status">' + label + '</span>'
+        + retry
+        + '<button class="desk-chip-x" title="Remove" onclick="DESK.removeMediaChip(\'' + m.key + '\')">&times;</button>'
+        + '</div>';
+    }).join('');
+  }
+
+  function renderComposerMedia() {
+    var el = $('DeskComposerMedia');
+    if (el) el.innerHTML = composerMediaHtml();
+  }
+
+  // ---------- inline thread media (WhatsApp-style photo bubbles) ----------
+  // Status ladder: Uploading\u2026 \u2192 Sending\u2026 \u2192 Sent \u2192 Delivered/Seen,
+  // with Failed surfaced as soon as any leg reports it.
+  function mediaStatusLabel(md) {
+    if (md.expired) return 'Expired';
+    var us = md.upload_status, ds = md.delivery_status;
+    if (us === 'failed') return 'Failed';
+    if (us === 'sending') return 'Sending\u2026';
+    if (ds === 'read') return 'Seen';
+    if (ds === 'delivered') return 'Delivered';
+    if (us === 'seen') return 'Seen';
+    if (us === 'sent') return 'Sent';
+    if (us === 'uploaded') return 'Ready';
+    if (us === 'uploading') return 'Uploading\u2026';
+    if (us === 'pending') return 'Pending';
+    return us || '';
+  }
+
+  // One tick set per message, not per photo: the least advanced state in the
+  // group wins, so a half-finished batch never lies to the agent.
+  var STATUS_RANK = { failed: 0, pending: 1, uploading: 1, uploaded: 2, sending: 2, sent: 3, expired: 3, delivered: 4, read: 5, seen: 5 };
+  var I_TICK1 = '<svg class="desk-tick" viewBox="0 0 16 11" width="13" height="10" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><path d="M1.6 6l3.3 3.3L13 1.4"/></svg>';
+  var I_TICK2 = '<svg class="desk-tick" viewBox="0 0 23 11" width="18" height="10" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><path d="M1.6 6l3.3 3.3L13 1.4"/><path d="M10.4 9.3l3.3 3.3L22 4.7"/></svg>';
+
+  function groupRank(arr) {
+    var worst = 99;
+    arr.forEach(function (md) {
+      var r = STATUS_RANK[md.expired ? 'expired' : (md.upload_status || '')];
+      if (r == null) r = 99;
+      if (r < worst) worst = r;
+    });
+    return worst;
+  }
+
+  // Clock + ticks ride a dark scrim in the bottom-right of the LAST tile, so a
+  // four-photo message reads as one message instead of four statuses. Ticks only
+  // describe photos the agent sent; incoming photos show the clock alone.
+  function groupReceiptHtml(arr, timeText, own) {
+    var r = groupRank(arr);
+    var mark = '';
+    if (own) {
+      mark = r === 0 ? '<span class="desk-mb-word">Failed</span>'
+        : r === 1 ? '<span class="desk-mb-word">Uploading\u2026</span>'
+        : r === 2 ? '<span class="desk-mb-word">Sending\u2026</span>'
+        : r >= 4 ? I_TICK2 : I_TICK1;
+    } else if (r === 0) {
+      mark = '<span class="desk-mb-word">Unavailable</span>';
+    }
+    if (!timeText && !mark) return '';
+    return '<span class="desk-mb-receipt">'
+      + (timeText ? '<span class="desk-mb-time">' + esc(timeText) + '</span>' : '')
+      + mark + '</span>';
+  }
+
+  function mediaTileHtml(md, gid, pos, isLast, hidden, receipt) {
+    var inner;
+    if (md.expired) {
+      // the retention cron destroyed the asset \u2014 the slot stays for the audit trail
+      inner = '<span class="desk-mb-gone">' + IC.image + ' Photo removed</span>';
+    } else if (md.thumb_url || md.full_url) {
+      var w = Number(md.width) || 0, h = Number(md.height) || 0;
+      // aspect comes from the stored metadata so the bubble never jumps on load
+      var ratio = (w > 0 && h > 0) ? ' style="aspect-ratio:' + w + '/' + h + '"' : '';
+      // the thread carries the lighter preview transform; the viewer loads full res
+      inner = '<img src="' + esc(md.thumb_url || md.full_url) + '" alt="photo" loading="lazy" decoding="async"' + ratio + '>';
+    } else {
+      inner = '<span class="desk-mb-pending">' + IC.image + '</span>';
+    }
+    var title = md.expired ? 'Photo expired' : esc(mediaStatusLabel(md));
+    var more = (isLast && hidden > 0) ? '<span class="desk-mb-more">+' + hidden + '</span>' : '';
+    return '<button type="button" class="desk-mb-tile' + (md.expired ? ' is-expired' : '') + '"'
+      + ' title="' + title + '"' + (md.expired ? ' disabled' : ' onclick="DESK.openViewer(' + gid + ',' + pos + ')"') + '>'
+      + inner + more + (isLast ? receipt : '')
+      + '</button>';
+  }
+
+  // 1 = full-bleed photo, 2 = side by side, 3 = hero + stack, 4+ = 2x2 with a
+  // "+N" tile standing in for the remainder.
+  function bubbleMediaHtml(arr, timeText, own) {
+    if (!arr || !arr.length) return '';
+    var urls = arr.map(function (md) { return md.expired ? '' : (md.full_url || md.thumb_url || ''); });
+    var gid = registerMediaGroup(urls);
+    var receipt = groupReceiptHtml(arr, timeText, own);
+    var n = arr.length;
+    var cls = n === 1 ? ' desk-mb-1' : n === 2 ? ' desk-mb-2' : n === 3 ? ' desk-mb-3' : ' desk-mb-4';
+    var shown = n <= 4 ? arr : arr.slice(0, 4);
+    var hidden = n <= 4 ? 0 : n - 4;
+    return '<div class="desk-mb' + cls + '" role="group" aria-label="' + n + ' photo' + (n > 1 ? 's' : '') + '">'
+      + shown.map(function (md, i) {
+          var isLast = i === shown.length - 1;
+          return mediaTileHtml(md, gid, i, isLast, isLast ? hidden : 0, receipt);
+        }).join('')
+      + '</div>';
+  }
+
+  // ---------- open-ticket thread poll ----------
+  function threadSig(t) {
+    if (!t) return '';
+    var th = t.thread || [];
+    var md = t.media || [];
+    return th.length + '|' + (t.status || '') + '|' + md.map(function (m) {
+      return m.id + ':' + (m.upload_status || '') + ':' + (m.delivery_status || '');
+    }).join(',');
+  }
+
+  function refreshThread(id) {
+    var prevSig = S.detail && S.detail.ticket ? threadSig(S.detail.ticket) : '';
+    api('/api/support/admin/tickets/' + id).then(function (d) {
+      if (!S.detail || !S.detail.ticket || S.detail.ticket.id !== id) return;
+      var newSig = threadSig(d.ticket);
+      if (newSig === prevSig) return;
+      // Merge only the thread-bearing fields so the lazy context column and
+      // the agent's composer draft survive the refresh.
+      S.detail.ticket = d.ticket;
+      if ('sla' in d) S.detail.sla = d.sla;
+      var focus = document.activeElement && document.activeElement.id === 'DeskMsg';
+      var caret = focus ? (document.getElementById('DeskMsg') || {}).selectionStart : null;
+      renderDetail();
+      if (focus) {
+        var ta = $('DeskMsg');
+        if (ta) { ta.focus(); try { if (caret != null) ta.setSelectionRange(caret, caret); } catch (e) {} }
+      }
+    }).catch(function () { /* transient — next tick retries */ });
   }
   function patchTicket(patch) {
     var t = S.detail.ticket;
@@ -2182,18 +2533,51 @@
       .then(function (r) { toast('Sync done: ' + (r.customers || 0) + ' customers processed'); })
       .catch(function (e) { toast(e.message, true); });
   }
-  function lightbox(url) {
+  // ---------- fullscreen photo viewer (tap a photo, page through the batch) ----------
+  // Groups are registered while the thread renders, so the registry resets with
+  // every conversation re-render and can never outgrow one ticket.
+  var MEDIA_GROUPS = [];
+  function registerMediaGroup(urls) {
+    MEDIA_GROUPS.push(urls.filter(Boolean));
+    return MEDIA_GROUPS.length - 1;
+  }
+
+  function openViewer(gid, pos) {
+    var group = (MEDIA_GROUPS[gid] || []);
+    if (!group.length) return;
+    var i = Math.max(0, Math.min(group.length - 1, Number(pos) || 0));
     var lb = document.createElement('div');
     lb.className = 'desk-lightbox';
-    lb.innerHTML = '<img src="' + esc(url) + '">';
     function closeLb() {
       document.removeEventListener('keydown', onLbKey);
-      if (lb) { lb.remove(); lb = null; }
+      lb.remove();
     }
-    function onLbKey(e) { if (e.key === 'Escape') closeLb(); }
-    lb.onclick = closeLb;
+    function onLbKey(e) {
+      if (e.key === 'Escape') { closeLb(); }
+      else if (group.length > 1 && e.key === 'ArrowRight') { i = (i + 1) % group.length; paint(); }
+      else if (group.length > 1 && e.key === 'ArrowLeft') { i = (i - 1 + group.length) % group.length; paint(); }
+    }
+    function paint() {
+      lb.innerHTML = '<img src="' + esc(group[i]) + '" alt="photo">'
+        + '<button class="desk-lb-x" aria-label="Close">&times;</button>'
+        + (group.length > 1 ? '<button class="desk-lb-nav prev" aria-label="Previous photo">&#8249;</button>'
+          + '<button class="desk-lb-nav next" aria-label="Next photo">&#8250;</button>'
+          + '<div class="desk-lb-count">' + (i + 1) + ' / ' + group.length + '</div>' : '');
+      var x = lb.querySelector('.desk-lb-x');
+      if (x) x.onclick = function (e) { e.stopPropagation(); closeLb(); };
+      var p = lb.querySelector('.desk-lb-nav.prev');
+      if (p) p.onclick = function (e) { e.stopPropagation(); i = (i - 1 + group.length) % group.length; paint(); };
+      var nx = lb.querySelector('.desk-lb-nav.next');
+      if (nx) nx.onclick = function (e) { e.stopPropagation(); i = (i + 1) % group.length; paint(); };
+    }
+    lb.onclick = closeLb;   // click the backdrop to dismiss
     document.addEventListener('keydown', onLbKey);
+    paint();
     document.body.appendChild(lb);
+  }
+
+  function lightbox(url) {
+    openViewer(registerMediaGroup([url]), 0);
   }
 
   // ============================================================
@@ -2613,6 +2997,7 @@
     toggleOrderHistory: toggleOrderHistory,
     toggleOrderRow: toggleOrderRow, reloadContext: reloadContext,
     setMode: setMode, setMsg: setMsg, useCanned: useCanned, sendComposer: sendComposer,
+    onPickFiles: onPickFiles, removeMediaChip: removeMediaChip, retryMediaChip: retryMediaChip,
     openResolve: openResolve, pickResolution: pickResolution, confirmResolve: confirmResolve,
     agentReopen: agentReopen, approve: approve, decline: decline,
     openSettings: openSettings, setTab: setTab, saveSla: saveSla, saveTeams: saveTeams,
@@ -2628,7 +3013,7 @@
     accSelLevel: accSelLevel, accSelExpiry: accSelExpiry, accSelResync: accSelResync, accSelAnnounce: accSelAnnounce, accCleanup: accCleanup,
     accExport: accExport, loadAccessRoster: loadAccessRoster, accListDormant: accListDormant, accListView: accListView,
     accListSearch: accListSearch,
-    closeModal: closeModal, syncOrders: syncOrders, lightbox: lightbox,
+    closeModal: closeModal, syncOrders: syncOrders, lightbox: lightbox, openViewer: openViewer,
     // portal engine tabs
     copyText: copyText, portalCreate: portalCreate, portalActive: portalActive, portalMax: portalMax,
     portalShiftEdit: portalShiftEdit, portalPass: portalPass, portalSplit: portalSplit,

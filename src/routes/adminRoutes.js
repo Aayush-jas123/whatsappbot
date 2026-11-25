@@ -2059,6 +2059,11 @@ router.put('/support-tickets/:id', verifyToken, async (req, res) => {
             } else if (status === 'resolved' || status === 'closed') {
                 // Resolving closes the follow-up loop — drop any pending reminder
                 updates.push('follow_up_at = NULL', 'follow_up_note = NULL');
+                // Canonical closure timestamp — the 45-day support-media
+                // retention timer reads resolution_at (was never stamped here).
+                updates.push('resolution_at = CURRENT_TIMESTAMP');
+            } else if (status === 'open') {
+                updates.push('resolution_at = NULL');
             }
         }
 
@@ -2073,6 +2078,22 @@ router.put('/support-tickets/:id', verifyToken, async (req, res) => {
             `UPDATE support_tickets SET ${updates.join(', ')} WHERE id = ?`,
             params
         );
+
+        // Drive the support-media retention timer off the new status.
+        if (status) {
+            try {
+                const supportMedia = require('../services/supportMediaService');
+                const tn = await dbAdapter.query('SELECT ticket_number, resolution_at FROM support_tickets WHERE id = ?', [id]);
+                const ticketNumber = tn?.[0]?.ticket_number;
+                if (status === 'resolved' || status === 'closed') {
+                    await supportMedia.armRetention(ticketNumber, tn?.[0]?.resolution_at);
+                } else if (status === 'open' || status === 'follow_up') {
+                    await supportMedia.clearRetention(ticketNumber);
+                }
+            } catch (retErr) {
+                console.error('[Admin] retention timer update failed:', retErr.message);
+            }
+        }
         
         // Invalidate ticket cache when ticket is updated
         clearAllCaches('tickets');

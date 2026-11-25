@@ -341,13 +341,40 @@ async function processIncomingMedia(mediaObj, messageType) {
         const uniqueId = crypto.randomBytes(8).toString('hex');
         const storagePath = `${typeFolder(messageType)}/${dateFolder}/${uniqueId}${ext}`;
 
-        // 5. Upload to Supabase Storage
-        const publicUrl = await uploadFileToStorage(finalPath, storagePath, finalMime);
+        // 5. Upload to storage.
+        //    IMAGES go to the dedicated support Cloudinary (matches the
+        //    browser direct-upload path so retention can purge them).
+        //    Everything else, or any Cloudinary failure, falls back to the
+        //    existing Supabase Storage flow.
+        //    (thumbUrl was already declared above for the Supabase path.)
+        let publicUrl = null;
+        let cloudinaryPublicId = null;
+        if (isImage) {
+            try {
+                const supportCloudinary = require('./supportCloudinaryService');
+                if (supportCloudinary.isConfigured()) {
+                    const channel = messageType === 'image' ? 'whatsapp' : 'whatsapp';
+                    const publicId = supportCloudinary.makePublicId(channel, null);
+                    // Upload the optimized file; Cloudinary's eager transform
+                    // yields the chat thumbnail.
+                    const upl = await supportCloudinary.uploadFromPath(finalPath, publicId);
+                    cloudinaryPublicId = upl.public_id;
+                    publicUrl = upl.secure_url;
+                    thumbUrl = upl.thumbnail_url || publicUrl;
+                }
+            } catch (cldErr) {
+                console.warn('[MEDIA] support Cloudinary upload failed, falling back to Supabase:', cldErr.message);
+                cloudinaryPublicId = null;
+            }
+        }
 
-        // 6. Upload thumbnail if generated
-        if (thumbnailPath) {
-            const thumbStoragePath = `thumbnails/${dateFolder}/${uniqueId}_thumb.webp`;
-            thumbUrl = await uploadFileToStorage(thumbnailPath, thumbStoragePath, 'image/webp');
+        if (!publicUrl) {
+            publicUrl = await uploadFileToStorage(finalPath, storagePath, finalMime);
+            // 6. Upload thumbnail if generated
+            if (thumbnailPath) {
+                const thumbStoragePath = `thumbnails/${dateFolder}/${uniqueId}_thumb.webp`;
+                thumbUrl = await uploadFileToStorage(thumbnailPath, thumbStoragePath, 'image/webp');
+            }
         }
 
         // 7. Cleanup ALL temp files
@@ -365,7 +392,9 @@ async function processIncomingMedia(mediaObj, messageType) {
             fileName: friendlyName,
             fileSize: finalSize,
             mimeType: finalMime,
-            caption
+            caption,
+            // Present only when the image landed in the support Cloudinary.
+            cloudinaryPublicId
         };
     } catch (error) {
         // Cleanup on error

@@ -1045,6 +1045,14 @@ function publicTicket(t) {
     if (!t) return null;
     const thread = Array.isArray(t.thread) ? t.thread : [];
     const lastMsg = [...thread].reverse().find(m => m.kind !== 'event');
+    // A photo-only message has no text to preview, so the queue/list row names
+    // the pictures instead of showing an empty line (WhatsApp does the same).
+    const previewText = () => {
+        const raw = String(lastMsg.text || '').slice(0, 140);
+        if (raw) return raw;
+        const n = Array.isArray(lastMsg.media_ids) ? lastMsg.media_ids.length : 0;
+        return n ? (n === 1 ? 'Photo' : n + ' photos') : '';
+    };
     return {
         id: t.id, ticket_number: t.ticket_number, order_id: t.order_id,
         reason: t.reason, reason_label: t.reason_label, sub: t.sub, sub_label: t.sub_label,
@@ -1052,7 +1060,7 @@ function publicTicket(t) {
         created_at: t.created_at, updated_at: t.updated_at,
         resolution_type: t.resolution_type, resolution_label: t.resolution_label, resolution_at: t.resolution_at,
         csat: t.csat, reopen_count: t.reopen_count || 0,
-        preview: lastMsg ? { role: lastMsg.role, text: String(lastMsg.text || '').slice(0, 140), at: lastMsg.at } : null
+        preview: lastMsg ? { role: lastMsg.role, text: previewText(), at: lastMsg.at } : null
     };
 }
 

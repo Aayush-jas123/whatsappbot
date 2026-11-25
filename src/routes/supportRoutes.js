@@ -6,6 +6,8 @@ const Support = require('../services/supportService');
 const SupportSync = require('../services/supportSync');
 const SupportAccess = require('../services/supportAccessService');
 const cloudinary = require('../services/cloudinaryService');
+const supportMedia = require('../services/supportMediaService');
+const supportCloudinary = require('../services/supportCloudinaryService');
 
 // ============================================================
 // Customer-facing Support API — the "Help & Tickets" tab inside
@@ -201,7 +203,17 @@ router.get('/tickets/:id', verifyCustomerPhone, async (req, res) => {
         if (!t || t.customer_phone !== req.customerPhone) {
             return res.status(404).json({ error: 'Ticket not found' });
         }
-        res.json({ ticket: { ...Support.customerTicket(t), images: await Support.listTicketImages(t.id) } });
+        // Cloudinary-backed media, hydrated with live status. Opening the
+        // ticket is the customer's 'seen' receipt for agent-sent media.
+        const media = await supportMedia.listForTicket(t.ticket_number);
+        await supportMedia.markSeen(t.ticket_number, 'incoming');
+        res.json({
+            ticket: {
+                ...Support.customerTicket(t),
+                images: await Support.listTicketImages(t.id),
+                media: media.map(supportMedia.publicView)
+            }
+        });
     } catch (error) {
         console.error('[Support] ticket detail error:', error.message);
         res.status(500).json({ error: 'Failed to load ticket' });
@@ -259,6 +271,31 @@ router.post('/tickets', verifyCustomerPhone, requireFullAccess, async (req, res)
             desc: b.desc || '',
             images: Array.isArray(b.images) ? b.images.slice(0, 6) : []
         });
+
+        // Bind any Cloudinary media the customer staged before the ticket
+        // existed (raise form) to the freshly-created ticket.
+        const mediaIds = Array.isArray(b.media_ids) ? b.media_ids.map(Number).filter(Boolean) : [];
+        if (mediaIds.length) {
+            if (mediaIds.length > supportMedia.MAX_PER_MESSAGE) {
+                return res.status(400).json({ error: `Only ${supportMedia.MAX_PER_MESSAGE} images per message` });
+            }
+            // The photos belong to the opening customer message, so stamp them
+            // onto that thread entry. The storefront renders the *filtered*
+            // thread, where positional indexes no longer line up — the entry's
+            // own media_ids list is the anchor it reads. thread_entry_idx is
+            // still written for the desk, which consumes the raw thread.
+            const created = await Support.getTicket(ticket.id);
+            const thread = Array.isArray(created.thread) ? created.thread : [];
+            let idx = thread.findIndex(m => m && m.kind !== 'event' && m.role === 'customer');
+            if (idx < 0) {
+                thread.push({ role: 'customer', text: '', at: Date.now() });
+                idx = thread.length - 1;
+            }
+            thread[idx] = Object.assign({}, thread[idx], { media_ids: mediaIds });
+            await Support.updateTicket(ticket.id, { thread, has_images: true });
+            await supportMedia.attachToTicket(mediaIds, { ticketRef: ticket.ticket_number, threadEntryIdx: idx });
+        }
+
         res.json({ ticket: { id: ticket.id, ticket_number: ticket.ticket_number, status: ticket.status } });
     } catch (error) {
         console.error('[Support] create ticket error:', error.message);
@@ -277,15 +314,27 @@ router.post('/tickets/:id/messages', verifyCustomerPhone, requireFullAccess, asy
             return res.status(400).json({ error: 'Ticket is closed. Reopen it to reply.' });
         }
         const text = String((req.body && req.body.text) || '').trim().slice(0, 5000);
-        if (!text) return res.status(400).json({ error: 'Message is empty' });
+        const mediaIds = Array.isArray(req.body && req.body.media_ids) ? req.body.media_ids : [];
+        if (!text && !mediaIds.length) return res.status(400).json({ error: 'Message is empty' });
+        if (mediaIds.length > supportMedia.MAX_PER_MESSAGE) {
+            return res.status(400).json({ error: `Only ${supportMedia.MAX_PER_MESSAGE} images per message` });
+        }
         const thread = Array.isArray(t.thread) ? t.thread : [];
-        thread.push({ role: 'customer', text, at: Date.now() });
+        const entry = { role: 'customer', text, at: Date.now() };
+        if (mediaIds.length) entry.media_ids = mediaIds.map(Number).filter(Boolean);
+        const entryIdx = thread.length;
+        thread.push(entry);
         const updated = await Support.updateTicket(t.id, {
             thread,
             status: t.status === 'awaiting' ? 'open' : t.status,
+            has_images: mediaIds.length ? true : t.has_images,
             last_customer_at: new Date().toISOString(),
             updated_at: new Date().toISOString()
         });
+        // Flip staged media to 'sent' and point it back at this thread entry.
+        if (mediaIds.length) {
+            await supportMedia.attachToMessage(mediaIds, { threadEntryIdx: entryIdx });
+        }
         res.json({ ticket: publicTicket(updated) });
     } catch (error) {
         console.error('[Support] customer reply error:', error.message);
@@ -345,6 +394,8 @@ router.post('/tickets/:id/reopen', verifyCustomerPhone, requireFullAccess, async
 });
 
 // ── Image upload (Cloudinary) — returns URLs the create call references ──
+// Legacy server-proxy path. Kept for any caller that has not migrated to
+// the signed direct-upload flow below; new UI uses /media/intent.
 router.post('/upload', verifyCustomerPhone, requireFullAccess, upload.array('images', 3), async (req, res) => {
     try {
         const urls = [];
@@ -360,6 +411,62 @@ router.post('/upload', verifyCustomerPhone, requireFullAccess, upload.array('ima
     } catch (error) {
         console.error('[Support] upload error:', error.message);
         res.status(500).json({ error: 'Upload failed' });
+    }
+});
+
+// ============================================================
+// Signed browser direct-upload (Cloudinary) — customer surface
+// ============================================================
+
+// 1. Ask for permission to upload one image. Returns a media row id and
+//    the signed params the browser POSTs straight to Cloudinary.
+router.post('/media/intent', verifyCustomerPhone, requireFullAccess, async (req, res) => {
+    try {
+        if (!supportCloudinary.isConfigured()) {
+            return res.status(503).json({ error: 'Image upload is not configured' });
+        }
+        const b = req.body || {};
+        const intent = await supportMedia.createIntent({
+            channel: 'website',
+            ticketRef: b.ticket_ref || null,
+            direction: 'incoming',
+            actor: req.customerPhone
+        });
+        res.json(intent);
+    } catch (error) {
+        console.error('[Support] media intent error:', error.message);
+        res.status(500).json({ error: 'Failed to start upload' });
+    }
+});
+
+// 2. Confirm the browser finished uploading — server verifies the asset
+//    really landed in our Cloudinary before marking it uploaded.
+router.post('/media/:id/finalize', verifyCustomerPhone, requireFullAccess, async (req, res) => {
+    try {
+        const row = await supportMedia.getById(req.params.id);
+        if (!row || row.actor !== req.customerPhone) {
+            return res.status(404).json({ error: 'Media not found' });
+        }
+        const updated = await supportMedia.finalize({ mediaId: row.id });
+        res.json({ media: supportMedia.publicView(updated) });
+    } catch (error) {
+        console.error('[Support] media finalize error:', error.message);
+        res.status(400).json({ error: error.message || 'Failed to confirm upload' });
+    }
+});
+
+// 3. Retry a failed upload — re-issues signed params for the same row.
+router.post('/media/:id/retry', verifyCustomerPhone, requireFullAccess, async (req, res) => {
+    try {
+        const row = await supportMedia.getById(req.params.id);
+        if (!row || row.actor !== req.customerPhone) {
+            return res.status(404).json({ error: 'Media not found' });
+        }
+        const fresh = await supportMedia.retry({ mediaId: row.id });
+        res.json(fresh);
+    } catch (error) {
+        console.error('[Support] media retry error:', error.message);
+        res.status(400).json({ error: error.message || 'Failed to retry upload' });
     }
 });
 

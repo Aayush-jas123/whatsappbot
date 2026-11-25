@@ -209,7 +209,9 @@ const deskCsp = helmet({
             'style-src': ["'self'", "'unsafe-inline'", 'https://fonts.googleapis.com'],
             'font-src': ["'self'", 'https://fonts.gstatic.com'],
             'img-src': ["'self'", 'data:', 'https:'],
-            'connect-src': ["'self'"],
+            // Support images upload straight from the browser to the
+            // dedicated Cloudinary account, so the desk needs to XHR it.
+            'connect-src': ["'self'", 'https://api.cloudinary.com'],
             'frame-ancestors': ["'none'"]
         }
     }
@@ -245,6 +247,23 @@ app.get(['/', '/admin'], (req, res) => {
 });
 
 // Serve support portal
+// CSP override so the portal can (a) upload support images directly from
+// the browser to the dedicated Cloudinary account and (b) render them from
+// res.cloudinary.com — neither host is in helmet's default 'self' policy.
+app.use('/portal/support', helmet({
+    contentSecurityPolicy: {
+        directives: {
+            'default-src': ["'self'"],
+            'script-src': ["'self'", 'https://static.cloudflareinsights.com'],
+            'script-src-attr': ["'unsafe-inline'"],
+            'style-src': ["'self'", "'unsafe-inline'", 'https://fonts.googleapis.com'],
+            'font-src': ["'self'", 'https://fonts.gstatic.com'],
+            'img-src': ["'self'", 'data:', 'blob:', 'https://res.cloudinary.com', 'https:'],
+            'connect-src': ["'self'", 'https://api.cloudinary.com'],
+            'frame-ancestors': ["'none'"]
+        }
+    }
+}));
 app.use('/portal/support', express.static(path.join(__dirname, 'public', 'portal', 'support')));
 
 // Admin API routes
@@ -334,6 +353,7 @@ app.use('/api/order-confirmation', orderConfirmationRoutes);
 const abandonedCartCron = require('./src/services/abandonedCartCron');
 const reengagementCron = require('./src/services/reengagementCron');
 const shipmentSyncCron = require('./src/services/shipmentSyncCron');
+const supportMediaRetentionCron = require('./src/services/supportMediaRetentionCron');
 // Cancelled Shopify orders → Zoho invoice voids. Shopify never subscribed
 // orders/cancelled to /webhooks/zoho/orders/cancelled, so the webhook handler
 // on its own voids nothing; this sweep is the feed that actually works.
@@ -629,6 +649,16 @@ async function handleStatusUpdate(statuses) {
       if (result.changes > 0) {
         console.log(`[STATUS] Message ${waMessageId} → ${dbStatus}`);
       }
+
+      // Advance the support_media lifecycle for any outbound support image
+      // sent under this wamid (monotonic: a late 'sent' never downgrades a
+      // 'delivered'). Best-effort — never fail the webhook on it.
+      try {
+        const supportMediaService = require('./src/services/supportMediaService');
+        await supportMediaService.applyDeliveryStatus(waMessageId, dbStatus);
+      } catch (mediaErr) {
+        console.error(`[STATUS] support_media update skipped for ${waMessageId}:`, mediaErr.message);
+      }
       
       // Also update follow-up recipient status if applicable
       if (whatsappStatus === 'delivered' || whatsappStatus === 'read') {
@@ -806,6 +836,9 @@ async function startServer() {
         abandonedCartCron.init();
         reengagementCron.init();
         shipmentSyncCron.init();
+        // Deletes support images from the dedicated Cloudinary account 45
+        // days after a ticket is finally closed. No-ops if creds are absent.
+        supportMediaRetentionCron.init();
         // Gated on the variable zohoService actually reads (ZOHO_ORGANIZATION_ID).
         // Not ZOHO_ORG_ID — that one is set nowhere, which is why the duplicate
         // sweeper above has never fired in production.

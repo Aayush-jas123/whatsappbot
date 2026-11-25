@@ -384,6 +384,9 @@ async function initializeDatabase() {
 
     // Initialize Widget Chat Tables (persisted website bot conversations)
     await initializeWidgetChatTables();
+
+    // Initialize Support Media table (Cloudinary-backed image lifecycle)
+    await initializeSupportMediaTable();
     
     // Initialize Manual Inventory Tables (bulk inventory-in tracking)
     await initializeManualInventoryTables();
@@ -1100,6 +1103,61 @@ async function initializeWidgetChatTables() {
     console.log('✅ Widget chat tables initialized');
   } catch (error) {
     console.error('❌ Failed to initialize widget chat tables:', error.message);
+  }
+}
+
+// ── Support Media Pipeline Table ──
+// One row per support image across website Help & Tickets, the internal
+// Support Desk and the WhatsApp/Instagram portal. Tracks the full lifecycle
+// (browser direct-upload → send → carrier receipts → seen → 45-day purge).
+// Kept in sync with supabase_migration_support_media.sql.
+async function initializeSupportMediaTable() {
+  try {
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS support_media (
+        id                SERIAL PRIMARY KEY,
+        public_id         VARCHAR(300) NOT NULL UNIQUE,
+        channel           VARCHAR(20) NOT NULL,
+        ticket_ref        VARCHAR(100),
+        direction         VARCHAR(10) NOT NULL,
+        actor             VARCHAR(100),
+        mime_type         VARCHAR(100),
+        file_size         INTEGER,
+        width             INTEGER,
+        height            INTEGER,
+        secure_url        TEXT,
+        thumbnail_url     TEXT,
+        upload_status     VARCHAR(30) DEFAULT 'pending',
+        delivery_status   VARCHAR(30),
+        wa_message_id     VARCHAR(200),
+        thread_entry_idx  INTEGER,
+        message_id        INTEGER,
+        retention_due_at  TIMESTAMP,
+        purged_at         TIMESTAMP,
+        error_text        TEXT,
+        created_at        TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        updated_at        TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+      )
+    `);
+
+    // Per-column self-heal for environments where the table predates any
+    // added column (CREATE TABLE IF NOT EXISTS silently no-ops otherwise).
+    await addColumnIfNotExists('support_media', 'delivery_status', 'VARCHAR(30)');
+    await addColumnIfNotExists('support_media', 'wa_message_id', 'VARCHAR(200)');
+    await addColumnIfNotExists('support_media', 'thread_entry_idx', 'INTEGER');
+    await addColumnIfNotExists('support_media', 'message_id', 'INTEGER');
+    await addColumnIfNotExists('support_media', 'retention_due_at', 'TIMESTAMP');
+    await addColumnIfNotExists('support_media', 'purged_at', 'TIMESTAMP');
+    await addColumnIfNotExists('support_media', 'error_text', 'TEXT');
+
+    await pool.query('CREATE INDEX IF NOT EXISTS idx_media_ticket ON support_media(ticket_ref)');
+    await pool.query('CREATE INDEX IF NOT EXISTS idx_media_public ON support_media(public_id)');
+    await pool.query('CREATE INDEX IF NOT EXISTS idx_media_wa_msg ON support_media(wa_message_id) WHERE wa_message_id IS NOT NULL');
+    await pool.query('CREATE INDEX IF NOT EXISTS idx_media_retention ON support_media(retention_due_at) WHERE purged_at IS NULL');
+
+    console.log('✅ Support media table initialized');
+  } catch (error) {
+    console.error('❌ Failed to initialize support media table:', error.message);
   }
 }
 

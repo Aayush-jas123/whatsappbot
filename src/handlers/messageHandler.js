@@ -179,7 +179,7 @@ class MessageHandler {
                 if (attachment && attachment.fileUrl) {
                     try {
                         const newTicket = await dbAdapter.query(
-                            'SELECT id FROM support_tickets WHERE ticket_number = ? LIMIT 1',
+                            'SELECT id, ticket_number FROM support_tickets WHERE ticket_number = ? LIMIT 1',
                             [ticketNumber]
                         );
                         const mediaService = require('../services/mediaService');
@@ -194,6 +194,19 @@ class MessageHandler {
                             caption: attachment.caption || null,
                             direction: 'incoming'
                         });
+                        if (attachment.cloudinaryPublicId) {
+                            const supportMedia = require('../services/supportMediaService');
+                            await supportMedia.registerIncoming({
+                                channel: 'whatsapp',
+                                ticketRef: newTicket?.[0]?.ticket_number || ticketNumber,
+                                actor: normalizedPhone,
+                                publicId: attachment.cloudinaryPublicId,
+                                secureUrl: attachment.fileUrl,
+                                thumbnailUrl: attachment.thumbnailUrl || null,
+                                bytes: attachment.fileSize || null,
+                                mimeType: attachment.mimeType || null
+                            });
+                        }
                     } catch (attErr) {
                         console.error('[MEDIA] Failed to save attachment:', attErr.message);
                     }
@@ -303,7 +316,7 @@ class MessageHandler {
             if (attachment && attachment.fileUrl) {
                 try {
                     const latestTicket = await dbAdapter.query(
-                        'SELECT id FROM support_tickets WHERE customer_phone = ? AND status = ? ORDER BY created_at DESC LIMIT 1',
+                        'SELECT id, ticket_number FROM support_tickets WHERE customer_phone = ? AND status = ? ORDER BY created_at DESC LIMIT 1',
                         [normalizedPhone, 'open']
                     );
                     const mediaService = require('../services/mediaService');
@@ -318,6 +331,21 @@ class MessageHandler {
                         caption: attachment.caption || null,
                         direction: 'incoming'
                     });
+                    // Register the Cloudinary lifecycle row so the desk/portal
+                    // render this image inline with status + retention tracking.
+                    if (attachment.cloudinaryPublicId) {
+                        const supportMedia = require('../services/supportMediaService');
+                        await supportMedia.registerIncoming({
+                            channel: 'whatsapp',
+                            ticketRef: latestTicket?.[0]?.ticket_number || null,
+                            actor: normalizedPhone,
+                            publicId: attachment.cloudinaryPublicId,
+                            secureUrl: attachment.fileUrl,
+                            thumbnailUrl: attachment.thumbnailUrl || null,
+                            bytes: attachment.fileSize || null,
+                            mimeType: attachment.mimeType || null
+                        });
+                    }
                     console.log(`[MEDIA] Saved attachment for ticket (phone: ${normalizedPhone}): ${attachment.fileType}`);
                 } catch (attErr) {
                     console.error('[MEDIA] Failed to save attachment:', attErr.message);

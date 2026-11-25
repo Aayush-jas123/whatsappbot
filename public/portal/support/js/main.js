@@ -598,17 +598,127 @@ function renderChatMessages(items, isInitialLoad = true) {
         return;
     }
 
-    // Full render — items is a merged stream of {type:'message',...} and {type:'attachment',...}
-    container.innerHTML = items.map(item => {
-        if (item.type === 'attachment') {
-            return renderAttachment(item);
-        }
-        return renderOneMessage(item);
-    }).join('');
+    // Full render — items is a merged stream of {type:'message',...} and {type:'attachment',...}.
+    // Consecutive photos from the same sender collapse into ONE photo bubble,
+    // the way a multi-image send looks on WhatsApp.
+    MEDIA_GROUPS = [];
+    container.innerHTML = groupPhotoItems(items).map(group =>
+        group.kind === 'photos' ? renderPhotoGroup(group.items) : renderItem(group.item)
+    ).join('');
 
     const chat = activeChatId ? openChats.get(String(activeChatId)) : null;
     if (chat) chat.lastMsgCount = items.length;
     if (isInitialLoad) container.scrollTop = container.scrollHeight;
+}
+
+function renderItem(item) {
+    if (item.type === 'attachment') return renderAttachment(item);
+    return renderOneMessage(item);
+}
+
+// Only plain images join a photo bubble; video and documents keep their own
+// framed card because they carry a player / filename.
+function isImageAttachment(item) {
+    if (item.type !== 'attachment') return false;
+    if (item.file_type === 'video' || (item.mime_type && item.mime_type.startsWith('video/'))) return false;
+    if (item.file_type && item.file_type !== 'image') return false;
+    if (item.file_type === 'document' || (item.mime_type && !item.mime_type.startsWith('image/'))) return false;
+    return !!(item.file_url || item.thumbnail_url || item.expired);
+}
+
+function groupPhotoItems(items) {
+    const groups = [];
+    for (const item of items) {
+        const last = groups[groups.length - 1];
+        if (isImageAttachment(item) && last && last.kind === 'photos'
+            && last.items[0].direction === item.direction) {
+            last.items.push(item);
+        } else {
+            groups.push(isImageAttachment(item)
+                ? { kind: 'photos', items: [item] }
+                : { kind: 'single', item });
+        }
+    }
+    return groups;
+}
+
+// ---------- photo bubbles (the picture IS the bubble) ----------
+const MEDIA_RANK = { failed: 0, pending: 1, uploading: 1, uploaded: 2, sending: 2, sent: 3, expired: 3, delivered: 4, read: 5, seen: 5 };
+const TICK_SINGLE = '<svg class="msg-tick" viewBox="0 0 16 11" width="13" height="10" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><path d="M1.6 6l3.3 3.3L13 1.4"/></svg>';
+const TICK_DOUBLE = '<svg class="msg-tick" viewBox="0 0 23 11" width="18" height="10" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><path d="M1.6 6l3.3 3.3L13 1.4"/><path d="M10.4 9.3l3.3 3.3L22 4.7"/></svg>';
+
+// Groups are registered while the chat renders; the registry resets each render
+// so it can never grow past one conversation's worth of images.
+let MEDIA_GROUPS = [];
+function registerMediaGroup(urls) {
+    MEDIA_GROUPS.push(urls.filter(Boolean));
+    return MEDIA_GROUPS.length - 1;
+}
+
+function photoGroupRank(atts) {
+    let worst = 99;
+    atts.forEach(a => {
+        const r = MEDIA_RANK[a.expired ? 'expired' : (a.upload_status || '')];
+        if (r == null || r > 99) return;
+        if (r < worst) worst = r;
+    });
+    return worst;
+}
+
+function photoReceiptHtml(atts, timeText, isAgent) {
+    const r = photoGroupRank(atts);
+    let mark = '';
+    if (isAgent) {
+        mark = r === 0 ? '<span class="pmb-word">Failed</span>'
+            : r === 1 ? '<span class="pmb-word">Uploading\u2026</span>'
+            : r === 2 ? '<span class="pmb-word">Sending\u2026</span>'
+            : r >= 4 ? TICK_DOUBLE : TICK_SINGLE;
+    }
+    return `<span class="pmb-receipt">`
+        + `<span class="pmb-time">${escapeHtml(timeText)}</span>${mark}</span>`;
+}
+
+function photoTileHtml(att, gid, pos, isLast, hidden, receipt) {
+    let inner;
+    if (att.expired) {
+        inner = `<span class="pmb-gone">Photo removed</span>`;
+    } else if (att.thumbnail_url || att.file_url) {
+        // legacy rows have no stored dimensions, so the tile keeps the grid aspect
+        const w = Number(att.width) || 0, h = Number(att.height) || 0;
+        const ratio = (w > 0 && h > 0) ? ` style="aspect-ratio:${w}/${h}"` : '';
+        // the bubble carries the lighter preview; the viewer loads full size
+        inner = `<img src="${escapeHtml(att.thumbnail_url || att.file_url)}" alt="photo" loading="lazy" decoding="async"${ratio}>`;
+    } else {
+        inner = `<span class="pmb-pending"></span>`;
+    }
+    const more = (isLast && hidden > 0) ? `<span class="pmb-more">+${hidden}</span>` : '';
+    const click = att.expired ? 'disabled' : `onclick="openViewer(${gid},${pos})"`;
+    return `<button type="button" class="pmb-tile${att.expired ? ' is-expired' : ''}" title="${escapeHtml(att.expired ? 'Photo expired' : portalMediaLabel(att).txt)}" ${click}>`
+        + `${inner}${more}${isLast ? receipt : ''}</button>`;
+}
+
+function renderPhotoGroup(atts) {
+    const isAgent = atts[0].direction === 'outgoing';
+    const time = formatTime(atts[0].created_at);
+    const gid = registerMediaGroup(atts.map(a => a.expired ? '' : (a.file_url || a.thumbnail_url || '')));
+    const receipt = photoReceiptHtml(atts, time, isAgent);
+    const shown = atts.length <= 4 ? atts : atts.slice(0, 4);
+    const hidden = atts.length <= 4 ? 0 : atts.length - 4;
+    const cls = shown.length === 1 ? ' pmb-1' : shown.length === 2 ? ' pmb-2' : shown.length === 3 ? ' pmb-3' : ' pmb-4';
+    const failed = isAgent ? atts.filter(a => !a.expired && a.upload_status === 'failed') : [];
+    const retry = failed.length
+        ? `<div class="pmb-actions"><button class="pmb-retry" onclick="retrySentMedia(${Number(failed[0].id) || 0})">Retry send</button></div>` : '';
+    // WhatsApp treats a batch as one message, so the first caption describes
+    // the whole group.
+    const caption = (atts.find(a => a.caption) || {}).caption || '';
+    return `<div class="chat-message ${isAgent ? 'agent' : 'customer'}">
+        <div class="msg-bubble bubble-photos">
+            ${caption ? `<div class="pmb-caption">${escapeHtml(caption).replace(/\n/g, '<br>')}</div>` : ''}
+            <div class="pmb${cls}" role="group" aria-label="${atts.length} photo${atts.length > 1 ? 's' : ''}">${
+                shown.map((att, i) => photoTileHtml(att, gid, i, i === shown.length - 1, i === shown.length - 1 ? hidden : 0, receipt)).join('')
+            }</div>${retry}
+        </div>
+    </div>`;
 }
 
 function renderOneMessage(msg) {
@@ -1156,7 +1266,42 @@ document.addEventListener('DOMContentLoaded', () => {
 // ══════════════════════════════════════════════════════════
 // MEDIA ATTACHMENTS
 // ══════════════════════════════════════════════════════════
-let pendingMediaFile = null;
+let pendingMedia = [];
+const MEDIA_MAX = 5;
+const MEDIA_MAX_BYTES = 10 * 1024 * 1024;
+const MEDIA_TYPES = /^image\/(jpeg|jpg|png|webp|heic|heif)$/i;
+
+function newMediaKey() { return 'm' + Date.now().toString(36) + Math.random().toString(36).slice(2, 7); }
+
+// Browser -> Cloudinary direct upload (signed), with live byte progress.
+function cloudinaryUpload(intent, file, onProgress) {
+    return new Promise((resolve, reject) => {
+        const up = (intent && intent.upload_params) || {};
+        if (!up.cloud_name || !up.signature) { reject(new Error('Upload was not authorised')); return; }
+        const url = `https://api.cloudinary.com/v1_1/${encodeURIComponent(up.cloud_name)}/image/upload`;
+        const fd = new FormData();
+        fd.append('file', file);
+        fd.append('api_key', up.api_key);
+        fd.append('timestamp', up.timestamp);
+        fd.append('signature', up.signature);
+        fd.append('public_id', up.public_id);
+        if (up.eager) fd.append('eager', up.eager);
+        if (up.transformation) fd.append('transformation', up.transformation);
+        const xhr = new XMLHttpRequest();
+        xhr.open('POST', url, true);
+        if (xhr.upload) xhr.upload.onprogress = (e) => {
+            if (e.lengthComputable && onProgress) onProgress(Math.round((e.loaded / e.total) * 100));
+        };
+        xhr.onload = () => {
+            let data = {};
+            try { data = JSON.parse(xhr.responseText || '{}'); } catch (_) { data = {}; }
+            if (xhr.status >= 200 && xhr.status < 300 && !data.error) resolve(data);
+            else reject(new Error((data.error && data.error.message) || `Upload failed (${xhr.status})`));
+        };
+        xhr.onerror = () => reject(new Error('Network error during upload'));
+        xhr.send(fd);
+    });
+}
 
 // Client-side image compression using Canvas API
 // Resizes large images and converts to WebP for massive size savings
@@ -1202,52 +1347,94 @@ async function compressImage(file, maxWidth = 1920, quality = 0.82) {
 }
 
 function handleFileSelect(e) {
-    const file = e.target.files?.[0];
-    if (!file) return;
-
-    // Validate file size (max 25MB)
-    if (file.size > 25 * 1024 * 1024) {
-        showToast('File too large. Maximum size is 25MB.', 'error');
-        e.target.value = '';
-        return;
-    }
-
-    // Compress images client-side before upload
-    if (file.type.startsWith('image/')) {
-        compressImage(file).then(compressed => {
-            pendingMediaFile = compressed;
-            showPreviewBar(compressed);
-        });
-    } else {
-        pendingMediaFile = file;
-        showPreviewBar(file);
-    }
-    e.target.value = ''; // Reset so same file can be re-selected
+    const files = Array.from(e.target.files || []);
+    if (!files.length) return;
+    const room = Math.max(0, MEDIA_MAX - pendingMedia.length);
+    if (files.length > room) showToast(`Up to ${MEDIA_MAX} images per message`, 'error');
+    files.slice(0, room).forEach((raw) => {
+        if (!MEDIA_TYPES.test(raw.type || '')) { showToast(`${raw.name} isn\'t a supported image`, 'error'); return; }
+        if (raw.size > MEDIA_MAX_BYTES) { showToast(`${raw.name} is over 10 MB`, 'error'); return; }
+        const entry = { key: newMediaKey(), name: raw.name, status: 'pending', progress: 0, media_id: null, file: raw };
+        pendingMedia.push(entry);
+        // Compress large images client-side (Canvas -> WebP), then run the pipeline.
+        compressImage(raw).then((file) => { entry.file = file; startMediaUpload(entry, file); });
+    });
+    renderMediaPreview();
+    e.target.value = '';
 }
 
-function showPreviewBar(file) {
+// Signed intent -> browser upload -> server finalize, for one composer chip.
+async function startMediaUpload(m, file) {
+    const chat = activeChatId ? openChats.get(String(activeChatId)) : null;
+    const channel = (chat && chat.ticket.channel) || 'whatsapp';
+    m.status = 'pending'; m.progress = 0; renderMediaPreview();
+    try {
+        const intent = await portalApi(`/portal/${portalSlug}/chat/media/intent`, 'POST', { channel });
+        m.media_id = intent.media_id; m.public_id = intent.public_id;
+        await runMediaUpload(m, file, intent);
+    } catch (e) {
+        m.status = 'failed'; m.error = e.message || 'Could not start upload';
+        showToast(m.error, 'error');
+        renderMediaPreview();
+    }
+}
+
+async function runMediaUpload(m, file, intent) {
+    m.status = 'uploading'; m.progress = 0; renderMediaPreview();
+    try {
+        await cloudinaryUpload(intent, file, (p) => { m.progress = p; renderMediaPreview(); });
+        const r = await portalApi(`/portal/${portalSlug}/chat/media/${m.media_id}/finalize`, 'POST', {});
+        if (!r || !r.media) throw new Error((r && r.error) || 'Could not confirm upload');
+        m.status = 'uploaded'; m.progress = 100;
+        m.thumb_url = r.media.thumb_url; m.full_url = r.media.full_url; m.error = null;
+    } catch (e) {
+        m.status = 'failed'; m.error = e.message || 'Upload failed';
+        showToast(`Image upload failed: ${m.error}`, 'error');
+    }
+    renderMediaPreview();
+}
+
+function retryMediaChip(key) {
+    const m = pendingMedia.find((x) => x.key === key);
+    if (!m || !m.file) { showToast('Re-select the image to retry', 'error'); return; }
+    if (m.media_id) {
+        portalApi(`/portal/${portalSlug}/chat/media/${m.media_id}/retry`, 'POST', {})
+            .then((fresh) => runMediaUpload(m, m.file, fresh))
+            .catch((e) => showToast((e.message) || 'Retry failed', 'error'));
+    } else {
+        startMediaUpload(m, m.file);
+    }
+}
+
+function renderMediaPreview() {
     const bar = document.getElementById('imagePreviewBar');
     if (!bar) return;
+    if (!pendingMedia.length) { bar.style.display = 'none'; bar.innerHTML = ''; return; }
     bar.style.display = 'flex';
-
-    const isImage = file.type.startsWith('image/');
-    let previewHtml = '';
-    if (isImage) {
-        const url = URL.createObjectURL(file);
-        previewHtml = `<div class="preview-item"><img src="${url}" alt="preview"><button class="preview-remove" onclick="removePendingMedia()">&times;</button></div>`;
-    } else {
-        previewHtml = `<div class="preview-item" style="display:flex;align-items:center;justify-content:center;background:var(--bg-hover);"><span style="font-size:20px;">📄</span><button class="preview-remove" onclick="removePendingMedia()">&times;</button></div>`;
-    }
-    bar.innerHTML = previewHtml;
+    bar.innerHTML = pendingMedia.map((m) => {
+        const label = m.status === 'uploaded' ? 'Ready'
+            : m.status === 'uploading' ? `${m.progress}%`
+            : m.status === 'failed' ? 'Failed' : 'Queued\u2026';
+        const fill = m.status === 'uploading' ? `<div class="media-chip-fill" style="width:${m.progress}%"></div>` : '';
+        const thumb = m.thumb_url ? `<img src="${escapeHtml(m.thumb_url)}" alt="">` : fill;
+        const retry = m.status === 'failed'
+            ? `<button class="media-chip-retry" onclick="retryMediaChip('${m.key}')">Retry</button>` : '';
+        return `<div class="media-chip st-${m.status}" title="${escapeHtml(m.error || m.name)}">
+            <div class="media-chip-thumb">${thumb}</div>
+            <span class="media-chip-status">${label}</span>
+            ${retry}
+            <button class="media-chip-x" onclick="removePendingMedia('${m.key}')">&times;</button>
+        </div>`;
+    }).join('');
 }
 
-function removePendingMedia() {
-    pendingMediaFile = null;
-    const bar = document.getElementById('imagePreviewBar');
-    if (bar) { bar.style.display = 'none'; bar.innerHTML = ''; }
+function removePendingMedia(key) {
+    pendingMedia = pendingMedia.filter((m) => m.key !== key);
+    renderMediaPreview();
 }
 
-// Override sendMessage to handle media
+// Send flow: images ride the Cloudinary lifecycle via send-media; a plain
+// message still uses the original chat/send path.
 const _originalSendMessage = sendMessage;
 sendMessage = async function() {
     const input = document.getElementById('chatInput');
@@ -1255,61 +1442,50 @@ sendMessage = async function() {
     const chat = activeChatId ? openChats.get(String(activeChatId)) : null;
     if (!chat) return;
 
-    // If there's a pending media file, upload and send it
-    if (pendingMediaFile) {
-        const file = pendingMediaFile;
-        removePendingMedia();
+    const ready = pendingMedia.filter((m) => m.status === 'uploaded' && m.media_id);
+    const busy = pendingMedia.filter((m) => m.status === 'uploading' || m.status === 'pending');
+    const failed = pendingMedia.filter((m) => m.status === 'failed');
 
-        const container = document.getElementById('chatMessages');
-        const isImage = file.type.startsWith('image/');
-        const tempMsg = document.createElement('div');
-        tempMsg.className = 'chat-message agent';
-        tempMsg.innerHTML = `<div class="msg-bubble"><div class="msg-content">${isImage ? '📷 Sending image...' : '📎 Sending file...'}</div><div class="msg-meta"><span class="msg-time">${formatTime(new Date().toISOString())}</span></div></div>`;
-        container.appendChild(tempMsg);
-        container.scrollTop = container.scrollHeight;
+    if (!ready.length && !message) { showToast('Nothing to send', 'error'); return; }
+    if (busy.length) { showToast('Wait for the image uploads to finish', 'error'); return; }
+    if (ready.length && failed.length) { showToast('Remove or retry the failed images first', 'error'); return; }
 
+    if (ready.length) {
         try {
-            const formData = new FormData();
-            formData.append('image', file);
-            formData.append('phone', chat.ticket.phone);
-            formData.append('caption', message);
-
-            const resp = await fetch(`${API_BASE}/portal/${portalSlug}/chat/send-image`, {
-                method: 'POST',
-                headers: { 'Authorization': `Bearer ${portalToken}` },
-                body: formData
+            const data = await portalApi(`/portal/${portalSlug}/chat/send-media`, 'POST', {
+                phone: chat.ticket.phone,
+                caption: message,
+                media_ids: ready.map((m) => m.media_id)
             });
-            const data = await resp.json();
-            tempMsg.remove();
-
-            if (data.success) {
-                // Also send text caption if present
-                if (message) {
-                    await portalApi(`/portal/${portalSlug}/chat/send`, 'POST', {
-                        phone: chat.ticket.phone, message
-                    });
-                }
-                await loadChatMessages(activeChatId, false);
-            } else {
-                showToast(data.error || 'Failed to send image', 'error');
-            }
-        } catch (err) {
-            tempMsg.remove();
+            if (!data.success) { showToast(data.error || 'Failed to send images', 'error'); return; }
+            const errs = (data.sent || []).filter((s) => s.status === 'failed');
+            if (errs.length) showToast(`${errs.length} image(s) failed to send`, 'error');
+            pendingMedia = [];
+            renderMediaPreview();
+            if (input) { input.value = ''; input.style.height = 'auto'; }
+            await loadChatMessages(activeChatId, false);
+        } catch (e) {
             showToast('Failed to send media', 'error');
         }
-        if (input) { input.value = ''; input.style.height = 'auto'; }
         return;
     }
 
-    // No media — use original text send
+    // No images — fall through to the original text send.
     return _originalSendMessage();
 };
 
-// Load attachments for a phone and merge into chat display
+// Load attachments for a phone and merge into chat display. Returns a single
+// array combining the new support_media lifecycle (with live status) and the
+// legacy attachments, dropping legacy image rows the lifecycle already shows.
 async function loadAttachmentsForChat(phone) {
     try {
         const data = await portalApi(`/portal/${portalSlug}/attachments/${encodeURIComponent(phone)}`);
-        return data.success ? (data.attachments || []) : [];
+        if (!data.success) return [];
+        const legacy = data.attachments || [];
+        const lifecycle = data.media || [];
+        const lcUrls = new Set(lifecycle.map((m) => m.file_url).filter(Boolean));
+        const legacyUnique = legacy.filter((a) => !(a.file_url && lcUrls.has(a.file_url)));
+        return lifecycle.concat(legacyUnique);
     } catch { return []; }
 }
 
@@ -1317,14 +1493,19 @@ async function loadAttachmentsForChat(phone) {
 function renderAttachment(att) {
     const isAgent = att.direction === 'outgoing';
     const time = formatTime(att.created_at);
+    const isLifecycle = att.source === 'support_media';
     const isImage = att.file_type === 'image' || (att.mime_type && att.mime_type.startsWith('image/'));
     const isVideo = att.file_type === 'video' || (att.mime_type && att.mime_type.startsWith('video/'));
 
     let attachHtml = '';
-    if (isImage) {
+    if (isLifecycle && att.expired) {
+        attachHtml = `<div class="msg-attachment msg-attachment-expired"><span class="file-icon">\ud83d\udcf7</span><span class="file-name">Image removed after case closure</span></div>`;
+    } else if (isImage) {
         // Use thumbnail for display (loads faster), full image on click
         const displayUrl = att.thumbnail_url || att.file_url;
-        attachHtml = `<div class="msg-attachment" onclick="openLightbox('${escapeJs(att.file_url)}', 'image')"><img src="${escapeHtml(displayUrl)}" alt="attachment" loading="lazy" decoding="async"></div>`;
+        attachHtml = att.file_url
+            ? `<div class="msg-attachment" onclick="openLightbox('${escapeJs(att.file_url)}', 'image')"><img src="${escapeHtml(displayUrl)}" alt="attachment" loading="lazy" decoding="async"></div>`
+            : `<div class="msg-attachment msg-attachment-expired"><span class="file-icon">\ud83d\udcf7</span><span class="file-name">Image unavailable</span></div>`;
     } else if (isVideo) {
         attachHtml = `<div class="msg-attachment" onclick="openLightbox('${escapeJs(att.file_url)}', 'video')"><video src="${escapeHtml(att.file_url)}" preload="metadata" loading="lazy" style="width:100%;border-radius:8px;"></video></div>`;
     } else {
@@ -1335,15 +1516,61 @@ function renderAttachment(att) {
         attachHtml += `<div class="msg-content" style="margin-top:4px;font-size:12px;color:var(--text-secondary);">${escapeHtml(att.caption)}</div>`;
     }
 
+    // Lifecycle images carry a real status chip (Uploading/Sending/Sent/
+    // Delivered/Seen/Failed + Retry); legacy agent media keep the old tick.
+    let statusHtml = '';
+    if (isLifecycle) statusHtml = mediaStatusChip(att, isAgent);
+    else if (isAgent) statusHtml = '<span class="msg-status msg-status-sent">&#10003;</span>';
+
     return `<div class="chat-message ${isAgent ? 'agent' : 'customer'}">
         <div class="msg-bubble">
             ${attachHtml}
             <div class="msg-meta">
                 ${isAgent ? '<span class="msg-type-badge">Media</span>' : ''}
                 <span class="msg-time">${time}</span>
+                ${statusHtml}
             </div>
         </div>
     </div>`;
+}
+
+// Map a lifecycle row's raw statuses onto a single display label.
+function portalMediaLabel(att) {
+    if (att.expired) return { txt: 'Expired', cls: 'expired' };
+    const us = att.upload_status, ds = att.delivery_status;
+    if (us === 'failed') return { txt: 'Failed', cls: 'failed' };
+    if (us === 'sending') return { txt: 'Sending\u2026', cls: 'sending' };
+    if (ds === 'read') return { txt: 'Seen', cls: 'seen' };
+    if (ds === 'delivered') return { txt: 'Delivered', cls: 'delivered' };
+    if (us === 'seen') return { txt: 'Seen', cls: 'seen' };
+    if (us === 'sent') return { txt: 'Sent', cls: 'sent' };
+    if (us === 'uploaded') return { txt: 'Ready', cls: 'ready' };
+    if (us === 'uploading') return { txt: 'Uploading\u2026', cls: 'sending' };
+    return { txt: us || '', cls: us || '' };
+}
+
+function mediaStatusChip(att, isAgent) {
+    if (!isAgent) return '';
+    const s = portalMediaLabel(att);
+    const retry = s.cls === 'failed'
+        ? `<button class="msg-status-retry" onclick="retrySentMedia(${Number(att.id) || 0})">Retry</button>` : '';
+    return `<span class="msg-status msg-status-${escapeHtml(s.cls)}">${escapeHtml(s.txt)}</span>${retry}`;
+}
+
+// Retry a send-stage failure: re-arm the row (finalize confirms the asset is
+// still in Cloudinary) then re-invoke send-media for just that image.
+function retrySentMedia(id) {
+    const chat = activeChatId ? openChats.get(String(activeChatId)) : null;
+    if (!chat || !id) return;
+    portalApi(`/portal/${portalSlug}/chat/retry-media/${id}`, 'POST', {})
+        .then((r) => {
+            if (!r || !r.media) throw new Error((r && r.error) || 'Re-upload required');
+            return portalApi(`/portal/${portalSlug}/chat/send-media`, 'POST', {
+                phone: chat.ticket.phone, caption: '', media_ids: [id]
+            });
+        })
+        .then(() => loadChatMessages(activeChatId, false))
+        .catch((e) => showToast((e.message) || 'Retry failed', 'error'));
 }
 
 // Lightbox for full-size image/video viewing
@@ -1356,5 +1583,44 @@ function openLightbox(url, type) {
     } else {
         lb.innerHTML = `<img src="${url}" alt="full size"><button class="media-lightbox-close">&times;</button>`;
     }
+    document.body.appendChild(lb);
+    const x = lb.querySelector('.media-lightbox-close');
+    if (x) x.onclick = (e) => { e.stopPropagation(); lb.remove(); };
+}
+
+// Fullscreen photo viewer for a message's batch: arrows, counter and Esc
+// navigate the photos exactly like tapping a picture in WhatsApp does.
+function openViewer(gid, pos) {
+    const group = MEDIA_GROUPS[gid] || [];
+    if (!group.length) return;
+    let i = Math.max(0, Math.min(group.length - 1, Number(pos) || 0));
+    const lb = document.createElement('div');
+    lb.className = 'media-lightbox';
+    function close() {
+        document.removeEventListener('keydown', onKey);
+        lb.remove();
+    }
+    function onKey(e) {
+        if (e.key === 'Escape') close();
+        else if (group.length > 1 && e.key === 'ArrowRight') { i = (i + 1) % group.length; paint(); }
+        else if (group.length > 1 && e.key === 'ArrowLeft') { i = (i - 1 + group.length) % group.length; paint(); }
+    }
+    function paint() {
+        lb.innerHTML = `<img src="${escapeHtml(group[i])}" alt="photo">`
+            + `<button class="media-lightbox-close" aria-label="Close">&times;</button>`
+            + (group.length > 1
+                ? `<button class="lb-nav prev" aria-label="Previous photo">&#8249;</button>`
+                + `<button class="lb-nav next" aria-label="Next photo">&#8250;</button>`
+                + `<div class="lb-count">${i + 1} / ${group.length}</div>` : '');
+        const x = lb.querySelector('.media-lightbox-close');
+        if (x) x.onclick = (e) => { e.stopPropagation(); close(); };
+        const p = lb.querySelector('.lb-nav.prev');
+        if (p) p.onclick = (e) => { e.stopPropagation(); i = (i - 1 + group.length) % group.length; paint(); };
+        const n = lb.querySelector('.lb-nav.next');
+        if (n) n.onclick = (e) => { e.stopPropagation(); i = (i + 1) % group.length; paint(); };
+    }
+    lb.onclick = (e) => { if (e.target === lb) close(); };
+    document.addEventListener('keydown', onKey);
+    paint();
     document.body.appendChild(lb);
 }
