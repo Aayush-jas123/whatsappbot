@@ -15,6 +15,7 @@ const detailsCache = new Map(); // phone -> { data, at }
 const DETAILS_CACHE_FRESH_MS = 60 * 1000;
 
 let ticketPollingInterval = null;
+let ticketPollingInFlight = false;
 let lastKnownTicketIds = new Set();
 let unreadMessageCount = 0;
 
@@ -240,6 +241,8 @@ function startTicketPolling() { loadTickets(); ticketPollingInterval = setInterv
 function stopTicketPolling() { if (ticketPollingInterval) { clearInterval(ticketPollingInterval); ticketPollingInterval = null; } }
 
 async function loadTickets() {
+    if (ticketPollingInFlight) return;
+    ticketPollingInFlight = true;
     try {
         const params = new URLSearchParams();
         if (currentChannelFilter !== 'all') params.set('channel', currentChannelFilter);
@@ -266,6 +269,7 @@ async function loadTickets() {
             renderTabs();
         }
     } catch (e) { console.error('Load tickets error:', e); }
+    finally { ticketPollingInFlight = false; }
 }
 
 function checkForNewMessages(tickets) {
@@ -402,6 +406,7 @@ function openChat(ticketId, phone, name, status, channel = 'whatsapp', followUpA
         entries: [],
         threadLoaded: false,
         threadLoading: false,
+        messagesLoading: false,
         pollingInterval: null,
         lastMsgCount: 0,
         lastAiReply: null
@@ -553,7 +558,8 @@ function getFilteredTickets() {
 // ══════════════════════════════════════════════════════════
 async function loadChatMessages(ticketId, showLoading = true) {
     const chat = openChats.get(String(ticketId));
-    if (!chat) return;
+    if (!chat || chat.messagesLoading) return;
+    chat.messagesLoading = true;
     try {
         const data = await portalApi(`/portal/${portalSlug}/chat/${encodeURIComponent(chat.ticket.phone)}`);
         if (data.success) {
@@ -569,6 +575,8 @@ async function loadChatMessages(ticketId, showLoading = true) {
         if (showLoading && String(ticketId) === activeChatId) {
             document.getElementById('chatMessages').innerHTML = '<div class="chat-loading">Failed to load messages</div>';
         }
+    } finally {
+        chat.messagesLoading = false;
     }
 }
 

@@ -26,7 +26,7 @@ installConsoleShim(createAppLogger({ level: 'warn' }));
 const messageHandler = require('./src/handlers/messageHandler');
 const adminRoutes = require('./src/routes/adminRoutes');
 const followUpService = require('./src/services/followUpService');
-const { testConnection, initializeDatabase, dbAdapter } = require('./src/database/db');
+const { testConnection, initializeDatabase, dbAdapter, pool } = require('./src/database/db');
 const { startCacheStatsLogging, getCacheStats } = require('./src/utils/cache');
 const { createHealthRouter } = require('./src/routes/healthRoutes');
 
@@ -846,33 +846,47 @@ async function startServer() {
         if (process.env.ZOHO_ORGANIZATION_ID) zohoCodSweepCron.init();
 
         // Keep the Inventory Control Tower's snapshot cached so the hub view opens
-        // instantly. The snapshot itself is cached for 1 hour (adminRoutes
-        // /inventory) and this call passes no refresh flag, so on a warm cache it
-        // is a no-op — its real job is to repopulate the snapshot if the cache was
-        // purged by the memory watchdog or an invalidation, without paying the
-        // reconciliation pass on a user's first open of the tower.
-        const warmInventoryTower = async () => {
-            try {
-                const jwt = require('jsonwebtoken');
-                const { adminCredentialFingerprint } = require('./src/middleware/auth');
-                const token = jwt.sign(
-                    { username: 'cache-warm', role: 'admin', credFp: adminCredentialFingerprint() },
-                    process.env.JWT_SECRET,
-                    { expiresIn: '60s' }
-                );
-                const port = process.env.PORT || 3000;
-                const res = await fetch(`http://localhost:${port}/api/admin/inventory?window=90`, {
-                    headers: { Authorization: `Bearer ${token}` }
-                });
-                if (!res.ok) throw new Error(`HTTP ${res.status}`);
-                // Drain the response body so the socket can be reused / reaped
-                await res.arrayBuffer().catch(() => {});
-                console.log('✅ Inventory tower cache warmed');
-            } catch (error) {
-                console.warn('⚠️ Inventory tower warm-up failed (non-critical):', error.message);
+        // instantly. A cold rebuild detoasts ~20MB of items_json and can take 5–16s
+        // on a fresh pooler cache, so it must not collide with post-deploy portal
+        // traffic. Delay the first attempt and leave at least four pool slots free.
+        let inventoryWarmInFlight = null;
+        const warmInventoryTower = () => {
+            if (inventoryWarmInFlight) return inventoryWarmInFlight;
+            const inUse = Math.max(0, (pool.totalCount || 0) - (pool.idleCount || 0));
+            const peakInventoryClients = 3;
+            const reservedPoolSlots = 4;
+            const maxPoolClients = pool.options.max || 10;
+            if ((pool.waitingCount || 0) > 0
+                || inUse + peakInventoryClients > maxPoolClients - reservedPoolSlots) {
+                return Promise.resolve();
             }
+            inventoryWarmInFlight = (async () => {
+                try {
+                    const jwt = require('jsonwebtoken');
+                    const { adminCredentialFingerprint } = require('./src/middleware/auth');
+                    const token = jwt.sign(
+                        { username: 'cache-warm', role: 'admin', credFp: adminCredentialFingerprint() },
+                        process.env.JWT_SECRET,
+                        { expiresIn: '60s' }
+                    );
+                    const port = process.env.PORT || 3000;
+                    const res = await fetch(`http://localhost:${port}/api/admin/inventory?window=90`, {
+                        headers: { Authorization: `Bearer ${token}` }
+                    });
+                    // Drain the response body so the socket can be reused / reaped
+                    await res.arrayBuffer().catch(() => {});
+                    // The route rechecks pool headroom after catalog work; a 503 means
+                    // this attempt was safely deferred and the next interval will retry.
+                    if (res.status === 503) return;
+                    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+                    console.log('✅ Inventory tower cache warmed');
+                } catch (error) {
+                    console.warn('⚠️ Inventory tower warm-up failed (non-critical):', error.message);
+                }
+            })().finally(() => { inventoryWarmInFlight = null; });
+            return inventoryWarmInFlight;
         };
-        setTimeout(warmInventoryTower, 8000);
+        setTimeout(warmInventoryTower, 45000);
         setInterval(warmInventoryTower, 150000); // repopulate the 1-hour snapshot if it was purged
 
         // ── Unified memory watchdog ─────────────────────────────────────
@@ -905,8 +919,8 @@ async function startServer() {
                 const reaped = reapIdleSockets();
                 if (reaped > 0) console.log(`[MEMORY] Reaped ${reaped} idle TLS socket(s)`);
 
-                // 2. Drain idle pg connections (~5-10MB native TLS each)
-                if ((pool.idleCount || 0) > 0) {
+                // 2. Drain idle pg connections above the one-session warm minimum
+                if ((pool.idleCount || 0) > 1) {
                     const closed = pool.endIdleClients();
                     if (closed > 0) console.log(`[MEMORY] Closed ${closed} idle pg connection(s) (total=${pool.totalCount})`);
                 }
@@ -979,8 +993,8 @@ async function startServer() {
                         taskQueue.length = 0;
                     } catch (e) { /* ignore */ }
                     try {
-                        const closed = pool.endIdleClients();
-                        if (closed > 0) console.log(`[MEMORY] Emergency: closed ${closed} idle pg connections`);
+                        const closed = pool.endIdleClients(0);
+                        if (closed > 0) console.log(`[MEMORY] Emergency: closed ${closed} idle pg connection(s)`);
                     } catch (e) { /* ignore */ }
                 }
             } catch (e) {

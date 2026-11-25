@@ -10,7 +10,7 @@ const Settings = require('../models/Settings');
 const broadcastService = require('../services/broadcastService');
 const followUpService = require('../services/followUpService');
 const whatsappService = require('../services/whatsappService');
-const { dbAdapter } = require('../database/db');
+const { dbAdapter, pool } = require('../database/db');
 const cloudinaryService = require('../services/cloudinaryService');
 const igCommentService = require('../services/igCommentService');
 const shipmentExportService = require('../services/shipmentExportService');
@@ -7909,14 +7909,70 @@ async function fetchReturnsServerPipeline(windowDays) {
     return require('../services/customerContextService').fetchReturnsServerPipeline(windowDays);
 }
 
+const inventoryInFlight = new Map();
+const INVENTORY_PEAK_DB_CLIENTS = 3;
+const INVENTORY_RESERVED_DB_SLOTS = 4;
+
+function inventoryHasHeadroom() {
+    const inUse = Math.max(0, (pool.totalCount || 0) - (pool.idleCount || 0));
+    const maxClients = pool.options.max || 10;
+    return (pool.waitingCount || 0) === 0
+        && inUse + INVENTORY_PEAK_DB_CLIENTS <= maxClients - INVENTORY_RESERVED_DB_SLOTS;
+}
+
+function sendInventoryOutcome(outcome, res, shared = false) {
+    const body = shared && outcome.status === 200 && outcome.body?.success && !outcome.body?.debug
+        ? { ...outcome.body, cached: true }
+        : outcome.body;
+    return res.status(outcome.status).json(body);
+}
+
 router.get('/inventory', verifyToken, async (req, res) => {
+    const windowDays = Math.max(0, Math.min(parseInt(req.query.window, 10) || 90, 730));
+    const force = req.query.refresh === '1' || req.query.refresh === 'true';
+    const cacheKey = `inventory_intel:${windowDays}`;
+    if (!force) {
+        const cached = getCached(cacheKey);
+        if (cached) return res.json({ ...cached, cached: true });
+    }
+
+    // A cold rebuild detoasts ~20MB of items_json. Share both the result and
+    // failures so waiters never launch duplicate scans after a cache miss.
+    const baseFlightKey = `${cacheKey}:${req.query.debug === '1' ? 'debug' : 'full'}`;
+    const flightKey = `${baseFlightKey}:${force ? 'forced' : 'normal'}`;
+    const reusableKey = force ? flightKey : `${baseFlightKey}:forced`;
+    const pending = inventoryInFlight.get(reusableKey)
+        || (!force ? inventoryInFlight.get(flightKey) : null);
+    if (pending) return sendInventoryOutcome(await pending, res, true);
+
+    // A forced refresh must not reuse stale catalog/bundle inputs from a normal
+    // build. Wait for that build to finish instead of running two heavy scans.
+    if (force) {
+        const normalPending = inventoryInFlight.get(`${baseFlightKey}:normal`);
+        if (normalPending) {
+            await normalPending;
+            const forcedPending = inventoryInFlight.get(flightKey);
+            if (forcedPending) return sendInventoryOutcome(await forcedPending, res, true);
+        }
+    }
+
+    const load = Promise.resolve().then(() => handleInventoryRequest(req));
+    inventoryInFlight.set(flightKey, load);
+    try {
+        return sendInventoryOutcome(await load, res);
+    } finally {
+        if (inventoryInFlight.get(flightKey) === load) inventoryInFlight.delete(flightKey);
+    }
+});
+
+async function handleInventoryRequest(req) {
     try {
         const windowDays = Math.max(0, Math.min(parseInt(req.query.window, 10) || 90, 730));
         const force = req.query.refresh === '1' || req.query.refresh === 'true';
         const cacheKey = `inventory_intel:${windowDays}`;
         if (!force) {
             const cached = getCached(cacheKey);
-            if (cached) return res.json({ ...cached, cached: true });
+            if (cached) return { status: 200, body: { ...cached, cached: true } };
         }
 
         const shopifyService = require('../services/shopifyService');
@@ -7936,11 +7992,14 @@ router.get('/inventory', verifyToken, async (req, res) => {
             }));
             const totalVariants = catalog.reduce((s, p) => s + (p.variants?.length || 0), 0);
             const variantsWithStock = catalog.reduce((s, p) => s + (p.variants || []).filter(v => v.inventory > 0).length, 0);
-            return res.json({
-                debug: true,
-                catalog_size: { products: catalog.length, variants: totalVariants, with_stock: variantsWithStock },
-                sample_products: sample
-            });
+            return {
+                status: 200,
+                body: {
+                    debug: true,
+                    catalog_size: { products: catalog.length, variants: totalVariants, with_stock: variantsWithStock },
+                    sample_products: sample
+                }
+            };
         }
 
         const windowSql = windowDays > 0 ? `AND created_at >= NOW() - INTERVAL '${windowDays} days'` : '';
@@ -7955,23 +8014,25 @@ router.get('/inventory', verifyToken, async (req, res) => {
 
         // ONE forward-order scan replaces the four separate ones this route used
         // to fire (delivered history, RTO history, circulation, 84-day sales).
-        // They all read the same store_shoppers heap pages — delivered and the
-        // 84-day sales series overlap almost completely — and each held its own
-        // pool slot, so the Nov 2026 Render boot logs showed 3.8s, 4.0s, 4.4s and
-        // 5.5s in parallel. The superset below is the union of the two filters:
-        //   in-window rows (max(window, 84) — the sales series is always 84 days)
-        //   ∪ in-circulation rows (never window-trimmed)
-        // and the split back into the old bucket queries happens in JS below.
-        const forwardScanDays = Math.max(windowDays, 84);
+        // The WHERE clause is the exact union of rows those buckets consume, so
+        // pending/cancelled rows inside the date window never cross the wire.
         const inWindowSql = windowDays > 0
             ? `(s.created_at >= NOW() - INTERVAL '${windowDays} days')`
             : 'TRUE';
-        const forwardWhereSql = windowDays > 0
-            ? `s.created_at >= NOW() - INTERVAL '${forwardScanDays} days'
-                   OR (s.status = 'confirmed'
-                       AND (o.awb IS NOT NULL OR o.status = 'shipped')
-                       AND COALESCE(o.status, '') NOT IN ('delivered','rto','cancelled','failed'))`
-            : 'TRUE';
+        const circulationSql = `(s.status = 'confirmed'
+            AND (o.awb IS NOT NULL OR o.status = 'shipped')
+            AND COALESCE(o.status, '') NOT IN ('delivered','rto','cancelled','failed'))`;
+        const forwardWhereSql = `((${inWindowSql})
+                AND (o.status = 'delivered' OR s.status = 'rto' OR o.status = 'rto'))
+            OR (s.created_at >= NOW() - INTERVAL '84 days'
+                AND o.status IN ('delivered','shipped'))
+            OR ${circulationSql}`;
+
+        // Recheck after the catalog/bundle work: the warm-up's earlier admission
+        // check cannot reserve slots while HTTP and Shopify calls are in flight.
+        if (req.admin?.username === 'cache-warm' && !inventoryHasHeadroom()) {
+            return { status: 503, body: { success: false, error: 'Inventory warm-up deferred under database load' } };
+        }
 
         const [forwardRows, returnRows, exchangeRows, rsPipeline] = await Promise.all([
             dbAdapter.query(`
@@ -8532,12 +8593,12 @@ router.get('/inventory', verifyToken, async (req, res) => {
             }
         };
         setCache(cacheKey, response, 'stats', 60 * 60 * 1000); // 1 hour — inventory data changes slowly, cache aggressively
-        res.json(response);
+        return { status: 200, body: response };
     } catch (error) {
         console.error('Inventory intelligence error:', error);
-        res.status(500).json({ success: false, error: 'Failed to compute inventory intelligence' });
+        return { status: 500, body: { success: false, error: 'Failed to compute inventory intelligence' } };
     }
-});
+}
 
 // ── Inventory Name Aliases (admin) ──
 // Human-confirmed mappings between order-item names and the real Shopify

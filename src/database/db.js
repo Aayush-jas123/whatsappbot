@@ -10,8 +10,11 @@ const pool = new Pool({
   // every other request queued until the 15s connect timeout fired
   // ("timeout exceeded when trying to connect" in the webhook/widget/portal paths).
   max: 10,
-  min: 0, // Allow all connections to close when idle (saves ~10MB native)
-  idleTimeoutMillis: 10000, // Close idle connections after 10s (was 20s)
+  // One warm session removes the 330–450ms Supabase handshake seen on trivial
+  // lookups. allowExitOnIdle keeps one-off scripts/tests from hanging on it.
+  min: 1,
+  allowExitOnIdle: true,
+  idleTimeoutMillis: 10000, // Close connections above the warm minimum after 10s
   connectionTimeoutMillis: 15000, // Allow up to 15s during warm-up bursts
   // Client-side guard: a query that never returns must not pin a pool slot forever
   query_timeout: 35000
@@ -133,15 +136,17 @@ setInterval(() => {
 }, 30000).unref();
 
 // CRITICAL FIX: pg Pool does NOT have endIdleClients() — implement it manually
-// This drains idle connections to free native TLS buffers (~5-10MB per idle connection)
-// Without this, native memory grows unbounded and causes OOM at 512MB
+// Routine watchdog passes keep one warm session; emergency memory pressure passes 0.
+// This bounds native TLS buffers (~5-10MB per idle connection) without paying a
+// fresh pooler handshake for every low-volume request.
 // pg-pool v3 stores IdleItem wrappers ({ client, idleListener, timeoutId }) in
 // this._idle — we must unwrap the client and use pool._remove() so the pool's
 // bookkeeping (_clients, idle timers, listeners) stays consistent. Calling
 // .end() on the wrapper itself silently no-ops and leaks/orphans connections.
-pool.endIdleClients = function() {
+pool.endIdleClients = function(keepWarm = 1) {
   let closed = 0;
-  while (this._idle && this._idle.length > 0) {
+  const keep = Math.max(0, Math.min(Number(keepWarm) || 0, this.options.max));
+  while (this._idle && this._idle.length > keep) {
     const item = this._idle[this._idle.length - 1];
     const client = item && item.client ? item.client : item;
     try {
