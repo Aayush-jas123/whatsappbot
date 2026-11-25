@@ -383,9 +383,15 @@ async function ensureInvoiceExists(rawOrderId, { allowSync = true } = {}) {
 
     console.log(`🔄 Zoho COD: no invoice for order #${orderId} — syncing from Shopify first`);
     try {
-        // Lazy require to avoid a circular dependency with the sync service
+        // Lazy require to avoid a circular dependency with the sync service.
+        // A local 'synced' row can point at an invoice that was later deleted
+        // from Zoho. We already searched Books and found no matching document,
+        // so let the sync service bypass that stale shortcut and run its own
+        // Zoho-side dedupe before creating a replacement.
         const zohoSyncService = require('./zohoSyncService');
-        const syncResult = await zohoSyncService.syncOrderToZoho(shopifyOrder);
+        const syncResult = await zohoSyncService.syncOrderToZoho(shopifyOrder, {
+            repairMissingInvoice: true
+        });
         if (syncResult.success) {
             matched = invoicesForOrder(
                 await zohoService.searchInvoice({ reference_number: orderId }), orderId

@@ -27,9 +27,10 @@
  *     first (the refund itself always happens in Shopify) and the removal is
  *     written onto the invoice as a comment before the void, because a void can
  *     never be undone and the receipt would otherwise vanish without a trace.
- *   • An invoice that already carries applied credit is LEFT ALONE — the sale
- *     was reversed by a credit note (the RTO path) and voiding on top of it
- *     would reverse the revenue twice. Those are counted and reported.
+ *   • An invoice that carries applied credit, or has any linked credit note, is
+ *     LEFT ALONE — the sale was reversed by a credit note (the RTO path) and
+ *     voiding on top of it would reverse the revenue twice. Those are counted
+ *     and reported.
  *   • Every safety decision is made on a fresh getInvoice, never on a list row:
  *     the list payload carries neither credits_applied nor payments, so an
  *     absent field would read as "no money attached".
@@ -72,6 +73,11 @@ function isTransientFailure(err) {
     const match = /Zoho API error \(([^)]+)\)/.exec(err?.message || '');
     if (!match) return true;
     return !/^\d{3}$/.test(match[1]) || /^5\d\d$/.test(match[1]);
+}
+
+/** Books blocks a void when even an unapplied credit note is linked. */
+function isCreditNoteVoidBlock(err) {
+    return /cannot void as one or more credit notes are created/i.test(err?.message || '');
 }
 
 /**
@@ -313,6 +319,14 @@ async function voidInvoiceForCancelledOrder(orderId, { reason, dispatched = fals
             out.voided++;
         } catch (err) {
             if (isRateLimited(err)) { out.rateLimited = true; return out; }
+            if (isCreditNoteVoidBlock(err)) {
+                // credits_applied only reports money already consumed. Zoho also
+                // refuses a void when a linked note is still open, so this is a
+                // terminal accounting-review case, not a transient void failure.
+                out.skippedCredited++;
+                console.warn(`⚠️ Zoho cancel: invoice ${inv.invoice_id} for order #${orderId} has linked credit note(s) — not voiding; manual accounting review required`);
+                continue;
+            }
             console.warn(`⚠️ Zoho cancel: void failed for invoice ${inv.invoice_id} (order #${orderId}): ${err.message}`);
             out.error = err.message;
         }

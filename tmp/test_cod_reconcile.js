@@ -39,6 +39,9 @@ let paymentsRecorded = [];
 let shopifyOrdersByName = {};
 let cancelledSyncLog = new Set();   // orders with a 'cancelled' zoho_sync_log row
 let syncCalls = 0;                  // on-demand Shopify → Zoho order syncs (a WRITE)
+let localSyncedOrders = new Set();  // local log says synced, but Zoho has no invoice
+let syncCreatesInvoice = false;
+let lastSyncOptions = null;
 let nextRowId = 1;
 
 const bare = id => String(id || '').replace(/^#/, '').trim();
@@ -51,6 +54,9 @@ function resetWorld() {
     shopifyOrdersByName = {};
     cancelledSyncLog = new Set();
     syncCalls = 0;
+    localSyncedOrders = new Set();
+    syncCreatesInvoice = false;
+    lastSyncOptions = null;
     nextRowId = 1;
 }
 
@@ -227,7 +233,20 @@ shopifyService.markOrderPaidByOrderNumber = async () => ({ success: true, action
 
 // The on-demand sync is the one write hiding inside ensureInvoiceExists.
 const zohoSyncService = require(path.join(ROOT, 'src', 'services', 'zohoSyncService'));
-zohoSyncService.syncOrderToZoho = async () => { syncCalls++; return { success: true }; };
+zohoSyncService.syncOrderToZoho = async (order, options = {}) => {
+    syncCalls++;
+    lastSyncOptions = options;
+    const orderId = String(order.order_number);
+    if (localSyncedOrders.has(orderId) && !options.repairMissingInvoice) {
+        return { success: true, alreadySynced: true };
+    }
+    if (syncCreatesInvoice) {
+        const invoiceId = `INV-SYNC-${orderId}`;
+        invoice(invoiceId, orderId, { balance: 1299, total: 1299, status: 'sent' });
+        return { success: true, zohoInvoiceId: invoiceId };
+    }
+    return { success: true };
+};
 
 // ============================================================
 // Assertions
@@ -420,6 +439,18 @@ async function main() {
     res = await zohoCodService.handleCodDelivery('64700', { carrier: 'delhivery' });
     check('reconciling an unsynced order does run the sync', syncCalls === 1, `syncs=${syncCalls}`);
     check('and still fails cleanly when no invoice appears', res.success === false && /No Zoho invoice/.test(res.error), JSON.stringify(res));
+
+    // -------------------------- 12b. stale local synced row with a deleted invoice
+    console.log('\n12b. a local synced row must not strand an order whose Zoho invoice is gone');
+    resetWorld();
+    codShopifyOrder('64701');
+    localSyncedOrders.add('64701');
+    syncCreatesInvoice = true;
+    res = await zohoCodService.handleCodDelivery('64701', { carrier: 'delhivery' });
+    check('repair mode bypasses the stale local synced shortcut', lastSyncOptions?.repairMissingInvoice === true, JSON.stringify(lastSyncOptions));
+    check('a replacement invoice is created and paid once', res.success === true
+        && paymentsRecorded.length === 1 && paymentsRecorded[0].invoice_id === 'INV-SYNC-64701', JSON.stringify(res));
+    check('the repair does not create duplicate invoices', Object.keys(invoicesById).length === 1);
 
     // -------------------------- 13. balance 0 means nothing is due, not "pay total"
     console.log('\n13. a settled invoice must never be paid its grand total');

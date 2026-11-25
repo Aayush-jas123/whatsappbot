@@ -164,6 +164,20 @@ const base = 'https://stub.myshopify.com/admin/api/2024-01/';
     r = await svc.voidInvoiceForCancelledOrder('43004', { reason: 'test' });
     check('already credited: left alone for review', r.skippedCredited === 1 && r.voided === 0);
 
+    // 6b. credits_applied stays zero while a linked note is still open, but
+    //     Books refuses the void anyway. That rejection is terminal review,
+    //     not a transient error that should keep the cancellation queued.
+    reset();
+    stubZoho({
+        list: [inv('INV6b', '43035')],
+        detail: { INV6b: { invoice_id: 'INV6b', status: 'open', credits_applied: 0 } },
+        voidErr: new Error('Zoho API error (400): Cannot void as one or more credit notes are created from this invoice. Credit Notes - [CN/26-27/00001]')
+    });
+    r = await svc.voidInvoiceForCancelledOrder('43035', { reason: 'test' });
+    check('linked open credit note: not voided', calls.includes('void:INV6b') && r.voided === 0);
+    check('linked open credit note: retired for manual review, not retried as an error',
+        r.skippedCredited === 1 && r.error === null);
+
     // 7. Rate limit stops the walk without swallowing the order
     reset();
     stubZoho({ searchErr: new Error('Zoho API 429: maximum call rate limit reached') });

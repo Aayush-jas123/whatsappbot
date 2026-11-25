@@ -27,8 +27,12 @@ const inFlightSyncs = new Set();
 /**
  * Main entry point — called from the Shopify webhook handler
  * when an order is created or updated.
+ *
+ * `repairMissingInvoice` is only for callers that have already verified the
+ * invoice is absent in Zoho. It bypasses the local synced-row shortcut, not the
+ * cancellation guards or the Zoho-side dedupe check below.
  */
-async function syncOrderToZoho(shopifyOrder) {
+async function syncOrderToZoho(shopifyOrder, { repairMissingInvoice = false } = {}) {
     const orderId = shopifyOrder.order_number?.toString() || shopifyOrder.id?.toString();
 
     if (!orderId) {
@@ -56,7 +60,7 @@ async function syncOrderToZoho(shopifyOrder) {
         'SELECT id, status FROM zoho_sync_log WHERE shopify_order_id = ? AND status = ?',
         [orderId, 'synced']
     );
-    if (existing.length > 0) {
+    if (existing.length > 0 && !repairMissingInvoice) {
         console.log(`✅ Zoho sync: order #${orderId} already synced (id=${existing[0].id})`);
         return { success: true, alreadySynced: true, logId: existing[0].id };
     }
