@@ -1119,6 +1119,55 @@ function customerTicket(t) {
     };
 }
 
+// ---------- portal (staff) thread projection ----------
+// The team portal was a WhatsApp/Instagram inbox only: it read `messages` by
+// phone, so a storefront ticket - whose whole conversation lives in this row's
+// `thread` - opened as unrelated WhatsApp history the team could neither read
+// nor answer. These helpers are the single definition of that lane, so the
+// portal and the desk cannot drift apart.
+
+// Same rule as DESK_WEBSITE_COND above: channel='website' also covers the chat
+// widget, and its tickets (WDG-) deliberately continue on WhatsApp, so they must
+// keep the portal's chat view.
+function isStorefrontTicket(t) {
+    return !!t && t.channel === 'website' && !String(t.ticket_number || '').startsWith('WDG-');
+}
+
+// Staff see the stored thread as it is, including the internal events the
+// customer projection hides - deliberately NOT isCustomerVisibleEntry.
+function portalThreadView(t) {
+    const thread = (t && Array.isArray(t.thread)) ? t.thread : [];
+    return thread.filter(Boolean).map(m => ({
+        role: m.kind === 'event' ? 'event' : (m.role === 'agent' ? 'agent' : 'customer'),
+        text: String(m.text || ''),
+        at: m.at || null,
+        ask: !!m.ask,
+        agentId: m.agentId || null,
+        internal: m.internal === true
+    }));
+}
+
+// A portal reply behaves exactly like the desk composer (supportDeskRoutes
+// agentComposer): the answer joins the thread, the ticket waits on the customer
+// and the first-response clock starts once. Nothing goes out on WhatsApp - the
+// storefront Help & Tickets tab is the delivery channel.
+function portalAgentReplyPatch(t, opts = {}) {
+    if (!t) return null;
+    const text = String(opts.text || '').trim().slice(0, 5000);
+    if (!text) return null;
+    const now = opts.now || Date.now();
+    const thread = (t && Array.isArray(t.thread)) ? t.thread.slice() : [];
+    thread.push({ role: 'agent', text, at: now, agentId: opts.agentId || null });
+    const patch = {
+        thread,
+        status: 'awaiting',
+        updated_at: new Date(now).toISOString(),
+        last_agent_at: new Date(now).toISOString()
+    };
+    if (!t.first_response_at) patch.first_response_at = new Date(now).toISOString();
+    return patch;
+}
+
 // Builds the filtered list query in SQL (the app has no REST filter builder).
 async function deskQueryTickets(filters = {}) {
     const conditions = [];
@@ -1209,5 +1258,6 @@ module.exports = {
     isWhitelisted, listWhitelist, addWhitelist, removeWhitelist,
     listTicketsByPhone, countTicketsByPhone, getTicket, getTicketByNumber, openTicketForOrder,
     createTicket, updateTicket, listTicketImages, deskQueryTickets, deskStatsAgg, publicTicket, customerTicket, isCustomerVisibleEntry,
+    isStorefrontTicket, portalThreadView, portalAgentReplyPatch,
     getPortalIndex, describePortal
 };
