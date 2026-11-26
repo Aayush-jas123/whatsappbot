@@ -135,6 +135,11 @@ function creditNoteDateFor(invoiceDate) {
     return today >= earliest ? today : earliest;
 }
 
+// Charge lines (shipping, COD) are never part of an exchange swap: they stay
+// on the original invoice and are never billed a second time. Full returns and
+// RTOs use the same matcher to reverse them once every product is credited.
+const isChargeLine = (l) => /shipping|cod|cash on delivery/i.test(`${l?.name || ''} ${l?.description || ''}`);
+
 /**
  * Credit note payload that MIRRORS the invoice it reverses: same rate, same
  * discount proportion, same tax basis (CGST+SGST vs IGST, inclusive vs
@@ -337,20 +342,14 @@ async function prepareAndCreateCreditNote({ shopifyOrder, orderId, returnItems, 
         customerId: customerId || originalInvoice.customer_id
     });
 
-    // For RTOs where ALL items are returned, include shipping and COD charges
-    // in the credit note so the invoice balances to zero. Without this, those
-    // charges remain as an outstanding balance on the invoice.
-    if (returnType === 'rto' && fullInvoice?.line_items?.length > 0) {
-        const isNonProductLine = (l) => {
-            const name = (l.name || '').toLowerCase();
-            const desc = (l.description || '').toLowerCase();
-            return name.includes('shipping') || desc.includes('shipping')
-                || name.includes('cod') || desc.includes('cod')
-                || name.includes('cash on delivery') || desc.includes('cash on delivery');
-        };
-
-        const invoiceItemLines = fullInvoice.line_items.filter(l => !isNonProductLine(l));
-        const nonProductLines = fullInvoice.line_items.filter(l => isNonProductLine(l));
+    // For full returns and RTOs, include shipping and COD charges in the credit
+    // note so the invoice balances to zero. Shopify refunds used to take the
+    // product-only path and leave the original shipping charge outstanding.
+    // Exchanges keep charge lines on the original invoice; the replacement is
+    // billed separately and must not reverse the original shipping a second time.
+    if (returnType !== 'exchange' && fullInvoice?.line_items?.length > 0) {
+        const invoiceItemLines = fullInvoice.line_items.filter(l => !isChargeLine(l));
+        const nonProductLines = fullInvoice.line_items.filter(l => isChargeLine(l));
 
         // Check if all invoice product items are being returned. The count has
         // to come from the lines actually built into the note, not from the
@@ -364,10 +363,11 @@ async function prepareAndCreateCreditNote({ shopifyOrder, orderId, returnItems, 
 
         if (totalCreditedQty >= totalInvoiceQty && totalInvoiceQty > 0) {
             // All items returned — add shipping/COD lines to credit note
+            const reversalLabel = returnType === 'rto' ? 'RTO' : 'Return';
             for (const extraLine of nonProductLines) {
                 const creditLine = {
                     name: extraLine.name,
-                    description: `RTO ${extraLine.name} Reversal`,
+                    description: `${reversalLabel} ${extraLine.name} Reversal`,
                     quantity: parseFloat(extraLine.quantity || 1),
                     rate: parseFloat(extraLine.rate || 0),
                     discount: parseFloat(extraLine.discount || 0)
@@ -387,7 +387,7 @@ async function prepareAndCreateCreditNote({ shopifyOrder, orderId, returnItems, 
                 }
 
                 creditNotePayload.line_items.push(creditLine);
-                console.log(`📦 Zoho RTO: all items returned, added ${extraLine.name} (₹${creditLine.rate.toFixed(2)}) to credit note`);
+                console.log(`📦 Zoho ${returnType}: all items returned, added ${extraLine.name} (₹${creditLine.rate.toFixed(2)}) to credit note`);
             }
         }
     }
@@ -496,10 +496,6 @@ async function ensureCreditNoteApplied({ creditNote, fullInvoice, reference, ret
         return false;
     }
 }
-
-// Charge lines (shipping, COD) are never part of an exchange swap: they stay
-// on the original invoice and are never billed a second time.
-const isChargeLine = (l) => /shipping|cod|cash on delivery/i.test(`${l?.name || ''} ${l?.description || ''}`);
 
 // A rendered line carries its GST split as flat rates (that is what Books
 // accepts on a POST/PUT). The credit-note builder reads the split from the
