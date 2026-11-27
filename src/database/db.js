@@ -1167,8 +1167,8 @@ async function initializeSupportMediaTable() {
 }
 
 // ── Manual Inventory Tracking Tables ──
-// Tracks manually-managed inventory (bulk inventory-in operations) independent
-// of Shopify. Used for the Shopper Hub bulk inventory-in feature.
+// Tracks manually-managed inventory independent of Shopify. Bulk moves, customer
+// sales, cancellation restocks, and Shopify workbench syncs all share this ledger.
 async function initializeManualInventoryTables() {
   try {
     // Manual inventory: current stock levels per SKU
@@ -1206,6 +1206,39 @@ async function initializeManualInventoryTables() {
     `);
     await pool.query('CREATE INDEX IF NOT EXISTS idx_inv_adjustments_sku ON inventory_adjustments(sku_key, created_at DESC)');
     await pool.query('CREATE INDEX IF NOT EXISTS idx_inv_adjustments_type ON inventory_adjustments(adjustment_type, created_at DESC)');
+    // One sale/restock entry per order and SKU. The transaction also takes an
+    // order-level advisory lock; these indexes are the durable dedupe guard
+    // across processes and webhook retries.
+    await pool.query(`
+      CREATE UNIQUE INDEX IF NOT EXISTS uq_inventory_adjustments_sale_order_sku
+      ON inventory_adjustments(reference, sku_key)
+      WHERE adjustment_type = 'sale'
+    `);
+    await pool.query(`
+      CREATE UNIQUE INDEX IF NOT EXISTS uq_inventory_adjustments_restock_order_sku
+      ON inventory_adjustments(reference, sku_key)
+      WHERE adjustment_type = 'sale_restock'
+    `);
+    await pool.query(`
+      CREATE UNIQUE INDEX IF NOT EXISTS uq_inventory_adjustments_rto_order_sku
+      ON inventory_adjustments(reference, sku_key)
+      WHERE adjustment_type = 'rto_restock'
+    `);
+    await pool.query(`
+      CREATE UNIQUE INDEX IF NOT EXISTS uq_inventory_adjustments_return_event_sku
+      ON inventory_adjustments(reference, sku_key)
+      WHERE adjustment_type = 'return_restock'
+    `);
+    await pool.query(`
+      CREATE UNIQUE INDEX IF NOT EXISTS uq_inventory_adjustments_exchange_return_sku
+      ON inventory_adjustments(reference, sku_key)
+      WHERE adjustment_type = 'exchange_restock'
+    `);
+    await pool.query(`
+      CREATE UNIQUE INDEX IF NOT EXISTS uq_inventory_adjustments_exchange_sale_sku
+      ON inventory_adjustments(reference, sku_key)
+      WHERE adjustment_type = 'exchange_sale'
+    `);
 
     // Shopify ⇄ Stock Room sync run audit (workbench pulls/pushes + bulk mirrors)
     await pool.query(`

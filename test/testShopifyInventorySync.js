@@ -6,6 +6,7 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
 const sync = require('../src/services/shopifyInventorySync');
+const shoppersInventory = require('../src/services/shoppersInventoryService');
 
 /* ───────────────────────── fixtures ───────────────────────── */
 
@@ -677,4 +678,393 @@ test('push plan marks hub rows changed since the last push and totals the remova
     assert.equal(plan.stats.will_clear, 1);
     assert.equal(plan.stats.recent_diffs, 1, 'one row to preselect, not the whole diff');
     assert.equal(plan.stats.net_delta, -40);
+});
+
+/* ── customer-order stock deductions ───────────────────────── */
+
+test('order lines deduct the exact manual SKU and aggregate duplicate lines', async () => {
+    const rows = [
+        { sku_key: 'waffle-001-b-s', product_name: 'WAFFLE - 001 ( B )', size: 'S' },
+        { sku_key: 'waffle-001-b-xs', product_name: 'WAFFLE - 001 ( B )', size: 'XS' },
+    ];
+    const items = [
+        { title: 'WAFFLE - 001 ( B )', variant_title: 'S', quantity: 2 },
+        { title: 'WAFFLE  - 001(B)', variant_title: 'Size: S', quantity: 1 },
+        { title: 'WAFFLE - 001 ( B )', variant_title: 'XS', quantity: 1 },
+    ];
+    const plan = await shoppersInventory.planOrderDeductions(items, rows);
+    assert.deepEqual(plan.deductions, [
+        { sku_key: 'waffle-001-b-s', product_name: 'WAFFLE - 001 ( B )', size: 'S', quantity: 3 },
+        { sku_key: 'waffle-001-b-xs', product_name: 'WAFFLE - 001 ( B )', size: 'XS', quantity: 1 },
+    ]);
+    assert.deepEqual(plan.unmatched, []);
+});
+
+test('bundle sales expand into component stock before deduction', async () => {
+    const rows = [{ sku_key: 'waffle-001-b-s', product_name: 'WAFFLE - 001 ( B )', size: 'S' }];
+    const bundles = [{ bundle_sku: 'WAFFLE BUNDLE', component_sku: 'WAFFLE - 001 ( B )', component_qty: 2 }];
+    const items = shoppersInventory.expandBundleItems([
+        { title: 'WAFFLE BUNDLE', variant_title: 'S', quantity: 2 },
+    ], bundles);
+    const plan = await shoppersInventory.planOrderDeductions(items, rows);
+    assert.equal(plan.deductions.length, 1);
+    assert.equal(plan.deductions[0].quantity, 4);
+    assert.deepEqual(plan.unmatched, []);
+});
+
+test('catalog variant id resolves a sheet key that differs from the Shopify handle key', async () => {
+    const rows = [{ sku_key: 'sheet-waffle-s', product_name: 'Legacy Waffle', size: 'S' }];
+    const products = [{
+        id: 1, title: 'WAFFLE - 001 ( B )', handle: 'waffle-001-b',
+        variants: [{ id: 11, title: 'S', sku: 'sheet-waffle-s', inventory_item_id: 911, inventory: 5 }],
+    }];
+    const plan = await shoppersInventory.planOrderDeductions([
+        { title: 'Renamed Waffle', variant_id: 11, variant_title: 'S', quantity: 1 },
+    ], rows, { catalog: products });
+    assert.equal(plan.deductions[0].sku_key, 'sheet-waffle-s');
+    assert.deepEqual(plan.unmatched, []);
+});
+
+function inventoryLedgerClient(initialQuantity) {
+    const state = { quantity: initialQuantity, updates: 0, claims: new Set() };
+    return {
+        state,
+        async query(sql, params = []) {
+            if (sql.includes('FROM manual_inventory') && sql.includes('FOR UPDATE')) {
+                return { rows: [{ sku_key: params[0], product_name: 'WAFFLE - 001 ( B )', size: 'S', quantity: state.quantity }] };
+            }
+            if (sql.includes('FROM inventory_adjustments')) {
+                if (sql.includes('SELECT sku_key, quantity_change')) return { rows: state.sales || [] };
+                if (sql.includes('COALESCE(SUM(quantity_change)')) return { rows: [] };
+                const type = sql.includes("'sale_restock'") ? 'sale_restock' : 'sale';
+                const key = `${type}:${params[0]}:${params[1]}`;
+                return { rows: state.claims.has(key) ? [{ id: 1 }] : [] };
+            }
+            if (sql.includes('INSERT INTO inventory_adjustments')) {
+                const type = sql.includes("'sale_restock'") ? 'sale_restock' : 'sale';
+                const key = `${type}:${params[6]}:${params[0]}`;
+                if (state.claims.has(key)) return { rows: [] };
+                state.claims.add(key);
+                return { rows: [{ id: state.claims.size }] };
+            }
+            if (sql.includes('UPDATE manual_inventory SET quantity')) {
+                state.quantity = params[0];
+                state.updates++;
+                return { rows: [] };
+            }
+            throw new Error(`Unexpected SQL: ${sql}`);
+        },
+    };
+}
+
+test('duplicate order webhooks cannot deduct the same SKU twice', async () => {
+    const client = inventoryLedgerClient(10);
+    const deductions = [{ sku_key: 'waffle-001-b-s', product_name: 'WAFFLE - 001 ( B )', size: 'S', quantity: 2 }];
+    const first = await shoppersInventory.applySaleDeductions(client, '123', deductions);
+    const retry = await shoppersInventory.applySaleDeductions(client, '123', deductions);
+    assert.equal(first.applied[0].quantity_change, -2);
+    assert.equal(first.applied[0].quantity_after, 8);
+    assert.equal(retry.applied.length, 0);
+    assert.equal(retry.duplicates, 1);
+    assert.equal(client.state.quantity, 8);
+    assert.equal(client.state.updates, 1);
+});
+
+test('cancellation restores only the quantity actually deducted and is idempotent', async () => {
+    const client = inventoryLedgerClient(8);
+    const sales = [{ sku_key: 'waffle-001-b-s', quantity_change: -2 }];
+    client.state.sales = sales;
+    const first = await shoppersInventory.applyCancellationRestock(client, '123', sales);
+    const retry = await shoppersInventory.applyCancellationRestock(client, '123', sales);
+    assert.equal(first.applied[0].quantity_change, 2);
+    assert.equal(first.applied[0].quantity_after, 10);
+    assert.equal(retry.applied.length, 0);
+    assert.equal(retry.duplicates, 1);
+    assert.equal(client.state.quantity, 10);
+    assert.equal(client.state.updates, 1);
+});
+
+test('order ingestion deducts once across repeated deliveries', async () => {
+    const rows = [{ sku_key: 'waffle-001-b-s', product_name: 'WAFFLE - 001 ( B )', size: 'S' }];
+    const ledger = inventoryLedgerClient(10);
+    const client = {
+        async query(sql, params = []) {
+            if (['BEGIN', 'COMMIT', 'ROLLBACK'].includes(sql)) return { rows: [] };
+            if (sql.includes('pg_advisory_xact_lock')) return { rows: [] };
+            return ledger.query(sql, params);
+        },
+        release() {},
+    };
+    const db = {
+        async query(sql) {
+            if (sql.includes('FROM manual_inventory')) return rows;
+            return [];
+        },
+    };
+    const deps = { db, pool: { connect: async () => client }, loadCatalog: async () => [] };
+    const order = { order_number: 123, line_items: [{ title: 'WAFFLE - 001 ( B )', variant_title: 'S', quantity: 2 }] };
+    const first = await shoppersInventory.deductOrderStock(order, deps);
+    const retry = await shoppersInventory.deductOrderStock(order, deps);
+    assert.equal(first.deducted, 2);
+    assert.equal(retry.deducted, 0);
+    assert.equal(retry.duplicates, 1);
+    assert.equal(ledger.state.quantity, 8);
+    assert.equal(ledger.state.updates, 1);
+});
+
+test('Shopify and GoKwik order ids normalize to one deduction reference', () => {
+    assert.equal(shoppersInventory.orderKeyOf({ order_number: 123, name: '#123' }), '123');
+    assert.equal(shoppersInventory.orderKeyOf({ name: '#123' }), '123');
+    assert.equal(shoppersInventory.orderKeyOf({ id: 456 }), '456');
+});
+
+/* ── RTO, returns, and exchanges ───────────────────────────── */
+
+const reverseSku = 'waffle-001-b-s';
+const reverseSkuM = 'waffle-001-b-m';
+const reverseRows = [
+    { sku_key: reverseSku, product_name: 'WAFFLE - 001 ( B )', size: 'S' },
+    { sku_key: reverseSkuM, product_name: 'WAFFLE - 001 ( B )', size: 'M' },
+];
+const reverseItem = size => ({ title: 'WAFFLE - 001 ( B )', variant_title: size, quantity: 1 });
+
+function reverseInventoryLedgerClient(initialQuantities, initialAdjustments = []) {
+    const quantities = new Map(Object.entries(initialQuantities));
+    const adjustments = initialAdjustments.map(row => ({ ...row }));
+    const state = { quantities, adjustments, updates: 0 };
+    const restockTypes = new Set(['sale_restock', 'rto_restock', 'return_restock', 'exchange_restock']);
+    const belongsToOrder = (row, orderKey) => row.reference === orderKey
+        || ['return:', 'refund:', 'exchange:'].some(prefix =>
+            String(row.reference || '').startsWith(`${prefix}${orderKey}:`));
+
+    return {
+        state,
+        async query(sql, params = []) {
+            if (sql.includes('FROM manual_inventory') && sql.includes('FOR UPDATE')) {
+                if (!quantities.has(params[0])) return { rows: [] };
+                return {
+                    rows: [{
+                        sku_key: params[0],
+                        product_name: 'WAFFLE - 001 ( B )',
+                        size: params[0] === reverseSku ? 'S' : 'M',
+                        quantity: quantities.get(params[0]),
+                    }],
+                };
+            }
+            if (sql.includes('SELECT 1 FROM inventory_adjustments')) {
+                const type = sql.match(/adjustment_type = '([^']+)'/)?.[1];
+                const exists = adjustments.some(row =>
+                    row.reference === params[0] && row.sku_key === params[1] && row.adjustment_type === type);
+                return { rows: exists ? [{ id: 1 }] : [] };
+            }
+            if (sql.includes('SELECT sku_key, quantity_change FROM inventory_adjustments')) {
+                const saleOnly = sql.includes("adjustment_type = 'sale'");
+                return {
+                    rows: adjustments
+                        .filter(row => belongsToOrder(row, params[0])
+                            && Number(row.quantity_change) < 0
+                            && (!saleOnly || row.adjustment_type === 'sale'))
+                        .sort((a, b) => a.sku_key.localeCompare(b.sku_key)),
+                };
+            }
+            if (sql.includes('SELECT sku_key, COALESCE(SUM(quantity_change)')) {
+                const totals = new Map();
+                for (const row of adjustments) {
+                    if (!belongsToOrder(row, params[0]) || !restockTypes.has(row.adjustment_type)) continue;
+                    totals.set(row.sku_key, (totals.get(row.sku_key) || 0) + Number(row.quantity_change));
+                }
+                return { rows: [...totals].map(([sku_key, restored]) => ({ sku_key, restored })) };
+            }
+            if (sql.includes('INSERT INTO inventory_adjustments')) {
+                const type = ['sale', 'sale_restock', 'rto_restock', 'return_restock', 'exchange_restock', 'exchange_sale']
+                    .find(candidate => sql.includes(`'${candidate}'`));
+                const reference = params[6];
+                const skuKey = params[0];
+                if (adjustments.some(row =>
+                    row.reference === reference && row.sku_key === skuKey && row.adjustment_type === type)) {
+                    return { rows: [] };
+                }
+                adjustments.push({
+                    sku_key: skuKey,
+                    adjustment_type: type,
+                    quantity_change: Number(params[3]),
+                    reference,
+                });
+                return { rows: [{ id: adjustments.length }] };
+            }
+            if (sql.includes('UPDATE manual_inventory SET quantity')) {
+                quantities.set(params[2], params[0]);
+                state.updates++;
+                return { rows: [] };
+            }
+            throw new Error(`Unexpected SQL: ${sql}`);
+        },
+    };
+}
+
+function reverseInventoryDeps(ledger) {
+    const client = {
+        async query(sql, params = []) {
+            if (['BEGIN', 'COMMIT', 'ROLLBACK'].includes(sql)) return { rows: [] };
+            if (sql.includes('pg_advisory_xact_lock')) return { rows: [] };
+            return ledger.query(sql, params);
+        },
+        release() {},
+    };
+    return {
+        db: {
+            async query(sql) {
+                if (sql.includes('FROM manual_inventory')) return reverseRows;
+                if (sql.includes('FROM zoho_bundle_map')) return [];
+                if (sql.includes('FROM inventory_name_aliases')) return [];
+                throw new Error(`Unexpected context SQL: ${sql}`);
+            },
+        },
+        pool: { connect: async () => client },
+        loadCatalog: async () => [],
+    };
+}
+
+test('RTO delivery restores the actual sale once and cannot overlap cancellation', async () => {
+    const ledger = reverseInventoryLedgerClient({ [reverseSku]: 8 }, [
+        { reference: '123', sku_key: reverseSku, adjustment_type: 'sale', quantity_change: -2 },
+    ]);
+    const deps = reverseInventoryDeps(ledger);
+
+    const first = await shoppersInventory.restockRTOOrder({ order_number: '#123' }, deps);
+    const retry = await shoppersInventory.restockRTOOrder({ order_number: '123' }, deps);
+    const cancellation = await shoppersInventory.restockCancelledOrder({ order_number: '123' }, deps);
+
+    assert.equal(first.restored, 2);
+    assert.equal(retry.restored, 0);
+    assert.equal(retry.duplicates, 1);
+    assert.equal(cancellation.restored, 0);
+    assert.equal(cancellation.exhausted, 1);
+    assert.equal(ledger.state.quantities.get(reverseSku), 10);
+    assert.equal(ledger.state.updates, 1);
+    assert.equal(ledger.state.adjustments.filter(row => row.adjustment_type === 'rto_restock').length, 1);
+});
+
+test('partial returns are capped by the quantity actually deducted', async () => {
+    const ledger = reverseInventoryLedgerClient({ [reverseSku]: 7 }, [
+        { reference: '123', sku_key: reverseSku, adjustment_type: 'sale', quantity_change: -3 },
+    ]);
+    const deps = reverseInventoryDeps(ledger);
+    const twoUnits = [{ ...reverseItem('S'), quantity: 2 }];
+
+    const first = await shoppersInventory.restockReturnedItems({
+        order: { order_number: '123' }, items: twoUnits, eventId: 'return:REQ-1', deps,
+    });
+    const second = await shoppersInventory.restockReturnedItems({
+        order: { order_number: '123' }, items: twoUnits, eventId: 'return:REQ-2', deps,
+    });
+    const retry = await shoppersInventory.restockReturnedItems({
+        order: { order_number: '123' }, items: twoUnits, eventId: 'return:REQ-1', deps,
+    });
+    const exhausted = await shoppersInventory.restockReturnedItems({
+        order: { order_number: '123' }, items: [reverseItem('S')], eventId: 'return:REQ-3', deps,
+    });
+
+    assert.equal(first.restored, 2);
+    assert.equal(second.restored, 1, 'the second return can restore only the remaining sold unit');
+    assert.equal(retry.restored, 0);
+    assert.equal(retry.duplicates, 1);
+    assert.equal(exhausted.restored, 0);
+    assert.equal(exhausted.exhausted, 1);
+    assert.equal(ledger.state.quantities.get(reverseSku), 10);
+    assert.equal(ledger.state.updates, 2);
+});
+
+test('Shopify refunds skip no_restock lines and restock only the refunded quantity', async () => {
+    const ledger = reverseInventoryLedgerClient({ [reverseSku]: 8 }, [
+        { reference: '123', sku_key: reverseSku, adjustment_type: 'sale', quantity_change: -2 },
+    ]);
+    const deps = reverseInventoryDeps(ledger);
+    const lineItem = { title: 'WAFFLE - 001 ( B )', variant_title: 'S', quantity: 1 };
+    const refund = {
+        id: 555,
+        refund_line_items: [
+            { line_item: lineItem, quantity: 1, restock_type: 'no_restock' },
+            { line_item: lineItem, quantity: 1, restock_type: 'return' },
+        ],
+    };
+
+    const first = await shoppersInventory.restockShopifyRefund({ order_number: '#123' }, refund, deps);
+    const retry = await shoppersInventory.restockShopifyRefund({ order_number: '123' }, refund, deps);
+    const skipped = await shoppersInventory.restockShopifyRefund({ order_number: '123' }, {
+        id: 556, refund_line_items: [{ line_item: lineItem, quantity: 1, restock_type: 'no_restock' }],
+    }, deps);
+
+    assert.equal(first.restored, 1);
+    assert.equal(first.reference, 'refund:123:555');
+    assert.equal(retry.restored, 0);
+    assert.equal(retry.duplicates, 1);
+    assert.equal(skipped.skipped, 'no_restockable_items');
+    assert.equal(ledger.state.quantities.get(reverseSku), 9);
+    assert.equal(ledger.state.updates, 1);
+});
+
+test('advance exchange deducts on dispatch and restocks the original on receipt', async () => {
+    const ledger = reverseInventoryLedgerClient({ [reverseSku]: 9, [reverseSkuM]: 5 }, [
+        { reference: '123', sku_key: reverseSku, adjustment_type: 'sale', quantity_change: -1 },
+    ]);
+    const deps = reverseInventoryDeps(ledger);
+
+    const dispatched = await shoppersInventory.deductExchangeReplacement({
+        order: { order_number: '123' }, items: [reverseItem('M')], eventId: 'REQ-EX-1', deps,
+    });
+    const dispatchRetry = await shoppersInventory.deductExchangeReplacement({
+        order: { order_number: '123' }, items: [reverseItem('M')], eventId: 'REQ-EX-1', deps,
+    });
+    const received = await shoppersInventory.restockExchangeItems({
+        order: { order_number: '123' }, items: [reverseItem('S')], eventId: 'REQ-EX-1', deps,
+    });
+    const receiptRetry = await shoppersInventory.restockExchangeItems({
+        order: { order_number: '123' }, items: [reverseItem('S')], eventId: 'REQ-EX-1', deps,
+    });
+    const replacementReturned = await shoppersInventory.restockReturnedItems({
+        order: { order_number: '123' }, items: [reverseItem('M')], eventId: 'return:REQ-EX-2', deps,
+    });
+
+    assert.equal(dispatched.deducted, 1);
+    assert.equal(dispatchRetry.deducted, 0);
+    assert.equal(dispatchRetry.duplicates, 1);
+    assert.equal(received.restored, 1);
+    assert.equal(receiptRetry.restored, 0);
+    assert.equal(receiptRetry.duplicates, 1);
+    assert.equal(replacementReturned.restored, 1, 'an exchanged replacement can later be returned against its own deduction');
+    assert.equal(ledger.state.quantities.get(reverseSku), 10);
+    assert.equal(ledger.state.quantities.get(reverseSkuM), 5);
+    assert.equal(ledger.state.updates, 3);
+    assert.equal(ledger.state.adjustments.filter(row => row.adjustment_type === 'exchange_sale').length, 1);
+    assert.equal(ledger.state.adjustments.filter(row => row.adjustment_type === 'exchange_restock').length, 1);
+});
+
+test('whole-order cancellation restores the original sale without touching an exchange replacement', async () => {
+    const ledger = reverseInventoryLedgerClient({ [reverseSku]: 9, [reverseSkuM]: 4 }, [
+        { reference: '123', sku_key: reverseSku, adjustment_type: 'sale', quantity_change: -1 },
+        { reference: 'exchange:123:REQ-EX-1', sku_key: reverseSkuM, adjustment_type: 'exchange_sale', quantity_change: -1 },
+    ]);
+    const deps = reverseInventoryDeps(ledger);
+
+    const result = await shoppersInventory.restockCancelledOrder({ order_number: '123' }, deps);
+
+    assert.equal(result.restored, 1);
+    assert.equal(ledger.state.quantities.get(reverseSku), 10);
+    assert.equal(ledger.state.quantities.get(reverseSkuM), 4);
+    assert.equal(ledger.state.updates, 1);
+});
+
+test('a return cannot restock an order with no matching deduction ledger', async () => {
+    const ledger = reverseInventoryLedgerClient({ [reverseSku]: 10 });
+    const deps = reverseInventoryDeps(ledger);
+
+    const result = await shoppersInventory.restockReturnedItems({
+        order: { order_number: '123' }, items: [reverseItem('S')], eventId: 'return:REQ-1', deps,
+    });
+
+    assert.equal(result.restored, 0);
+    assert.equal(result.exhausted, 1);
+    assert.equal(ledger.state.quantities.get(reverseSku), 10);
+    assert.equal(ledger.state.updates, 0);
 });

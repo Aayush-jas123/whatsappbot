@@ -1146,8 +1146,8 @@
 
         const sevenDaysAgo = Date.now() - 7 * 86400000;
         const recentAdj = SR.adjustments.filter(a => new Date(a.created_at).getTime() > sevenDaysAgo);
-        const recentIn = recentAdj.filter(a => a.adjustment_type === 'stock_in' || a.adjustment_type === 'bulk_in').reduce((s, a) => s + Math.abs(a.quantity_change), 0);
-        const recentOut = recentAdj.filter(a => a.adjustment_type === 'stock_out' || a.adjustment_type === 'bulk_out').reduce((s, a) => s + Math.abs(a.quantity_change), 0);
+        const recentIn = recentAdj.filter(a => a.adjustment_type === 'stock_in' || a.adjustment_type === 'bulk_in' || ['sale_restock', 'rto_restock', 'return_restock', 'exchange_restock'].includes(a.adjustment_type)).reduce((s, a) => s + Math.abs(a.quantity_change), 0);
+        const recentOut = recentAdj.filter(a => a.adjustment_type === 'stock_out' || a.adjustment_type === 'bulk_out' || ['sale', 'exchange_sale'].includes(a.adjustment_type)).reduce((s, a) => s + Math.abs(a.quantity_change), 0);
 
         // Update page header
         const headerP = main.querySelector('.ict-page-head p');
@@ -1222,7 +1222,7 @@
                         <td class="ict-mono ict-muted"><code>${esc(a.sku_key)}</code></td>
                         <td>${esc(a.product_name)}</td>
                         <td class="ict-muted">${esc(a.size)}</td>
-                        <td>${pill(a.adjustment_type === 'stock_in' || a.adjustment_type === 'bulk_in' ? 'healthy' : a.adjustment_type === 'stock_out' || a.adjustment_type === 'bulk_out' ? 'critical' : 'info', a.adjustment_type.replace('_', ' '))}</td>
+                        <td>${pill(a.adjustment_type === 'stock_in' || a.adjustment_type === 'bulk_in' || ['sale_restock', 'rto_restock', 'return_restock', 'exchange_restock'].includes(a.adjustment_type) ? 'healthy' : a.adjustment_type === 'stock_out' || a.adjustment_type === 'bulk_out' || ['sale', 'exchange_sale'].includes(a.adjustment_type) ? 'critical' : 'info', a.adjustment_type.replace('_', ' '))}</td>
                         <td class="ict-num ${a.quantity_change >= 0 ? 'ict-healthy-text' : 'ict-critical-text'}" style="font-weight:600">${a.quantity_change >= 0 ? '+' : ''}${num(a.quantity_change)}</td>
                         <td class="ict-num ict-muted">${num(a.quantity_before)}</td>
                         <td class="ict-num ict-strong">${num(a.quantity_after)}</td>
@@ -1251,8 +1251,8 @@
 
         const sevenDaysAgo = Date.now() - 7 * 86400000;
         const recentAdj = SR.adjustments.filter(a => new Date(a.created_at).getTime() > sevenDaysAgo);
-        const recentIn = recentAdj.filter(a => a.adjustment_type === 'stock_in' || a.adjustment_type === 'bulk_in').reduce((s, a) => s + Math.abs(a.quantity_change), 0);
-        const recentOut = recentAdj.filter(a => a.adjustment_type === 'stock_out' || a.adjustment_type === 'bulk_out').reduce((s, a) => s + Math.abs(a.quantity_change), 0);
+        const recentIn = recentAdj.filter(a => a.adjustment_type === 'stock_in' || a.adjustment_type === 'bulk_in' || ['sale_restock', 'rto_restock', 'return_restock', 'exchange_restock'].includes(a.adjustment_type)).reduce((s, a) => s + Math.abs(a.quantity_change), 0);
+        const recentOut = recentAdj.filter(a => a.adjustment_type === 'stock_out' || a.adjustment_type === 'bulk_out' || ['sale', 'exchange_sale'].includes(a.adjustment_type)).reduce((s, a) => s + Math.abs(a.quantity_change), 0);
 
         main.innerHTML = `
             <div class="sr-container">

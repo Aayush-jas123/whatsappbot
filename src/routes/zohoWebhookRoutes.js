@@ -9,6 +9,7 @@ const zohoReturnService = require('../services/zohoReturnService');
 const zohoCodService = require('../services/zohoCodService');
 const zohoService = require('../services/zohoService');
 const zohoCancelService = require('../services/zohoCancelService');
+const shoppersInventoryService = require('../services/shoppersInventoryService');
 
 // ============================================================
 // SHOPIFY WEBHOOK VERIFICATION (HMAC-SHA256)
@@ -77,6 +78,11 @@ router.post('/orders/create', verifyShopifyWebhook, async (req, res) => {
     try {
         const order = req.body;
         console.log(`📦 Zoho webhook: order created #${order.order_number || order.id}`);
+        // The Stock Room is separate from Shopify stock. Keep this call here as
+        // well as the shopper-ingestion path because either webhook subscription
+        // may be the one that delivers a given order. Run it before Zoho so an
+        // accounting outage cannot leave hub stock unchanged.
+        await shoppersInventoryService.deductOrderStock(order);
         await zohoSyncService.syncOrderToZoho(order);
     } catch (err) {
         console.error('❌ Zoho webhook order/create error:', err.message);
@@ -123,6 +129,7 @@ router.post('/orders/cancelled', verifyShopifyWebhook, async (req, res) => {
 
         console.log(`📦 Zoho cancel: processing cancellation for order #${orderId}`);
 
+        await shoppersInventoryService.restockCancelledOrder(order);
         const result = await zohoCancelService.processCancellation(order);
         if (result.voided > 0) {
             console.log(`✅ Zoho cancel: order #${orderId} — ${result.voided} invoice(s) voided`);
@@ -217,6 +224,8 @@ router.post('/refunds/create', verifyShopifyWebhook, async (req, res) => {
             };
         }
 
+        await inventorySideEffect('refund restock', () =>
+            shoppersInventoryService.restockShopifyRefund(shopifyOrder, refund));
         await zohoReturnService.handleShopifyRefund(shopifyOrder, refund);
     } catch (err) {
         console.error('❌ Zoho webhook refunds/create error:', err.message);
@@ -255,6 +264,15 @@ function parseJsonBody(req, res, next) {
     next();
 }
 
+async function inventorySideEffect(label, work) {
+    try {
+        return await work();
+    } catch (error) {
+        console.error(`❌ Stock Room ${label} error:`, error.message);
+        return null;
+    }
+}
+
 // ============================================================
 // CARRIER DELIVERY WEBHOOK — COD reconciliation + RTO
 // Called by existing carrier webhook handlers or Delhivery/Shiprocket
@@ -282,6 +300,10 @@ router.post('/carrier/delivery', requireInternalToken, parseJsonBody, async (req
                 deliveryDate: delivery_date || new Date().toISOString().split('T')[0]
             });
         } else if (status === 'rto' || status === 'rto_delivered') {
+            if (status === 'rto_delivered') {
+                await inventorySideEffect('RTO restock', () =>
+                    shoppersInventoryService.restockRTOOrder({ order_number: order_id }));
+            }
             // RTO — need original order data
             const syncLog = await require('../database/db').dbAdapter.query(
                 'SELECT original_payload FROM zoho_sync_log WHERE shopify_order_id = ? ORDER BY created_at DESC LIMIT 1',
@@ -316,7 +338,7 @@ router.post('/exchange', requireInternalToken, parseJsonBody, async (req, res) =
     res.status(200).json({ received: true });
 
     try {
-        const { order_id, original_items, exchanged_items } = req.body || {};
+        const { order_id, request_id, original_items, exchanged_items, inventory_event, inventory_only } = req.body || {};
         if (!order_id) {
             console.warn('⚠️ Zoho exchange webhook: missing order_id');
             return;
@@ -339,6 +361,21 @@ router.post('/exchange', requireInternalToken, parseJsonBody, async (req, res) =
             shopifyOrder = { order_number: order_id, id: order_id, line_items: original_items || [] };
         }
 
+        if (inventory_event === 'replacement_dispatched') {
+            await inventorySideEffect('exchange replacement deduction', () => shoppersInventoryService.deductExchangeReplacement({
+                order: shopifyOrder,
+                items: exchanged_items || [],
+                eventId: request_id
+            }));
+        } else if (inventory_event === 'return_received') {
+            await inventorySideEffect('exchange return restock', () => shoppersInventoryService.restockExchangeItems({
+                order: shopifyOrder,
+                items: original_items || [],
+                eventId: request_id
+            }));
+        }
+        if (inventory_only) return;
+
         await zohoReturnService.handleExchange(
             shopifyOrder,
             original_items || [],
@@ -359,12 +396,26 @@ router.post('/return', requireInternalToken, parseJsonBody, async (req, res) => 
     res.status(200).json({ received: true });
 
     try {
-        const { order_id, return_items } = req.body || {};
+        const { order_id, request_id, return_items, return_type, inventory_event, inventory_only } = req.body || {};
         if (!order_id) {
             console.warn('⚠️ Zoho return webhook: missing order_id');
             return;
         }
         console.log(`🔁 Zoho webhook: return for order #${order_id}`);
+
+        if (inventory_event === 'return_received') {
+            const isExchange = return_type === 'exchange';
+            await inventorySideEffect('return restock', () => shoppersInventoryService.restockReturnedItems({
+                order: { order_number: order_id },
+                items: return_items || [],
+                eventId: request_id,
+                referencePrefix: isExchange ? 'exchange:' : 'return:',
+                adjustmentType: isExchange
+                    ? shoppersInventoryService.EXCHANGE_RESTOCK
+                    : shoppersInventoryService.RETURN_RESTOCK
+            }));
+        }
+        if (inventory_only) return;
 
         await zohoReturnService.handleReturnsServerReturn(order_id, return_items || []);
     } catch (err) {
