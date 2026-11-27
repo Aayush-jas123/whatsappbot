@@ -104,6 +104,42 @@ function fallbackTaxDecisionFor(shopifyOrder) {
     return determineTaxType(process.env.ZOHO_SELLER_STATE || 'Haryana', customerState);
 }
 
+/** Calendar day on the server clock — Books dates are plain yyyy-MM-dd, so
+ *  the UTC day would be wrong for IST returns processed after midnight UTC. */
+function todayYmd() {
+    const now = new Date();
+    return `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}-${String(now.getDate()).padStart(2, '0')}`;
+}
+
+function addDaysYmd(ymd, days) {
+    const d = new Date(`${ymd}T00:00:00Z`);
+    d.setUTCDate(d.getUTCDate() + days);
+    return d.toISOString().slice(0, 10);
+}
+
+/**
+ * Credit note date Books will accept for this invoice.
+ *
+ * No date was ever sent, so Books defaulted the note to today — and rejected
+ * it with 400 "The credit note date should be later than the invoice date"
+ * whenever the return landed on the day the invoice was raised. The rule is
+ * strictly later-than, so the earliest valid date is invoice date + 1; keep
+ * today when it is already past that (a normal, later return), and only step
+ * forward for the same-day case.
+ */
+function creditNoteDateFor(invoiceDate) {
+    const today = todayYmd();
+    const inv = String(invoiceDate || '').slice(0, 10);
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(inv)) return today;
+    const earliest = addDaysYmd(inv, 1);
+    return today >= earliest ? today : earliest;
+}
+
+// Charge lines (shipping, COD) are never part of an exchange swap: they stay
+// on the original invoice and are never billed a second time. Full returns and
+// RTOs use the same matcher to reverse them once every product is credited.
+const isChargeLine = (l) => /shipping|cod|cash on delivery/i.test(`${l?.name || ''} ${l?.description || ''}`);
+
 /**
  * Credit note payload that MIRRORS the invoice it reverses: same rate, same
  * discount proportion, same tax basis (CGST+SGST vs IGST, inclusive vs
@@ -130,6 +166,8 @@ async function buildMirroredCreditNotePayload({
     // fallback for the rare case the invoice has none.
     payload.customer_id = fullInvoice?.customer_id || customerId || null;
     payload.invoice_id = fullInvoice?.invoice_id;
+    // Must be later than the invoice date, or Books rejects the note outright
+    payload.date = creditNoteDateFor(fullInvoice?.date || fullInvoice?.issued_date);
     return payload;
 }
 
@@ -289,25 +327,29 @@ async function prepareAndCreateCreditNote({ shopifyOrder, orderId, returnItems, 
     }
     const fullInvoice = await fetchFullInvoice(originalInvoice);
 
+    // A cancelled order's invoice is voided by the cancellation path (with its
+    // receipt removed if it had one), so there is nothing left to credit —
+    // raising a note here would reverse the same sale twice, and Books rejects
+    // documents pointed at a void invoice anyway.
+    const invoiceStatus = String(fullInvoice.status || originalInvoice.status || '');
+    if (invoiceStatus === 'void' || invoiceStatus === 'deleted') {
+        console.log(`ℹ️ Zoho ${returnType}: invoice for order #${orderId} is ${invoiceStatus} — the cancellation already reversed it, no credit note raised (${reference})`);
+        return { success: true, creditNoteId: null, invoiceVoided: true, creditNoteTotal: 0, customerId };
+    }
+
     const creditNotePayload = await buildMirroredCreditNotePayload({
         shopifyOrder, orderId, returnItems, returnType, fullInvoice, reference, extraNotes,
         customerId: customerId || originalInvoice.customer_id
     });
 
-    // For RTOs where ALL items are returned, include shipping and COD charges
-    // in the credit note so the invoice balances to zero. Without this, those
-    // charges remain as an outstanding balance on the invoice.
-    if (returnType === 'rto' && fullInvoice?.line_items?.length > 0) {
-        const isNonProductLine = (l) => {
-            const name = (l.name || '').toLowerCase();
-            const desc = (l.description || '').toLowerCase();
-            return name.includes('shipping') || desc.includes('shipping')
-                || name.includes('cod') || desc.includes('cod')
-                || name.includes('cash on delivery') || desc.includes('cash on delivery');
-        };
-
-        const invoiceItemLines = fullInvoice.line_items.filter(l => !isNonProductLine(l));
-        const nonProductLines = fullInvoice.line_items.filter(l => isNonProductLine(l));
+    // For full returns and RTOs, include shipping and COD charges in the credit
+    // note so the invoice balances to zero. Shopify refunds used to take the
+    // product-only path and leave the original shipping charge outstanding.
+    // Exchanges keep charge lines on the original invoice; the replacement is
+    // billed separately and must not reverse the original shipping a second time.
+    if (returnType !== 'exchange' && fullInvoice?.line_items?.length > 0) {
+        const invoiceItemLines = fullInvoice.line_items.filter(l => !isChargeLine(l));
+        const nonProductLines = fullInvoice.line_items.filter(l => isChargeLine(l));
 
         // Check if all invoice product items are being returned. The count has
         // to come from the lines actually built into the note, not from the
@@ -321,10 +363,11 @@ async function prepareAndCreateCreditNote({ shopifyOrder, orderId, returnItems, 
 
         if (totalCreditedQty >= totalInvoiceQty && totalInvoiceQty > 0) {
             // All items returned — add shipping/COD lines to credit note
+            const reversalLabel = returnType === 'rto' ? 'RTO' : 'Return';
             for (const extraLine of nonProductLines) {
                 const creditLine = {
                     name: extraLine.name,
-                    description: `RTO ${extraLine.name} Reversal`,
+                    description: `${reversalLabel} ${extraLine.name} Reversal`,
                     quantity: parseFloat(extraLine.quantity || 1),
                     rate: parseFloat(extraLine.rate || 0),
                     discount: parseFloat(extraLine.discount || 0)
@@ -344,7 +387,7 @@ async function prepareAndCreateCreditNote({ shopifyOrder, orderId, returnItems, 
                 }
 
                 creditNotePayload.line_items.push(creditLine);
-                console.log(`📦 Zoho RTO: all items returned, added ${extraLine.name} (₹${creditLine.rate.toFixed(2)}) to credit note`);
+                console.log(`📦 Zoho ${returnType}: all items returned, added ${extraLine.name} (₹${creditLine.rate.toFixed(2)}) to credit note`);
             }
         }
     }
@@ -453,10 +496,6 @@ async function ensureCreditNoteApplied({ creditNote, fullInvoice, reference, ret
         return false;
     }
 }
-
-// Charge lines (shipping, COD) are never part of an exchange swap: they stay
-// on the original invoice and are never billed a second time.
-const isChargeLine = (l) => /shipping|cod|cash on delivery/i.test(`${l?.name || ''} ${l?.description || ''}`);
 
 // A rendered line carries its GST split as flat rates (that is what Books
 // accepts on a POST/PUT). The credit-note builder reads the split from the
@@ -1280,11 +1319,12 @@ async function buildSwapLines({
             if (tax.igst_rate) line.igst_rate = tax.igst_rate;
             if (tax.tax_percentage) line.tax_percentage = tax.tax_percentage;
         }
-        // Resolve by NAME first — the exchange SKU can still be the ORIGINAL
-        // item's SKU, which would link the line to the wrong stock item.
-        let item = await resolver.resolve(lineName);
-        if (!item?.item_id && exItem.sku) item = await resolver.resolve(exItem.sku);
+        // Name is authoritative: the exchange SKU can still be the ORIGINAL
+        // item's SKU (and this store's SKUs are junk values that collide with
+        // unrelated Zoho items), which would move the wrong colourway's stock.
+        const { item, via, conflict } = await resolver.resolveLine({ name: lineName, sku: exItem.sku });
         if (item?.item_id) line.item_id = item.item_id;
+        else if (via === 'sku-conflict') console.warn(`⚠️ Zoho exchange: "${lineName}" NOT linked — sku "${exItem.sku}" belongs to catalog item "${conflict?.name}" (different style/colourway), so no stock movement`);
         else console.warn(`⚠️ Zoho exchange: no catalog item for "${lineName}" — line created without item_id (no stock movement)`);
         return line;
     };
@@ -2251,6 +2291,10 @@ module.exports = {
     handleReturnsServerReturn,
     prepareAndCreateCreditNote,
     creditNoteReference,
+    // exported for the date-rule test (tmp/test-zoho-cancel-and-cn-date.js):
+    // same-day returns used to fail with 400 "credit note date should be later
+    // than the invoice date", and the rule is a boundary condition.
+    creditNoteDateFor,
     retryReturn,
     getReturnStats,
     getReturnLog,

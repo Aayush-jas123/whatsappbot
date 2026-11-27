@@ -191,6 +191,8 @@ body {
 .stc-channel { display: inline-flex; align-items: center; }
 .stc-channel.wa { color: #25D366; }
 .stc-channel.ig { color: #E1306C; }
+.stc-channel.website { color: var(--primary); }
+.stc-status.awaiting { background: rgba(59,130,246,0.15); color: var(--info); }
 .stc-message { font-size: 12px; color: #94a3b8; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; line-height: 1.4; }
 
 .unread-dot-sm {
@@ -504,6 +506,59 @@ body {
 }
 .chat-channel-badge.whatsapp { background: rgba(37,211,102,0.12); color: #1a8c44; }
 .chat-channel-badge.instagram { background: rgba(225,48,108,0.1); color: #c2185b; }
+.chat-channel-badge.website { background: rgba(99,102,241,0.12); color: var(--primary-dark); }
+
+/* ═══════════════════════════════════════════════════════════
+   HELP & TICKETS THREAD (storefront ticket view)
+   ═══════════════════════════════════════════════════════════ */
+/* The request behind the thread: order, reason, preference - the fields the
+   WhatsApp chat view never had. Same card language as the details panel. */
+.ticket-request-card {
+    align-self: stretch; max-width: none;
+    background: var(--bg-card); border: 1px solid var(--border);
+    border-radius: var(--border-radius-lg); padding: 12px 14px;
+    display: flex; flex-direction: column; gap: 5px;
+}
+.treq-head { display: flex; align-items: center; gap: 8px; margin-bottom: 3px; }
+.treq-num {
+    font-size: 11px; font-weight: 600; font-family: 'Courier New', monospace;
+    color: var(--primary); background: rgba(99,102,241,0.12);
+    padding: 2px 6px; border-radius: 4px; letter-spacing: 0.3px;
+}
+.treq-status {
+    font-size: 10px; font-weight: 600; text-transform: uppercase;
+    padding: 2px 6px; border-radius: 4px;
+    background: rgba(245,158,11,0.15); color: var(--warning);
+}
+.treq-status.resolved { background: rgba(16,185,129,0.15); color: var(--success); }
+.treq-status.awaiting { background: rgba(59,130,246,0.15); color: var(--info); }
+.treq-status.follow_up { background: rgba(99,102,241,0.12); color: var(--primary); }
+.treq-row { display: flex; gap: 8px; font-size: 12.5px; line-height: 1.45; }
+.treq-k {
+    flex: 0 0 86px; color: var(--text-tertiary); font-size: 11px;
+    text-transform: uppercase; letter-spacing: 0.4px; padding-top: 1px;
+}
+.treq-v { flex: 1; color: var(--text-primary); word-break: break-word; }
+.treq-link { font-size: 12px; color: var(--primary); text-decoration: none; }
+.treq-link:hover { text-decoration: underline; }
+
+/* System lines (request raised, routing, hand-offs). Staff see internal ones
+   too, dimmed - the storefront projection hides them, this surface must not. */
+.ticket-event {
+    align-self: center; max-width: 90%;
+    display: flex; align-items: center; gap: 8px;
+    font-size: 11px; color: var(--text-tertiary); text-align: center;
+}
+.ticket-event span:first-child { word-break: break-word; }
+.ticket-event.internal { font-style: italic; opacity: 0.8; }
+.ticket-event-time { font-size: 10px; white-space: nowrap; }
+
+/* Ticket uploads (ticket_attachments), in the Shared Media shape */
+.ticket-attach-strip { display: flex; flex-direction: column; gap: 6px; align-items: flex-start; }
+.chat-attach-head {
+    align-self: center; text-align: center; font-size: 11px;
+    color: var(--text-tertiary); margin: 6px 0;
+}
 
 /* ══════════════════════════════════════════════════════════
    RESPONSIVE
@@ -687,4 +742,140 @@ textarea.fu-input { resize: vertical; min-height: 60px; }
     background: rgba(255,255,255,0.15); color: #fff;
     border: none; cursor: pointer; font-size: 18px;
     display: flex; align-items: center; justify-content: center;
+}
+
+/* ── Composer media chips (signed Cloudinary direct upload) ── */
+.image-preview-bar .media-chip {
+    position: relative; display: flex; align-items: center; gap: 6px;
+    padding: 6px 8px; border-radius: 8px;
+    background: var(--bg-card); border: 1px solid var(--border);
+    max-width: 210px;
+}
+.image-preview-bar .media-chip.st-failed { border-color: var(--danger); }
+.image-preview-bar .media-chip-thumb {
+    position: relative; width: 44px; height: 44px; flex-shrink: 0;
+    border-radius: 6px; overflow: hidden; background: var(--border-light);
+    display: flex; align-items: center; justify-content: center;
+}
+.image-preview-bar .media-chip-thumb img { width: 100%; height: 100%; object-fit: cover; display: block; }
+.image-preview-bar .media-chip-fill {
+    position: absolute; left: 0; bottom: 0; height: 4px; background: var(--primary);
+    transition: width 0.15s;
+}
+.image-preview-bar .media-chip-status { font-size: 11px; color: var(--text-secondary); white-space: nowrap; }
+.image-preview-bar .media-chip.st-uploaded .media-chip-status { color: var(--success); }
+.image-preview-bar .media-chip.st-failed .media-chip-status { color: var(--danger); }
+.image-preview-bar .media-chip-retry {
+    border: 1px solid var(--border); background: var(--bg-primary); color: var(--text-primary);
+    font-size: 11px; font-weight: 500; border-radius: 6px; padding: 3px 8px; cursor: pointer;
+}
+.image-preview-bar .media-chip-retry:hover { border-color: var(--primary); color: var(--primary); }
+.image-preview-bar .media-chip-x {
+    border: none; background: transparent; color: var(--text-tertiary);
+    font-size: 16px; line-height: 1; cursor: pointer; padding: 0 2px;
+}
+.image-preview-bar .media-chip-x:hover { color: var(--danger); }
+
+/* ── Lifecycle media status chips in the chat thread ── */
+.msg-status { font-weight: 500; }
+.msg-status-sending { color: var(--text-tertiary); }
+.msg-status-delivered { color: var(--info); }
+.msg-status-read, .msg-status-seen { color: var(--success); }
+.msg-status-ready { color: var(--info); }
+.msg-status-failed { color: var(--danger); }
+.msg-status-expired { color: var(--text-tertiary); font-style: italic; }
+.msg-status-retry {
+    border: 1px solid currentColor; background: transparent; color: var(--danger);
+    font-size: 10px; font-weight: 600; border-radius: 5px; padding: 1px 6px; cursor: pointer;
+}
+.chat-message.agent .msg-status-retry { color: #fff; border-color: rgba(255,255,255,0.7); }
+.msg-attachment-expired {
+    display: flex; align-items: center; gap: 8px; padding: 10px 12px;
+    background: var(--bg-card); border: 1px dashed var(--border);
+    border-radius: 8px; color: var(--text-tertiary); font-size: 12px; max-width: 240px;
+}
+.msg-attachment-expired .file-icon { font-size: 18px; }
+
+/* ══ Photo bubbles: the picture IS the message (WhatsApp behaviour) ══
+   A send carrying images renders the grid edge to edge with the clock and the
+   tick set burned into the last tile, instead of a framed thumbnail sitting
+   inside a padded bubble. */
+.chat-message.customer .msg-bubble.bubble-photos,
+.chat-message.agent .msg-bubble.bubble-photos {
+    padding: 0; background: transparent; border: none;
+    border-radius: 12px; overflow: visible;
+}
+.pmb {
+    display: grid; gap: 2px;
+    width: min(288px, 68vw);
+    border-radius: 12px; overflow: hidden;
+    background: var(--border);
+}
+.pmb-2, .pmb-3, .pmb-4 { grid-template-columns: 1fr 1fr; }
+.pmb-3 .pmb-tile:first-child { grid-row: 1 / span 2; aspect-ratio: auto; }
+.pmb-tile {
+    position: relative; display: block;
+    margin: 0; padding: 0; border: 0;
+    min-height: 92px; background: var(--border-light);
+    overflow: hidden; cursor: zoom-in;
+    -webkit-appearance: none; appearance: none;
+    text-align: inherit; color: inherit; font: inherit;
+}
+.pmb-2 .pmb-tile, .pmb-3 .pmb-tile, .pmb-4 .pmb-tile { aspect-ratio: 1 / 1; }
+.pmb-tile img { width: 100%; height: 100%; object-fit: cover; display: block; }
+.pmb-1 .pmb-tile { max-height: 360px; }
+.pmb-1 .pmb-tile img { max-height: 360px; }
+.pmb-tile.is-expired { cursor: default; }
+.pmb-tile:focus-visible { outline: 2px solid var(--primary); outline-offset: -2px; }
+.pmb-gone {
+    display: flex; align-items: center; justify-content: center; gap: 6px;
+    width: 100%; height: 100%; min-height: 92px; padding: 0 10px; box-sizing: border-box;
+    background: repeating-linear-gradient(135deg, #f6f7f9, #f6f7f9 6px, #eceef1 6px, #eceef1 12px);
+    color: var(--text-tertiary); font-size: 11px; font-weight: 500;
+}
+.pmb-pending { display: block; width: 100%; height: 100%; min-height: 92px; background: var(--border-light); }
+.pmb-receipt {
+    position: absolute; right: 5px; bottom: 5px;
+    display: inline-flex; align-items: center; gap: 4px;
+    padding: 2px 7px; border-radius: 999px;
+    background: rgba(0,0,0,0.55); color: #fff; pointer-events: none;
+}
+.pmb-time { font-size: 10px; }
+.pmb-word { font-size: 10px; font-weight: 600; }
+.pmb-receipt .msg-tick { display: block; }
+.pmb-more {
+    position: absolute; inset: 0;
+    display: flex; align-items: center; justify-content: center;
+    background: rgba(0,0,0,0.45); color: #fff;
+    font-size: 18px; font-weight: 600; pointer-events: none;
+}
+.pmb-caption {
+    padding: 9px 12px; max-width: min(288px, 68vw);
+    background: var(--bg-card); border: 1px solid var(--border); border-bottom: none;
+    border-radius: 12px 12px 0 0; font-size: 13px; line-height: 1.45; color: var(--text-primary);
+}
+.chat-message.agent .pmb-caption {
+    background: var(--primary); color: #fff; border-color: var(--primary);
+}
+.pmb-actions { display: flex; justify-content: flex-end; margin-top: 6px; }
+.pmb-retry {
+    border: 1px solid var(--danger); background: transparent; color: var(--danger);
+    font-size: 11px; font-weight: 600; border-radius: 6px; padding: 3px 9px; cursor: pointer;
+}
+.pmb-retry:hover { background: var(--danger); color: #fff; }
+
+/* viewer chrome for a photo batch */
+.media-lightbox .lb-nav {
+    position: absolute; top: 50%; transform: translateY(-50%);
+    width: 42px; height: 56px; border: none; border-radius: 10px;
+    background: rgba(255,255,255,0.14); color: #fff;
+    font-size: 26px; line-height: 1; cursor: pointer;
+    display: flex; align-items: center; justify-content: center;
+}
+.media-lightbox .lb-nav.prev { left: 14px; }
+.media-lightbox .lb-nav.next { right: 14px; }
+.media-lightbox .lb-nav:hover, .media-lightbox .media-lightbox-close:hover { background: rgba(255,255,255,0.28); }
+.media-lightbox .lb-count {
+    position: absolute; bottom: 20px; left: 50%; transform: translateX(-50%);
+    color: rgba(255,255,255,0.85); font-size: 12px; letter-spacing: .08em;
 }

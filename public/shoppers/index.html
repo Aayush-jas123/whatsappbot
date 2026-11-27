@@ -6,7 +6,7 @@
     <title>Shopper Management | OFFCOMFRT</title>
     <!-- Google Fonts: Outfit, Inter, Archivo Narrow -->
         <link href="https://fonts.googleapis.com/css2?family=Outfit:wght@300;400;500;700&family=Inter:wght@400;500;600&family=Archivo+Narrow:wght@400;500;600;700&display=swap" rel="stylesheet">
-        <link rel="stylesheet" href="/shoppers/assets/shoppers-hub.css?build=20261112-shopifysync4">
+        <link rel="stylesheet" href="/shoppers/assets/shoppers-hub.css?build=20261124-inboxpremium2">
 </head>
 <body class="dark-theme">
     <!-- Login View -->
@@ -64,6 +64,11 @@
                     <button id="shippedOrdersBtn" class="sidebar-item" data-nav="shipped" title="Shipped Orders">
                         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="1" y="3" width="15" height="13"/><polygon points="16 8 20 8 23 11 23 16 16 16 16 8"/><circle cx="5.5" cy="18.5" r="2.5"/><circle cx="18.5" cy="18.5" r="2.5"/></svg>
                         <span>Shipped</span>
+                    </button>
+                    <button id="itemRequestsBtn" class="sidebar-item" title="Item change requests from the website">
+                        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M8 3 4 7l4 4"/><path d="M4 7h16"/><path d="m16 21 4-4-4-4"/><path d="M20 17H4"/></svg>
+                        <span>Item Requests</span>
+                        <span id="itemReqBadge" class="sidebar-badge" style="display: none;">0</span>
                     </button>
                 </div>
                 <div class="sidebar-section">
@@ -315,6 +320,7 @@
                     </div>
                     <div id="editAddrSyncStatus" class="addr-sync-status"></div>
                 </div>
+                <div id="editReqBanner"></div>
                 <div id="productEditor">
                     <div id="editOrderEditor"></div>
                 </div>
@@ -323,6 +329,27 @@
                     <button type="submit" class="btn btn-primary">Save Details</button>
                 </div>
             </form>
+        </div>
+    </div>
+
+    <!-- Item Change Requests Modal (website edit-panel queue) -->
+    <div id="itemRequestsModal">
+        <div class="modal-content irm-content">
+            <div class="irm-head">
+                <h3>Item Change Requests</h3>
+                <div class="irm-head-actions">
+                    <button type="button" class="btn btn-outline" id="irmRefreshBtn" title="Reload requests from the server">⟳ Refresh</button>
+                    <button type="button" class="btn btn-outline" id="irmCloseBtn">Close</button>
+                </div>
+            </div>
+            <div class="irm-tabs">
+                <button type="button" class="irm-tab active" data-irm-status="pending">Pending <span id="irmCountPending"></span></button>
+                <button type="button" class="irm-tab" data-irm-status="history">History</button>
+            </div>
+            <div id="irmList" class="irm-list">
+                <div class="table-loading"><div class="spinner"></div><span>Loading requests…</span></div>
+            </div>
+            <p class="irm-foot">Applying a request updates the hub row and mirrors the new items to Shopify <strong>and GoKwik</strong>, moves the order from the Edits queue to <strong>Confirmed</strong>, then notifies the customer on WhatsApp. “Open in Editor” lets you tweak sizes, prices or totals first — saving the editor syncs the same way, confirms the order and closes the request.</p>
         </div>
     </div>
 
@@ -843,161 +870,205 @@
     </div>
 
     <!-- Inbox View - Unread Messages & Recent Confirmations -->
-    <div id="inboxView" style="display: none; position: fixed; top: 0; left: 0; width: 100%; height: 100%; background: #000; z-index: 2500; overflow-y: auto;">
-        <div class="inbox-header">
-            <div class="inbox-header-left">
-                <button id="backToShoppersFromInbox" class="btn btn-outline">
-                    <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="vertical-align: middle; margin-right: 6px;">
-                        <path d="M19 12H5M12 19l-7-7 7-7"/>
-                    </svg>
-                    Back to Shoppers
+    <div id="inboxView" class="inbox-view" style="display: none;">
+        <header class="inbox-header">
+            <div class="inbox-header-main">
+                <button id="backToShoppersFromInbox" class="inbox-back-btn" aria-label="Back to Shoppers">
+                    <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" aria-hidden="true"><path d="M19 12H5M12 19l-7-7 7-7"/></svg>
+                    <span>Shoppers</span>
                 </button>
-                <h2 style="margin: 0; font-family: 'Outfit', sans-serif; font-size: 1.5rem;">Inbox</h2>
-                <div class="inbox-tabs">
-                    <button class="inbox-tab active" data-inbox-tab="unread">
-                        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></svg>
+                <div class="inbox-title-block">
+                    <div class="inbox-eyebrow"><span>OFFCOMFRT</span><span class="inbox-eyebrow-separator">/</span><span>Workspace</span></div>
+                    <h1>Inbox</h1>
+                    <p>Every conversation. Every confirmation. One clear queue.</p>
+                </div>
+            </div>
+            <div class="inbox-header-actions">
+                <div class="inbox-tabs" role="tablist" aria-label="Inbox views">
+                    <button class="inbox-tab active" data-inbox-tab="unread" role="tab" aria-selected="true">
+                        <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" aria-hidden="true"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></svg>
                         Unread
                         <span class="inbox-tab-count" id="inboxUnreadCount">0</span>
                     </button>
-                    <button class="inbox-tab confirmed-tab" data-inbox-tab="confirmed">
-                        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="20 6 9 17 4 12"/></svg>
+                    <button class="inbox-tab confirmed-tab" data-inbox-tab="confirmed" role="tab" aria-selected="false">
+                        <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" aria-hidden="true"><polyline points="20 6 9 17 4 12"/></svg>
                         Confirmed
                         <span class="inbox-tab-count" id="inboxConfirmedCount">0</span>
                     </button>
                 </div>
-            </div>
-            <div class="inbox-header-right">
-                <button id="refreshInboxBtn" class="btn btn-outline" style="padding: 0.5rem 1rem;">
-                    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="vertical-align: middle; margin-right: 4px;"><polyline points="23 4 23 10 17 10"/><path d="M20.49 15a9 9 0 1 1-2.12-9.36L23 10"/></svg>
-                    Refresh
+                <button id="refreshInboxBtn" class="inbox-refresh-btn" aria-label="Refresh inbox" title="Refresh inbox">
+                    <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" aria-hidden="true"><polyline points="23 4 23 10 17 10"/><path d="M20.49 15a9 9 0 1 1-2.12-9.36L23 10"/></svg>
+                    <span>Refresh</span>
                 </button>
             </div>
-        </div>
+        </header>
 
         <div class="inbox-content">
-            <!-- Stats Row -->
-            <div class="inbox-stats-row">
-                <div class="inbox-stat-card unread-stat">
-                    <div class="stat-icon">
-                        <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></svg>
+            <section class="inbox-overview" aria-label="Inbox overview">
+                <div class="inbox-overview-copy">
+                    <span class="inbox-kicker">At a glance</span>
+                    <p>Live signals from your customer desk.</p>
+                </div>
+                <div class="inbox-stats-row">
+                    <div class="inbox-stat-card unread-stat">
+                        <div class="inbox-stat-card-top">
+                            <span class="inbox-stat-index">01</span>
+                            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" aria-hidden="true"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></svg>
+                        </div>
+                        <div class="inbox-stat-number" id="inboxStatUnread">0</div>
+                        <div class="inbox-stat-label">Unread messages</div>
                     </div>
-                    <div>
-                        <div class="stat-number" id="inboxStatUnread">0</div>
-                        <div class="stat-label">Unread Messages</div>
+                    <div class="inbox-stat-card confirmed-stat">
+                        <div class="inbox-stat-card-top">
+                            <span class="inbox-stat-index">02</span>
+                            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" aria-hidden="true"><polyline points="20 6 9 17 4 12"/></svg>
+                        </div>
+                        <div class="inbox-stat-number" id="inboxStatConfirmed">0</div>
+                        <div class="inbox-stat-label">Total confirmed</div>
+                    </div>
+                    <div class="inbox-stat-card pending-stat">
+                        <div class="inbox-stat-card-top">
+                            <span class="inbox-stat-index">03</span>
+                            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" aria-hidden="true"><circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/></svg>
+                        </div>
+                        <div class="inbox-stat-number" id="inboxStatPending">0</div>
+                        <div class="inbox-stat-label">Pending</div>
+                    </div>
+                    <div class="inbox-stat-card edits-stat">
+                        <div class="inbox-stat-card-top">
+                            <span class="inbox-stat-index">04</span>
+                            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" aria-hidden="true"><path d="M11 4H4a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7"/><path d="M18.5 2.5a2.121 2.121 0 0 1 3 3L12 15l-4 1 1-4 9.5-9.5z"/></svg>
+                        </div>
+                        <div class="inbox-stat-number" id="inboxStatEdits">0</div>
+                        <div class="inbox-stat-label">Edit requests</div>
                     </div>
                 </div>
-                <div class="inbox-stat-card confirmed-stat">
-                    <div class="stat-icon">
-                        <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="20 6 9 17 4 12"/></svg>
-                    </div>
-                    <div>
-                        <div class="stat-number" id="inboxStatConfirmed">0</div>
-                        <div class="stat-label">Total Confirmed</div>
-                    </div>
+            </section>
+
+            <div class="inbox-analytics-panel inbox-confirmed-filter hidden" id="inboxAnalyticsPanel">
+                <div class="inbox-analytics-head">
+                    <button type="button" class="inbox-analytics-toggle" id="inboxAnalyticsToggle" aria-expanded="true" aria-controls="inboxAnalyticsBody" aria-label="Toggle confirmation analytics">
+                        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" aria-hidden="true"><polyline points="6 9 12 15 18 9"/></svg>
+                    </button>
+                    <div class="inbox-analytics-title">Confirmation pulse <span class="inbox-analytics-range" id="inboxAnalyticsRange"></span></div>
+                    <button type="button" class="inbox-analytics-refresh" id="inboxAnalyticsRefresh" aria-label="Refresh confirmation analytics" title="Refresh analytics">
+                        <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" aria-hidden="true"><polyline points="23 4 23 10 17 10"/><path d="M20.49 15a9 9 0 1 1-2.12-9.36L23 10"/></svg>
+                    </button>
                 </div>
-                <div class="inbox-stat-card pending-stat">
-                    <div class="stat-icon">
-                        <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/></svg>
-                    </div>
-                    <div>
-                        <div class="stat-number" id="inboxStatPending">0</div>
-                        <div class="stat-label">Pending</div>
-                    </div>
-                </div>
-                <div class="inbox-stat-card edits-stat">
-                    <div class="stat-icon">
-                        <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M11 4H4a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7"/><path d="M18.5 2.5a2.121 2.121 0 0 1 3 3L12 15l-4 1 1-4 9.5-9.5z"/></svg>
-                    </div>
-                    <div>
-                        <div class="stat-number" id="inboxStatEdits">0</div>
-                        <div class="stat-label">Edit Requests</div>
-                    </div>
-                </div>
-            </div>
-
-            <!-- Date Filter Bar -->
-            <div class="inbox-date-bar">
-                <span class="inbox-date-bar-label" id="inboxDateBarLabel">📅 Orders from:</span>
-                <select id="inboxDateField" class="inbox-filter-select inbox-confirmed-filter hidden">
-                    <option value="updated_at">Confirmed Date</option>
-                    <option value="created_at">Order Date</option>
-                </select>
-                <button class="inbox-quick-date" data-inbox-range="today">Today</button>
-                <button class="inbox-quick-date" data-inbox-range="yesterday">Yesterday</button>
-                <button class="inbox-quick-date" data-inbox-range="last7">Last 7 Days</button>
-                <button class="inbox-quick-date" data-inbox-range="last30">Last 30 Days</button>
-                <button class="inbox-quick-date" data-inbox-range="thisMonth">This Month</button>
-                <span style="color: rgba(255,255,255,0.2); margin: 0 0.3rem;">|</span>
-                <label>From</label>
-                <input type="date" id="inboxStartDate">
-                <label>To</label>
-                <input type="date" id="inboxEndDate">
-                <button class="clear-btn" id="clearInboxFiltersBtn">Clear</button>
-            </div>
-
-            <!-- Filter & Actions Bar -->
-            <div class="inbox-filter-bar">
-                <input type="text" id="inboxSearch" placeholder="Search name, phone, order..." class="inbox-search-input">
-
-                <select id="inboxActionType" class="inbox-filter-select inbox-unread-filter hidden">
-                    <option value="">All Actions</option>
-                    <option value="edit_details">Edit</option>
-                    <option value="confirmed">Confirm</option>
-                    <option value="cancelled">Cancel</option>
-                    <option value="pending">Pending</option>
-                </select>
-
-                <select id="inboxConfirmedBy" class="inbox-filter-select inbox-confirmed-filter hidden">
-                    <option value="">All Methods</option>
-                    <option value="whatsapp">WhatsApp</option>
-                    <option value="manual">Manual</option>
-                </select>
-                <select id="inboxPaymentMethod" class="inbox-filter-select inbox-confirmed-filter hidden">
-                    <option value="">All Payment</option>
-                    <option value="COD">COD</option>
-                    <option value="Prepaid">Prepaid</option>
-                </select>
-                <select id="inboxDeliveryType" class="inbox-filter-select inbox-confirmed-filter hidden">
-                    <option value="">All Delivery</option>
-                    <option value="Express">Express</option>
-                    <option value="Standard">Standard</option>
-                </select>
-
-                <div class="inbox-filter-spacer"></div>
-
-                <button id="inboxSelectAllBtn" class="inbox-filter-action">Select All</button>
-                <button id="inboxExportBtn" class="inbox-filter-action export">Export</button>
-            </div>
-
-            <!-- List Header -->
-            <div class="inbox-list-header">
-                <h3 id="inboxListTitle">Unread Customer Messages</h3>
-                <span class="inbox-active-filter-chip" id="inboxActiveFilterChip" style="display: none;"></span>
-            </div>
-
-            <!-- List Container -->
-            <div class="inbox-list-container" id="inboxListContainer">
-                <div class="inbox-empty">
-                    <div class="inbox-empty-icon">💬</div>
-                    <div class="inbox-empty-title">No unread messages</div>
-                    <div class="inbox-empty-text">All customer messages have been attended to</div>
+                <div class="inbox-analytics-body" id="inboxAnalyticsBody">
+                    <div class="inbox-analytics-loading">Loading confirmation analytics…</div>
                 </div>
             </div>
 
-            <!-- Pagination -->
-            <div class="inbox-pagination">
-                <div class="page-info" id="inboxPageInfo">Showing 0-0 of 0</div>
-                <div style="display: flex; gap: 0.5rem;">
-                    <button class="btn btn-outline" id="inboxPrevBtn" disabled>PREVIOUS</button>
-                    <button class="btn btn-outline" id="inboxNextBtn" disabled>NEXT</button>
-                </div>
-            </div>
+            <section class="inbox-queue" aria-label="Inbox queue">
+                <div class="inbox-controls">
+                    <div class="inbox-date-bar">
+                        <div class="inbox-date-context">
+                            <span class="inbox-control-label" id="inboxDateBarLabel">Message date</span>
+                            <select id="inboxDateField" class="inbox-filter-select inbox-confirmed-filter hidden" aria-label="Date field">
+                                <option value="updated_at">Confirmed date</option>
+                                <option value="created_at">Order date</option>
+                            </select>
+                        </div>
+                        <div class="inbox-quick-dates" aria-label="Quick date filters">
+                            <button class="inbox-quick-date" data-inbox-range="today">Today</button>
+                            <button class="inbox-quick-date" data-inbox-range="yesterday">Yesterday</button>
+                            <button class="inbox-quick-date" data-inbox-range="last7">Last 7 days</button>
+                            <button class="inbox-quick-date" data-inbox-range="last30">Last 30 days</button>
+                            <button class="inbox-quick-date" data-inbox-range="thisMonth">This month</button>
+                        </div>
+                        <div class="inbox-custom-dates">
+                            <label><span>From</span><input type="date" id="inboxStartDate" aria-label="Start date"></label>
+                            <label><span>To</span><input type="date" id="inboxEndDate" aria-label="End date"></label>
+                            <button class="inbox-clear-btn" id="clearInboxFiltersBtn">Clear</button>
+                        </div>
+                    </div>
 
-            <!-- Bulk Actions Bar -->
+                    <div class="inbox-filter-bar">
+                        <label class="inbox-search-field">
+                            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" aria-hidden="true"><circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></svg>
+                            <input type="text" id="inboxSearch" placeholder="Search name, phone, or order…" class="inbox-search-input" aria-label="Search inbox">
+                        </label>
+
+                        <select id="inboxActionType" class="inbox-filter-select inbox-unread-filter hidden" aria-label="Filter by action">
+                            <option value="">All actions</option>
+                            <option value="edit_details">Edit</option>
+                            <option value="confirmed">Confirm</option>
+                            <option value="cancelled">Cancel</option>
+                            <option value="pending">Pending</option>
+                        </select>
+                        <select id="inboxConfirmedBy" class="inbox-filter-select inbox-confirmed-filter hidden" aria-label="Filter by confirmation method">
+                            <option value="">All methods</option>
+                            <option value="whatsapp">WhatsApp</option>
+                            <option value="manual">Manual</option>
+                        </select>
+                        <select id="inboxOperatorFilter" class="inbox-filter-select inbox-confirmed-filter inbox-operator-only hidden" title="Confirmed by which operator" aria-label="Filter by operator">
+                            <option value="">All operators</option>
+                        </select>
+                        <select id="inboxPaymentMethod" class="inbox-filter-select inbox-confirmed-filter hidden" aria-label="Filter by payment method">
+                            <option value="">All payment</option>
+                            <option value="COD">COD</option>
+                            <option value="Prepaid">Prepaid</option>
+                        </select>
+                        <select id="inboxDeliveryType" class="inbox-filter-select inbox-confirmed-filter hidden" aria-label="Filter by delivery type">
+                            <option value="">All delivery</option>
+                            <option value="Express">Express</option>
+                            <option value="Standard">Standard</option>
+                        </select>
+
+                        <div class="inbox-filter-spacer"></div>
+                        <button id="inboxSelectAllBtn" class="inbox-filter-action">
+                            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" aria-hidden="true"><rect x="3" y="3" width="18" height="18" rx="3"/><polyline points="7 12 10 15 17 8"/></svg>
+                            <span id="inboxSelectAllLabel">Select all</span>
+                        </button>
+                        <button id="inboxExportBtn" class="inbox-filter-action export">
+                            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" aria-hidden="true"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>
+                            Export
+                        </button>
+                    </div>
+                </div>
+
+                <div class="inbox-list-header">
+                    <div class="inbox-list-title-wrap">
+                        <span class="inbox-kicker">Active queue</span>
+                        <h2 id="inboxListTitle">Unread customer messages</h2>
+                    </div>
+                    <div class="inbox-list-header-right">
+                        <span class="inbox-queue-count" id="inboxQueueCount">0 conversations</span>
+                        <span class="inbox-active-filter-chip" id="inboxActiveFilterChip" style="display: none;"></span>
+                    </div>
+                </div>
+
+                <div class="inbox-list-container" id="inboxListContainer">
+                    <div class="inbox-empty">
+                        <div class="inbox-empty-mark">
+                            <svg width="30" height="30" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.4" aria-hidden="true"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></svg>
+                        </div>
+                        <div class="inbox-empty-title">No unread messages</div>
+                        <div class="inbox-empty-text">All customer messages have been attended to.</div>
+                        <button class="inbox-empty-action" data-inbox-action="back">Back to shoppers</button>
+                    </div>
+                </div>
+
+                <div class="inbox-pagination">
+                    <div class="page-info" id="inboxPageInfo">Showing 0–0 of 0</div>
+                    <div class="inbox-page-actions">
+                        <button class="inbox-page-btn" id="inboxPrevBtn" disabled>
+                            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" aria-hidden="true"><path d="M15 18l-6-6 6-6"/></svg>
+                            Previous
+                        </button>
+                        <button class="inbox-page-btn" id="inboxNextBtn" disabled>
+                            Next
+                            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" aria-hidden="true"><path d="M9 18l6-6-6-6"/></svg>
+                        </button>
+                    </div>
+                </div>
+            </section>
+
             <div id="inboxBulkBar" class="inbox-bulk-bar" style="display:none;">
                 <span id="inboxSelectedCount">0 selected</span>
-                <button id="inboxExportSelectedBtn" class="inbox-bulk-btn export">Export Selected</button>
-                <button id="inboxMarkReadSelectedBtn" class="inbox-bulk-btn read">Mark Read</button>
+                <button id="inboxExportSelectedBtn" class="inbox-bulk-btn export">Export selected</button>
+                <button id="inboxMarkReadSelectedBtn" class="inbox-bulk-btn read">Mark read</button>
                 <button id="inboxDeselectAllBtn" class="inbox-bulk-btn deselect">Deselect</button>
             </div>
         </div>
@@ -2003,11 +2074,11 @@
     </section>
 
     <!-- Scripts -->
-    <script src="/shoppers/assets/shoppers-app.js?build=20260926-exchanges1"></script>
+    <script src="/shoppers/assets/shoppers-app.js?build=20261123-inboxopattrib1"></script>
     <script src="/shoppers/assets/shoppers-forecast-engine.js?v=20261024-1"></script>
     <script src="/shoppers/assets/shoppers-forecast-workspace.js?v=20261024-1"></script>
     <script src="/shoppers/assets/shoppers-inventory-tower.js?v=20261024-forecast1"></script>
-    <script src="/shoppers/assets/shoppers-stock-room.js?v=20261112-shopifysync4"></script>
+    <script src="/shoppers/assets/shoppers-stock-room.js?v=20261123-projectedpush1"></script>
     <script src="/shoppers/assets/shoppers-ai-copilot-pro.js?v=1788900000"></script>
 </body>
 </html>

@@ -94,7 +94,10 @@ function normalizePhone(raw) {
     if (d.length === 10) d = '91' + d;
     if (d.length === 11 && d.startsWith('0')) d = '91' + d.slice(1);
     if (d.length === 12 && d.startsWith('91')) return d;
-    if (d.length > 12 && d.startsWith('0091')) return d.slice(4);
+    // '0091XXXXXXXXXX' is the international-dialling spelling of the same
+    // number, so strip the 00 and keep the canonical 91-prefix. Returning the
+    // bare 10 digits here would fail every ^91[0-9]{10}$ check downstream.
+    if (d.length > 12 && d.startsWith('0091')) return '91' + d.slice(4);
     return d;
 }
 
@@ -221,16 +224,41 @@ function raiseCatalog(order) {
 }
 
 // ---------- settings ----------
+// support_settings is tiny but hot: the Nov 23 log sweep shows the single-key
+// read firing 30+ times per desk page load (cost_config, sla, teams,
+// resolution_templates, portal_routing, access policy), each one paying for a
+// pool slot behind the Access-tab bursts. `key` is already the table's PRIMARY
+// KEY, so the read itself is cheap — the fix is not asking for it every time.
+// 30s of staleness is harmless for these toggles and putSetting() drops the
+// entry immediately, so a save always reads back what it just wrote.
+const SETTINGS_TTL_MS = 30 * 1000;
+const settingCache = new Map();   // key -> { value, at }
+let allSettingsEntry = null;      // { value, at } for getAllSettings
+
+// Settings are JSONB objects; hand out copies so a caller mutating its
+// result can never poison the cached value.
+const cloneSetting = (v) => (v && typeof v === 'object' ? JSON.parse(JSON.stringify(v)) : v);
+
 async function getSetting(key) {
+    const hit = settingCache.get(key);
+    if (hit && Date.now() - hit.at < SETTINGS_TTL_MS) return cloneSetting(hit.value);
     const rows = await dbAdapter.query('SELECT value FROM support_settings WHERE key = ?', [key]);
-    return rows.length ? rows[0].value : null;
+    const value = rows.length ? rows[0].value : null;
+    settingCache.set(key, { value, at: Date.now() });
+    return cloneSetting(value);
 }
 
 async function getAllSettings() {
+    if (allSettingsEntry && Date.now() - allSettingsEntry.at < SETTINGS_TTL_MS) return cloneSetting(allSettingsEntry.value);
     const rows = await dbAdapter.query('SELECT key, value FROM support_settings');
     const out = {};
-    rows.forEach(r => { out[r.key] = r.value; });
-    return out;
+    const now = Date.now();
+    rows.forEach(r => {
+        out[r.key] = r.value;
+        settingCache.set(r.key, { value: r.value, at: now });
+    });
+    allSettingsEntry = { value: out, at: now };
+    return cloneSetting(out);
 }
 
 async function putSetting(key, value) {
@@ -240,6 +268,8 @@ async function putSetting(key, value) {
          ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = CURRENT_TIMESTAMP`,
         [key, JSON.stringify(value ?? null)]
     );
+    settingCache.delete(key);
+    allSettingsEntry = null;
     return true;
 }
 
@@ -347,7 +377,8 @@ function mapCachedOrder(row) {
     if (!row) return null;
     const json = row.order_json || {};
     const items = (json.line_items || []).map(i => ({
-        n: i.name || i.title, v: [i.variant_title].filter(Boolean).join(', ') || '', q: i.quantity || 1, p: Number(i.price || 0)
+        n: i.name || i.title, v: [i.variant_title].filter(Boolean).join(', ') || '', q: i.quantity || 1, p: Number(i.price || 0),
+        img: i.image || ''
     }));
     // Stage preference: cache column wins, but replacement bookkeeping may override
     let stage = row.stage || 'unshipped';
@@ -429,7 +460,8 @@ function hubExtrasFor(ctx, orderId) {
 // Full order from the hub row alone (order not in the cache at all).
 function orderFromHub(r, extras) {
     const items = parseHubItems(r.items_json).map(i => ({
-        n: i.name || i.title || 'Item', v: i.variant_title || i.size || '', q: Number(i.quantity) || 1, p: Number(i.price || 0)
+        n: i.name || i.title || 'Item', v: i.variant_title || i.size || '', q: Number(i.quantity) || 1, p: Number(i.price || 0),
+        img: i.image_url || i.image || ''
     }));
     const ts = v => { const t = v ? new Date(v).getTime() : NaN; return Number.isNaN(t) ? null : t; };
     return {
@@ -514,6 +546,60 @@ async function listOrdersByPhone(phone) {
         return out;
     }
     return Object.values(byId).map(mapCachedOrder).sort((a, b) => (b.placed || 0) - (a.placed || 0));
+}
+
+// ---------- product thumbnails for the storefront order picker ----------
+// Hub items_json and pre-projection cache rows carry no image URL, so fill
+// missing item thumbnails from the same cached Shopify product catalog the
+// Shoppers Hub picker uses, matched on product title. The catalog call rides
+// the service's 10-min cache; on a cold cache we wait only a small budget and
+// let the fetch finish in the background, so a customer never pays catalog
+// build time — the next page load picks up the warmed map.
+const CATALOG_IMG_BUDGET = 1500;
+const SIZE_SUFFIX_RE = /\s*[-\u2013]\s*(?:xxs|xs|s|m|l|xl|xxl|xxxl|free size|one size)$/i;
+// Titles drift in spacing, not letters: catalog says "HENLEY - 001 ( B )",
+// line items say "HENLEY - 001 (B) - XS" — collapse paren padding and
+// whitespace runs so both sides land on the same key.
+const canonTitle = t => String(t || '').toLowerCase()
+    .replace(/\(\s+/g, '(').replace(/\s+\)/g, ')')
+    .replace(/\s+/g, ' ').trim();
+let catalogImgInFlight = null;
+
+async function attachItemImages(orders = []) {
+    if (!orders.some(o => (o.items || []).some(i => !i.img && i.n))) return orders;
+    const Shopify = require('./shopifyService');
+    // One shared in-flight build: concurrent cold requests piggyback on it
+    // instead of each stampeding the Shopify products API.
+    if (!catalogImgInFlight) {
+        catalogImgInFlight = Shopify.getProductCatalog().catch(() => null)
+            .finally(() => { catalogImgInFlight = null; });
+    }
+    let timer;
+    const budget = new Promise(res => { timer = setTimeout(() => res(null), CATALOG_IMG_BUDGET); if (timer.unref) timer.unref(); });
+    const catalog = await Promise.race([catalogImgInFlight, budget]);
+    clearTimeout(timer);
+    if (!catalog || !catalog.length) return orders;
+    const byTitle = new Map();
+    catalog.forEach(p => {
+        const t = canonTitle(p.title);
+        if (t && p.image && !byTitle.has(t)) byTitle.set(t, p.image);
+    });
+    const lookup = (name) => {
+        const k = canonTitle(name);
+        if (!k) return '';
+        if (byTitle.has(k)) return byTitle.get(k);
+        const stripped = k.replace(SIZE_SUFFIX_RE, '');
+        if (stripped && byTitle.has(stripped)) return byTitle.get(stripped);
+        // line-item names sometimes append size/colour after the product title
+        for (const t of byTitle.keys()) {
+            if (k.startsWith(t + ' ') || k.startsWith(t + ' -') || k.startsWith(t + '\u2013')) return byTitle.get(t);
+        }
+        return '';
+    };
+    orders.forEach(o => (o.items || []).forEach(i => {
+        if (!i.img && i.n) i.img = lookup(i.n);
+    }));
+    return orders;
 }
 
 // One order with the hub context merged when the customer's phone is known
@@ -721,6 +807,157 @@ async function openTicketForOrder(orderId) {
     return rows[0] || null;
 }
 
+// Minutes-of-day in IST (UTC+5:30, no DST) — the clock every portal window is
+// written against, whatever zone the server itself runs in.
+function istMinutesOf(dateLike) {
+    const d = new Date(dateLike);
+    if (isNaN(d)) return null;
+    const ist = new Date(d.getTime() + 5.5 * 60 * 60 * 1000);
+    return ist.getUTCHours() * 60 + ist.getUTCMinutes();
+}
+
+// [start, end) is a minutes-of-day window, overnight-aware. `whenMissing` says
+// what a portal with no window means: always-on when routing a new ticket,
+// never-claiming when describing where an existing one already lives.
+function windowCovers(mins, start, end, whenMissing) {
+    if (!start || !end) return !!whenMissing;
+    const [sh, sm] = String(start).split(':').map(Number);
+    const [eh, em] = String(end).split(':').map(Number);
+    if ([sh, sm, eh, em].some(n => !Number.isFinite(n))) return !!whenMissing;
+    // Unknown ticket time: routing keeps the portal eligible (it was already
+    // before this helper existed), display refuses to claim an owner.
+    if (mins == null) return !!whenMissing;
+    const s = sh * 60 + sm, e = eh * 60 + em;
+    // Overnight windows (e.g. 17:00-01:00) wrap around midnight
+    return s <= e ? (mins >= s && mins < e) : (mins >= s || mins < e);
+}
+
+// Wall-clock minutes-of-day where the portal windows are configured (IST unless
+// the portal says otherwise). Intl handles real zones; a bad name falls back to
+// the fixed +5:30 offset the routing path already uses.
+function minutesInZone(dateLike, tz) {
+    const d = new Date(dateLike);
+    if (isNaN(d)) return null;
+    try {
+        const s = new Intl.DateTimeFormat('en-GB', { timeZone: tz || 'Asia/Kolkata', hour: '2-digit', minute: '2-digit', hour12: false }).format(d);
+        const [h, m] = String(s).split(':').map(Number);
+        return Number.isFinite(h) && Number.isFinite(m) ? (h % 24) * 60 + m : null;
+    } catch (e) {
+        return istMinutesOf(d);
+    }
+}
+
+function parsePortalConfig(raw) {
+    let config = raw;
+    if (typeof config === 'string') { try { config = JSON.parse(config); } catch (e) { config = null; } }
+    return config && typeof config === 'object' ? config : null;
+}
+
+// ---------- portal attribution (what the desk pill reads) ----------
+// Mirrors portalRoutes.getPortalTickets() exactly, so the label on a desk row
+// is the same claim the portal itself makes: an explicit portal_id wins,
+// otherwise a time_based portal picks the ticket up whenever its created_at
+// falls inside the portal's window. A 'shift' claim is only a view — the row
+// still has no owner until something stamps portal_id — which is why the desk
+// renders the two differently.
+async function getPortalIndex() {
+    const rows = await dbAdapter.query('SELECT id, name, type, is_active, config FROM support_portals ORDER BY id ASC');
+    const byId = {};
+    const shift = [];
+    rows.forEach(p => {
+        const config = parsePortalConfig(p.config);
+        const active = p.is_active !== false;
+        byId[p.id] = { id: p.id, name: p.name, type: p.type, active };
+        if (p.type === 'time_based' && active && config && config.time_start && config.time_end) {
+            shift.push({ id: p.id, name: p.name, config });
+        }
+    });
+    return { byId, shift };
+}
+
+function describePortal(ticket, index) {
+    if (!ticket || !index) return null;
+    if (ticket.portal_id) {
+        const known = index.byId[ticket.portal_id];
+        return {
+            id: ticket.portal_id,
+            name: known ? known.name : ('Portal #' + ticket.portal_id),
+            type: known ? known.type : null,
+            active: known ? known.active : false,
+            via: 'assigned'
+        };
+    }
+    const minsOf = tz => minutesInZone(ticket.created_at, tz);
+    for (const p of index.shift) {
+        // Same timezone the portal's own SQL uses, so the pill can never name a
+        // portal that would not actually list the ticket.
+        if (windowCovers(minsOf(p.config.timezone), p.config.time_start, p.config.time_end, false)) {
+            return { id: p.id, name: p.name, type: 'time_based', active: true, via: 'shift' };
+        }
+    }
+    return null;
+}
+
+// ---------- auto-routing (desk "portal_routing" setting) ----------
+// Unless an admin has switched it off, a freshly created ticket is dropped
+// straight into the active shift portal carrying the fewest open tickets
+// (oldest portal wins ties), respecting each portal's max_tickets cap. Portals
+// with no shift window are treated as always-on. Shift windows are matched in
+// IST, the same timezone the Command dashboard analytics use. Never throws —
+// routing must not break ticket creation.
+async function autoRouteTicket(created) {
+    try {
+        const cfg = await getSetting('portal_routing');
+        // Absent means never-saved, not switched off. The WhatsApp and widget
+        // lanes assign through portalAssignment on every ticket with no toggle
+        // at all, so an unset value has to route too or the storefront lane
+        // quietly stops producing portal owners.
+        if (cfg && cfg.enabled !== true) return created;
+        const portals = await dbAdapter.query(
+            "SELECT id, name, type, config, shift_start, shift_end, max_tickets FROM support_portals WHERE is_active = true AND type IN ('time_based', 'auto')"
+        );
+        if (!portals.length) return created;
+        const mins = istMinutesOf(created.created_at || new Date());
+        const candidates = portals.filter(p => {
+            let start = p.shift_start, end = p.shift_end;
+            if (p.type === 'time_based') {
+                const c = parsePortalConfig(p.config);
+                if (c && (c.time_start || c.time_end)) { start = c.time_start; end = c.time_end; }
+            }
+            return windowCovers(mins, start, end, true);
+        });
+        if (!candidates.length) return created;
+        const ids = candidates.map(p => p.id);
+        const counts = await dbAdapter.query(
+            `SELECT portal_id, COUNT(*)::int AS open_cnt FROM support_tickets
+             WHERE portal_id IN (${ids.map(() => '?').join(',')}) AND status = 'open' GROUP BY portal_id`,
+            ids
+        );
+        const openMap = {};
+        counts.forEach(r => { openMap[r.portal_id] = r.open_cnt; });
+        let best = null, bestCount = Infinity;
+        for (const p of candidates) {
+            const c = openMap[p.id] || 0;
+            if (p.max_tickets && c >= p.max_tickets) continue; // portal is full
+            if (c < bestCount || (c === bestCount && best && p.id < best.id)) {
+                best = p; bestCount = c;
+            }
+        }
+        if (!best) return created;
+        const thread = Array.isArray(created.thread) ? created.thread : [];
+        thread.push({ kind: 'event', text: 'Auto-routed to ' + best.name + ' (shift portal, least load)', at: Date.now(), internal: true });
+        const updated = await updateTicket(created.id, { portal_id: best.id, thread });
+        // Keep the portal's running load counter honest: the round-robin engine
+        // in utils/portalAssignment reads assigned_count for its capacity check,
+        // and every other write path recomputes it from live tickets.
+        await dbAdapter.run('UPDATE support_portals SET assigned_count = assigned_count + 1 WHERE id = ?', [best.id]);
+        return updated || created;
+    } catch (e) {
+        console.warn('[Support] auto-route skipped:', e.message);
+        return created;
+    }
+}
+
 async function createTicket(payload) {
     const now = Date.now();
     const thread = [{ kind: 'event', text: payload.requestLabel ? 'Request raised: ' + payload.requestLabel : 'Ticket raised', at: now }];
@@ -762,12 +999,22 @@ async function createTicket(payload) {
         ticketValues(data)
     );
     const created = rows[0];
+    // The desk's Access policy can pull the writer onto the whitelist automatically.
+    // Required lazily because supportAccessService loads this module, and fired
+    // without awaiting: a customer must never see a failed ticket because a policy
+    // row could not be written.
+    if (created) {
+        require('./supportAccessService').maybeAutoGrant(created.customer_phone, created.channel)
+            .catch(e => console.warn('[Support] auto-grant skipped:', e.message));
+    }
     // Attach images
     if (created && (payload.images || []).length) {
         for (const url of payload.images) {
             await dbAdapter.run('INSERT INTO ticket_attachments (ticket_id, image_url) VALUES (?, ?)', [created.id, url]);
         }
     }
+    // Auto-pilot: drop the ticket into the live shift portal when enabled
+    if (created && !payload.portalId) return await autoRouteTicket(created);
     return created;
 }
 
@@ -798,6 +1045,14 @@ function publicTicket(t) {
     if (!t) return null;
     const thread = Array.isArray(t.thread) ? t.thread : [];
     const lastMsg = [...thread].reverse().find(m => m.kind !== 'event');
+    // A photo-only message has no text to preview, so the queue/list row names
+    // the pictures instead of showing an empty line (WhatsApp does the same).
+    const previewText = () => {
+        const raw = String(lastMsg.text || '').slice(0, 140);
+        if (raw) return raw;
+        const n = Array.isArray(lastMsg.media_ids) ? lastMsg.media_ids.length : 0;
+        return n ? (n === 1 ? 'Photo' : n + ' photos') : '';
+    };
     return {
         id: t.id, ticket_number: t.ticket_number, order_id: t.order_id,
         reason: t.reason, reason_label: t.reason_label, sub: t.sub, sub_label: t.sub_label,
@@ -805,7 +1060,7 @@ function publicTicket(t) {
         created_at: t.created_at, updated_at: t.updated_at,
         resolution_type: t.resolution_type, resolution_label: t.resolution_label, resolution_at: t.resolution_at,
         csat: t.csat, reopen_count: t.reopen_count || 0,
-        preview: lastMsg ? { role: lastMsg.role, text: String(lastMsg.text || '').slice(0, 140), at: lastMsg.at } : null
+        preview: lastMsg ? { role: lastMsg.role, text: previewText(), at: lastMsg.at } : null
     };
 }
 
@@ -815,12 +1070,38 @@ const QUEUE_COLS = [
     'id', 'ticket_number', 'order_id', 'reason', 'reason_label', 'sub', 'sub_label',
     'status', 'priority', 'team', 'created_at', 'updated_at', 'last_customer_at',
     'resolution_type', 'resolution_label', 'resolution_at', 'csat', 'reopen_count',
-    'thread', 'customer_name', 'customer_phone', 'channel', 'has_images'
+    'thread', 'customer_name', 'customer_phone', 'channel', 'source', 'has_images', 'portal_id'
 ].join(', ');
+
+// The desk's default "website" lane is the storefront Help & Tickets (accounts)
+// section only. The website chat widget raises tickets through createWidgetTicket,
+// which shares channel='website' (and for the testbot even source='website'), so
+// widget tickets are told apart by their 'WDG-' ticket-number prefix — every
+// widget path uses it, while account tickets are numbered from the order id.
+// Choosing whatsapp/instagram narrows normally; channel='all' deliberately keeps
+// widget tickets visible so nothing becomes unreachable from the desk.
+const DESK_WEBSITE_COND = "channel = 'website' AND ticket_number NOT LIKE 'WDG-%'";
+
+// Events the storefront must never see: internal routing, team hand-offs,
+// triage levels and named-staff actions. Rows written before the `internal`
+// flag existed are caught by the text pattern, so no backfill is needed —
+// the desk keeps reading the unfiltered thread and the DB stays honest.
+const INTERNAL_EVENT_RE = /^(auto-routed to|assigned to|taken by|priority set to|reopened by)\b/i;
+
+function isCustomerVisibleEntry(m) {
+    if (!m) return false;                       // never ship a hole to the theme
+    if (m.kind !== 'event') return true;        // messages always pass
+    if (m.internal === true) return false;
+    return !INTERNAL_EVENT_RE.test(String(m.text || ''));
+}
 
 // Customer-safe detail projection. The desk row carries internal columns
 // (notes, assigned_to, the customer snapshot in history) that must never be
 // serialised to the storefront, and trimming them also shrinks the response.
+// The thread is filtered by the same rule: auto-route / assignment / hand-off
+// events describe who inside Off-Comfort is working on the ticket, which is
+// operations detail the customer never needs to see (and which pins staff
+// names and the internal team map onto a browsable payload).
 function customerTicket(t) {
     if (!t) return null;
     return {
@@ -833,8 +1114,58 @@ function customerTicket(t) {
         resolution_label: t.resolution_label, resolution_at: t.resolution_at,
         csat: t.csat, reopen_count: t.reopen_count || 0,
         payment_link: t.payment_link || null,
-        thread: Array.isArray(t.thread) ? t.thread : []
+        // Customer sees only outcomes, never the internal team map.
+        thread: Array.isArray(t.thread) ? t.thread.filter(isCustomerVisibleEntry) : []
     };
+}
+
+// ---------- portal (staff) thread projection ----------
+// The team portal was a WhatsApp/Instagram inbox only: it read `messages` by
+// phone, so a storefront ticket - whose whole conversation lives in this row's
+// `thread` - opened as unrelated WhatsApp history the team could neither read
+// nor answer. These helpers are the single definition of that lane, so the
+// portal and the desk cannot drift apart.
+
+// Same rule as DESK_WEBSITE_COND above: channel='website' also covers the chat
+// widget, and its tickets (WDG-) deliberately continue on WhatsApp, so they must
+// keep the portal's chat view.
+function isStorefrontTicket(t) {
+    return !!t && t.channel === 'website' && !String(t.ticket_number || '').startsWith('WDG-');
+}
+
+// Staff see the stored thread as it is, including the internal events the
+// customer projection hides - deliberately NOT isCustomerVisibleEntry.
+function portalThreadView(t) {
+    const thread = (t && Array.isArray(t.thread)) ? t.thread : [];
+    return thread.filter(Boolean).map(m => ({
+        role: m.kind === 'event' ? 'event' : (m.role === 'agent' ? 'agent' : 'customer'),
+        text: String(m.text || ''),
+        at: m.at || null,
+        ask: !!m.ask,
+        agentId: m.agentId || null,
+        internal: m.internal === true
+    }));
+}
+
+// A portal reply behaves exactly like the desk composer (supportDeskRoutes
+// agentComposer): the answer joins the thread, the ticket waits on the customer
+// and the first-response clock starts once. Nothing goes out on WhatsApp - the
+// storefront Help & Tickets tab is the delivery channel.
+function portalAgentReplyPatch(t, opts = {}) {
+    if (!t) return null;
+    const text = String(opts.text || '').trim().slice(0, 5000);
+    if (!text) return null;
+    const now = opts.now || Date.now();
+    const thread = (t && Array.isArray(t.thread)) ? t.thread.slice() : [];
+    thread.push({ role: 'agent', text, at: now, agentId: opts.agentId || null });
+    const patch = {
+        thread,
+        status: 'awaiting',
+        updated_at: new Date(now).toISOString(),
+        last_agent_at: new Date(now).toISOString()
+    };
+    if (!t.first_response_at) patch.first_response_at = new Date(now).toISOString();
+    return patch;
 }
 
 // Builds the filtered list query in SQL (the app has no REST filter builder).
@@ -842,7 +1173,8 @@ async function deskQueryTickets(filters = {}) {
     const conditions = [];
     const params = [];
     const ch = filters.channel === 'all' ? null : (filters.channel || 'website');
-    if (ch) { conditions.push('channel = ?'); params.push(ch); }
+    if (ch === 'website') { conditions.push(DESK_WEBSITE_COND); }
+    else if (ch) { conditions.push('channel = ?'); params.push(ch); }
     if (filters.status && filters.status !== 'all') { conditions.push('status = ?'); params.push(filters.status); }
     if (filters.team) { conditions.push('team = ?'); params.push(filters.team); }
     if (filters.priority) { conditions.push('priority = ?'); params.push(filters.priority); }
@@ -888,7 +1220,8 @@ async function deskStatsAgg(slaCfg = {}, channel = 'website', requestPairs = [])
     params.push(todayStart.toISOString());
 
     const conditions = [];
-    if (ch) { conditions.push('channel = ?'); params.push(ch); }
+    if (ch === 'website') { conditions.push(DESK_WEBSITE_COND); }
+    else if (ch) { conditions.push('channel = ?'); params.push(ch); }
 
     const rows = await dbAdapter.query(
         `SELECT
@@ -921,8 +1254,10 @@ module.exports = {
     getSetting, getAllSettings, putSetting, fillTemplate,
     riskOf, econOf, slaOf, ticketBase, nextTicketNumber,
     listOrdersByPhone, getOrderByNumber, patchCachedOrder, customerHistory, mapCachedOrder, cacheRowsFor, getCacheRow, listOrderCache,
-    contextFor, normOrderId,
+    contextFor, normOrderId, attachItemImages,
     isWhitelisted, listWhitelist, addWhitelist, removeWhitelist,
     listTicketsByPhone, countTicketsByPhone, getTicket, getTicketByNumber, openTicketForOrder,
-    createTicket, updateTicket, listTicketImages, deskQueryTickets, deskStatsAgg, publicTicket, customerTicket
+    createTicket, updateTicket, listTicketImages, deskQueryTickets, deskStatsAgg, publicTicket, customerTicket, isCustomerVisibleEntry,
+    isStorefrontTicket, portalThreadView, portalAgentReplyPatch,
+    getPortalIndex, describePortal
 };

@@ -10,7 +10,7 @@ const Settings = require('../models/Settings');
 const broadcastService = require('../services/broadcastService');
 const followUpService = require('../services/followUpService');
 const whatsappService = require('../services/whatsappService');
-const { dbAdapter } = require('../database/db');
+const { dbAdapter, pool } = require('../database/db');
 const cloudinaryService = require('../services/cloudinaryService');
 const igCommentService = require('../services/igCommentService');
 const shipmentExportService = require('../services/shipmentExportService');
@@ -1600,6 +1600,38 @@ function timeRangeSqlClause(config, col = 'created_at') {
 // it is NOT resolved and still counts toward the portal's active workload.
 const SUPPORT_TICKET_STATUSES = ['open', 'resolved', 'closed', 'follow_up'];
 
+// ── Date range filter helpers for support tickets ──
+// Dates are YYYY-MM-DD calendar days in IST (what the dashboard shows).
+// Boundaries are shifted to UTC on the PARAMETER side (`?::date - interval`),
+// never on created_at, so the index on created_at stays usable (sargable).
+// This also fixes the old UTC-vs-IST day-edge mismatch with the analytics.
+const IST_OFFSET_SQL = "INTERVAL '5 hours 30 minutes'";
+function isYmdDate(v) { return /^\d{4}-\d{2}-\d{2}$/.test(String(v || '')); }
+function isHmTime(v) { return /^([01]?\d|2[0-3]):[0-5]\d(:[0-5]\d)?$/.test(String(v || '')); }
+// Returns [{ clause, param }] for a column, e.g. 'created_at' or 't.created_at'
+function istRangeClauses(col, date_from, date_to) {
+    const out = [];
+    if (isYmdDate(date_from)) {
+        out.push({ clause: `${col} >= (?::date - ${IST_OFFSET_SQL})`, param: date_from });
+    }
+    if (isYmdDate(date_to)) {
+        out.push({ clause: `${col} < ((?::date + INTERVAL '1 day') - ${IST_OFFSET_SQL})`, param: date_to });
+    }
+    return out;
+}
+// Time-of-day bounds (HH:MM, IST). Inherently a column-side cast, but they only
+// ever narrow an already date-range-bounded scan, so the index still drives the row fetch.
+function istTimeClauses(col, time_from, time_to) {
+    const out = [];
+    if (isHmTime(time_from)) {
+        out.push({ clause: `(${col} + ${IST_OFFSET_SQL})::time >= ?::time`, param: time_from });
+    }
+    if (isHmTime(time_to)) {
+        out.push({ clause: `(${col} + ${IST_OFFSET_SQL})::time < ((?::time + INTERVAL '1 minute'))`, param: time_to });
+    }
+    return out;
+}
+
 router.get('/support-tickets', verifyToken, async (req, res) => {
     try {
         const { status, is_read, date_from, date_to, time_from, time_to, search, portal, sort, urgent, urgent_filter, channel } = req.query;
@@ -1647,25 +1679,12 @@ router.get('/support-tickets', verifyToken, async (req, res) => {
             params.push(is_read === 'true');
         }
 
-        if (date_from) {
-            conditions.push('created_at::date >= ?::date');
-            params.push(date_from);
-        }
-
-        if (date_to) {
-            conditions.push('created_at::date <= ?::date');
-            params.push(date_to);
-        }
-
-        if (time_from) {
-            conditions.push('created_at::time >= ?::time');
-            params.push(time_from);
-        }
-
-        if (time_to) {
-            conditions.push('created_at::time <= ?::time');
-            params.push(time_to);
-        }
+        // Date range (inclusive days, IST) + optional time-of-day window
+        [...istRangeClauses('created_at', date_from, date_to),
+         ...istTimeClauses('created_at', time_from, time_to)].forEach(c => {
+            conditions.push(c.clause);
+            params.push(c.param);
+        });
 
         if (search && String(search).trim()) {
             const like = `%${String(search).trim()}%`;
@@ -1803,7 +1822,7 @@ router.get('/support-tickets', verifyToken, async (req, res) => {
 // ── Export Support Tickets (with chat) as Excel or CSV ──────────────────────
 router.get('/support-tickets/export', verifyToken, requirePermission('export'), async (req, res) => {
     try {
-        const { status, date_from, date_to, search, portal, channel, format = 'xlsx', urgent } = req.query;
+        const { status, date_from, date_to, time_from, time_to, search, portal, channel, format = 'xlsx', urgent } = req.query;
         logOperatorActivity(req, 'export', `Support tickets export (status: ${status || 'all'}, format: ${format})`);
 
         // ── Build WHERE clause (mirrors the list endpoint filters) ──
@@ -1811,8 +1830,11 @@ router.get('/support-tickets/export', verifyToken, requirePermission('export'), 
         const params = [];
 
         if (status) { conditions.push('t.status = ?'); params.push(status); }
-        if (date_from) { conditions.push('t.created_at::date >= ?::date'); params.push(date_from); }
-        if (date_to) { conditions.push('t.created_at::date <= ?::date'); params.push(date_to); }
+        [...istRangeClauses('t.created_at', date_from, date_to),
+         ...istTimeClauses('t.created_at', time_from, time_to)].forEach(c => {
+            conditions.push(c.clause);
+            params.push(c.param);
+        });
         if (channel) { conditions.push('t.channel = ?'); params.push(channel); }
         if (search && String(search).trim()) {
             const like = `%${String(search).trim()}%`;
@@ -1850,17 +1872,21 @@ router.get('/support-tickets/export', verifyToken, requirePermission('export'), 
         const portalNameById = {};
         allPortals.forEach(p => { portalNameById[p.id] = p.name; });
 
-        // ── Collect unique phones → fetch all chat messages in one batch ──
+        // ── Collect unique phones → fetch chat messages in phone batches ──
+        // Was one unbounded LIMIT 50000 pull of full message bodies (~50MB heap
+        // spike, 1.9s query). Batching by phone caps each result set; LEFT(...,5000)
+        // matches the JS-side substring below, so the export output is unchanged.
         const phones = [...new Set(tickets.map(t => t.customer_phone).filter(Boolean))];
         let messagesByPhone = {};
-        if (phones.length) {
+        const PHONE_BATCH = 400;
+        for (let i = 0; i < phones.length; i += PHONE_BATCH) {
+            const batch = phones.slice(i, i + PHONE_BATCH);
             const chatRows = await dbAdapter.query(
-                `SELECT customer_phone, message_content, message_type, status, created_at
+                `SELECT customer_phone, LEFT(message_content, 5000) AS message_content, message_type, status, created_at
                  FROM messages
                  WHERE customer_phone = ANY(?)
-                 ORDER BY created_at ASC
-                 LIMIT 50000`,
-                [phones]
+                 ORDER BY created_at ASC`,
+                [batch]
             );
             chatRows.forEach(m => {
                 const phone = m.customer_phone;
@@ -2033,6 +2059,11 @@ router.put('/support-tickets/:id', verifyToken, async (req, res) => {
             } else if (status === 'resolved' || status === 'closed') {
                 // Resolving closes the follow-up loop — drop any pending reminder
                 updates.push('follow_up_at = NULL', 'follow_up_note = NULL');
+                // Canonical closure timestamp — the 45-day support-media
+                // retention timer reads resolution_at (was never stamped here).
+                updates.push('resolution_at = CURRENT_TIMESTAMP');
+            } else if (status === 'open') {
+                updates.push('resolution_at = NULL');
             }
         }
 
@@ -2047,6 +2078,22 @@ router.put('/support-tickets/:id', verifyToken, async (req, res) => {
             `UPDATE support_tickets SET ${updates.join(', ')} WHERE id = ?`,
             params
         );
+
+        // Drive the support-media retention timer off the new status.
+        if (status) {
+            try {
+                const supportMedia = require('../services/supportMediaService');
+                const tn = await dbAdapter.query('SELECT ticket_number, resolution_at FROM support_tickets WHERE id = ?', [id]);
+                const ticketNumber = tn?.[0]?.ticket_number;
+                if (status === 'resolved' || status === 'closed') {
+                    await supportMedia.armRetention(ticketNumber, tn?.[0]?.resolution_at);
+                } else if (status === 'open' || status === 'follow_up') {
+                    await supportMedia.clearRetention(ticketNumber);
+                }
+            } catch (retErr) {
+                console.error('[Admin] retention timer update failed:', retErr.message);
+            }
+        }
         
         // Invalidate ticket cache when ticket is updated
         clearAllCaches('tickets');
@@ -2540,6 +2587,310 @@ router.put('/shoppers/:id', verifyToken, requirePermission('edit_orders'), async
     }
 });
 
+// ============================================================
+// Order item change requests — the queue behind the website
+// order-confirmation edit panel (size / qty / remove on existing
+// lines plus new items picked from the live Shopify catalog).
+// Rows land in order_item_requests; the hub applies them with one
+// click, which mirrors the swap to Shopify AND GoKwik exactly like
+// saving in the edit modal (PUT /shoppers/:id above).
+// ============================================================
+
+function normalizeItemTitle(t) {
+    return String(t == null ? '' : t).trim().toLowerCase().replace(/\s+/g, ' ');
+}
+
+// Parse store_shoppers.items_json defensively (GoKwik / Shopify / manual shapes)
+function parseShopperItems(itemsJson) {
+    try {
+        const parsed = JSON.parse(itemsJson || '[]');
+        return Array.isArray(parsed) ? parsed : [];
+    } catch (_) {
+        return [];
+    }
+}
+
+// Apply a pending request to the shopper's CURRENT items → final items array
+// in the hub items_json shape. Unmatched titles are skipped (the request card
+// shows them as "not found on the order" so ops can handle manually).
+function computeRequestedItems(currentItems, request) {
+    const req = request || {};
+    const items = (Array.isArray(currentItems) ? currentItems : []).map(i => ({ ...i }));
+    const unmatched = [];
+    (req.items || []).forEach((ch) => {
+        const match = items.find(i => !i.__removed && normalizeItemTitle(i.title || i.name) === normalizeItemTitle(ch.title));
+        if (!match) { unmatched.push(ch.title); return; }
+        if (ch.remove) { match.__removed = true; return; }
+        if (ch.toVariantTitle) {
+            match.size = ch.toVariantTitle;
+            match.variant_title = ch.toVariantTitle;
+        }
+        if (ch.qty != null && !isNaN(parseInt(ch.qty, 10))) {
+            match.quantity = Math.max(0, parseInt(ch.qty, 10));
+        }
+    });
+    const finalItems = items
+        .filter(i => !i.__removed && (parseInt(i.quantity, 10) || 0) > 0)
+        .map(({ __removed, ...rest }) => rest);
+    (req.adds || []).forEach((ad) => {
+        if (!ad || !ad.title) return;
+        finalItems.push({
+            title: ad.title,
+            name: ad.title,
+            quantity: Math.max(1, parseInt(ad.quantity, 10) || 1),
+            price: parseFloat(ad.price) || 0,
+            size: ad.variantTitle || null,
+            variant_title: ad.variantTitle || null,
+            variant_id: ad.variantId || null,
+            product_id: ad.productId || null,
+            requested_add: true
+        });
+    });
+    return { items: finalItems, unmatched };
+}
+
+function requestItemsTotal(items) {
+    return Math.round(items.reduce((sum, i) => sum + (parseFloat(i.price) || 0) * (parseInt(i.quantity, 10) || 1), 0) * 100) / 100;
+}
+
+// List requests (hub queue). status=pending|applied|dismissed|all (default pending)
+router.get('/order-item-requests', verifyToken, async (req, res) => {
+    try {
+        const status = String(req.query.status || 'pending').toLowerCase();
+        const params = [];
+        let whereClause = '';
+        if (status !== 'all') {
+            whereClause = 'WHERE r.status = ?';
+            params.push(status);
+        }
+        const rows = await dbAdapter.query(
+            `SELECT r.id, r.shopper_id, r.order_id, r.phone, r.request, r.summary, r.status,
+                    r.created_at, r.resolved_at, r.resolved_by, r.resolution_note,
+                    s.name AS customer_name, s.payment_method, s.order_total, s.status AS shopper_status,
+                    s.items_json, o.awb
+             FROM order_item_requests r
+             LEFT JOIN store_shoppers s ON s.id = r.shopper_id
+             LEFT JOIN orders o ON o.order_id = s.order_id
+             ${whereClause}
+             ORDER BY r.created_at DESC
+             LIMIT 200`,
+            params
+        );
+        // Attach the live item snapshot so the hub can render current → requested
+        const requests = (rows || []).map(r => {
+            let request = r.request;
+            if (typeof request === 'string') { try { request = JSON.parse(request); } catch (_) { request = { items: [], adds: [] }; } }
+            const currentItems = parseShopperItems(r.items_json);
+            const preview = computeRequestedItems(currentItems, request);
+            return {
+                ...r,
+                request,
+                current_items: currentItems,
+                proposed_items: preview.items,
+                proposed_total: requestItemsTotal(preview.items),
+                unmatched_titles: preview.unmatched,
+                shipped: !!r.awb
+            };
+        });
+        res.json({ success: true, requests });
+    } catch (error) {
+        console.error('Item requests fetch error:', error);
+        res.status(500).json({ success: false, error: 'Failed to fetch item requests' });
+    }
+});
+
+// One-click apply: writes the requested items onto the hub row, mirrors to
+// Shopify + GoKwik, acks the customer on WhatsApp. Optional body overrides
+// { items?, order_total?, payment_method? } when the admin tweaked in the picker.
+router.post('/order-item-requests/:id/apply', verifyToken, requirePermission('edit_orders'), async (req, res) => {
+    try {
+        const id = parseInt(req.params.id, 10);
+        if (!id) return res.status(400).json({ error: 'Invalid request id' });
+
+        const reqRows = await dbAdapter.query('SELECT * FROM order_item_requests WHERE id = ?', [id]);
+        const requestRow = reqRows && reqRows[0];
+        if (!requestRow) return res.status(404).json({ error: 'Request not found' });
+        if (requestRow.status !== 'pending') {
+            return res.status(409).json({ error: `Request already ${requestRow.status}` });
+        }
+
+        const shopperRows = await dbAdapter.query(
+            'SELECT * FROM store_shoppers WHERE id = ? OR order_id = ? ORDER BY created_at DESC LIMIT 1',
+            [String(requestRow.shopper_id || ''), requestRow.order_id]
+        );
+        const shopper = shopperRows && shopperRows[0];
+        if (!shopper) return res.status(404).json({ error: 'Shopper row not found' });
+
+        // A cancelled order must not be resurrected by a one-click apply
+        if (String(shopper.status || '').toLowerCase() === 'cancelled') {
+            return res.status(409).json({ error: 'Order is cancelled in the hub — resolve that first' });
+        }
+
+        // Fail-closed shipped check (same rule as the website endpoints)
+        const shippedRows = await dbAdapter.query(
+            `SELECT 1 FROM orders WHERE order_id = ? AND (awb IS NOT NULL OR status = 'shipped') LIMIT 1`,
+            [shopper.order_id]
+        );
+        if (shippedRows && shippedRows.length) {
+            return res.status(409).json({ error: 'Order already shipped — apply is closed', shipped: true });
+        }
+
+        let request = requestRow.request;
+        if (typeof request === 'string') { try { request = JSON.parse(request); } catch (_) { request = { items: [], adds: [] }; } }
+
+        // Final items: admin-provided array wins (they may have adjusted price/qty
+        // in the editor); otherwise compute current + request.
+        let finalItems;
+        if (Array.isArray(req.body && req.body.items) && req.body.items.length) {
+            finalItems = req.body.items.slice(0, 30).map(i => ({
+                title: String(i.title || i.name || 'Product').trim().slice(0, 150),
+                quantity: Math.min(50, Math.max(1, parseInt(i.quantity, 10) || 1)),
+                price: Math.min(999999, Math.max(0, parseFloat(i.price) || 0)),
+                size: i.size || i.variant_title || null,
+                variant_title: i.variant_title || i.size || null,
+                product_id: i.product_id || null,
+                variant_id: i.variant_id || null
+            }));
+        } else {
+            finalItems = computeRequestedItems(parseShopperItems(shopper.items_json), request).items;
+        }
+        if (!finalItems.length) {
+            return res.status(400).json({ error: 'Applying this request would leave the order with no items' });
+        }
+
+        const itemsJson = JSON.stringify(finalItems);
+        const newTotal = req.body && req.body.order_total != null && !isNaN(parseFloat(req.body.order_total))
+            ? Math.max(0, parseFloat(req.body.order_total))
+            : requestItemsTotal(finalItems);
+        const paymentMethod = req.body && ['COD', 'Prepaid'].includes(req.body.payment_method) ? req.body.payment_method : null;
+        const nowIso = new Date().toISOString();
+
+        // Applying an approved request IS the customer's confirmation with the new
+        // items, so the order leaves the "Edits" queue and becomes confirmed.
+        const nowConfirmed = String(shopper.status || '') === 'edit_details';
+
+        const updateData = {
+            items_json: itemsJson,
+            order_total: newTotal,
+            updated_at: nowIso,
+            customer_message: `Customer item change request applied by ${req.admin && req.admin.username ? req.admin.username : 'team'} (request #${id})${nowConfirmed ? ' — order confirmed' : ''}`
+        };
+        if (nowConfirmed) {
+            updateData.status = 'confirmed';
+            // Same human-approval signal as the status route above. Note this path
+            // deliberately does NOT rewrite confirmed_by: the order reached
+            // edit_details through the WhatsApp bot and changing the channel here
+            // would move rows between buckets the existing method analytics counts.
+            const actor = operatorIdentity(req);
+            if (actor) updateData.confirmed_by_operator = actor;
+        }
+        if (paymentMethod) updateData.payment_method = paymentMethod;
+        await dbAdapter.update('store_shoppers', updateData, { id: shopper.id });
+        invalidateCache('shoppers');
+
+        // Mirror to Shopify, then GoKwik — same pair of calls the edit modal uses
+        let shopifySync = null;
+        let gokwikSync = null;
+        try {
+            const shopifyService = require('../services/shopifyService');
+            shopifySync = await shopifyService.syncOrderEdits(shopper.order_id, {
+                items: finalItems,
+                paymentMethod
+            });
+        } catch (syncError) {
+            console.error('⚠️ Shopify item-request sync error (hub still updated):', syncError.message);
+            shopifySync = { success: false, actions: [], warnings: [syncError.message] };
+        }
+        try {
+            const gokwikService = require('../services/gokwikService');
+            gokwikSync = await gokwikService.notifyOrderUpdate(shopper.order_id, {
+                items: finalItems,
+                orderTotal: newTotal,
+                ...(paymentMethod ? { paymentMethod } : {})
+            });
+        } catch (gkError) {
+            console.error('⚠️ GoKwik item-request sync error (hub still updated):', gkError.message);
+            gokwikSync = { success: false, skipped: false, reason: gkError.message };
+        }
+
+        await dbAdapter.query(
+            `UPDATE order_item_requests
+             SET status = 'applied', resolved_at = ?, resolved_by = ?, resolution_note = ?
+             WHERE id = ?`,
+            [nowIso, String((req.admin && (req.admin.username || req.admin.role)) || 'team'), `total ₹${newTotal}`, id]
+        );
+
+        // Ack the customer on WhatsApp (best effort, like the other actions)
+        try {
+            const phone = String(shopper.phone || '').replace(/\D/g, '').slice(-10);
+            if (phone.length === 10) {
+                await whatsappService.sendMessage(phone, `✏️ *Edit Applied — Order ${shopper.order_id}*\n\n▫️ Your item changes have been applied to the order.\n▫️ Updated total: ₹${newTotal}${nowConfirmed ? '\n▫️ Your order is now *confirmed*.' : '\n▫️ We will ship the updated items. Thank you!'}`);
+            }
+        } catch (waErr) {
+            console.warn('[ItemRequests] WhatsApp ack skipped:', waErr.message);
+        }
+
+        logOperatorActivity(req, 'item_request_apply', `Applied request #${id} for ${shopper.order_id} (total ₹${newTotal})${nowConfirmed ? ' — order confirmed' : ''}`);
+        res.json({
+            success: true,
+            items: finalItems,
+            order_total: newTotal,
+            order_status: nowConfirmed ? 'confirmed' : shopper.status,
+            shopify_sync: shopifySync,
+            gokwik_sync: gokwikSync
+        });
+    } catch (error) {
+        console.error('Item request apply error:', error);
+        res.status(500).json({ error: 'Failed to apply item request' });
+    }
+});
+
+// Close a request without applying (declined, or applied through another path
+// such as the edit modal which already synced Shopify + GoKwik itself)
+router.post('/order-item-requests/:id/dismiss', verifyToken, requirePermission('edit_orders'), async (req, res) => {
+    try {
+        const id = parseInt(req.params.id, 10);
+        if (!id) return res.status(400).json({ error: 'Invalid request id' });
+        const status = req.body && req.body.status === 'applied' ? 'applied' : 'dismissed';
+        const note = String((req.body && req.body.note) || '').slice(0, 300);
+        const requestRows = await dbAdapter.query('SELECT shopper_id, order_id FROM order_item_requests WHERE id = ?', [id]);
+        if (!requestRows || !requestRows.length) return res.status(404).json({ error: 'Item request not found' });
+        const result = await dbAdapter.query(
+            `UPDATE order_item_requests
+             SET status = ?, resolved_at = ?, resolved_by = ?, resolution_note = ?
+             WHERE id = ? AND status = 'pending'
+             RETURNING id`,
+            [status, new Date().toISOString(), String((req.admin && (req.admin.username || req.admin.role)) || 'team'), note, id]
+        );
+        if (!result || !result.length) return res.status(409).json({ error: 'Request is no longer pending' });
+
+        // Closing a request as applied ("saved through the editor") is the same
+        // approval — an order sitting in the Edits queue moves to Confirmed.
+        let orderConfirmed = false;
+        if (status === 'applied') {
+            try {
+                const flip = await dbAdapter.query(
+                    `UPDATE store_shoppers
+                     SET status = 'confirmed', updated_at = ?, confirmed_by_operator = COALESCE(?, confirmed_by_operator)
+                     WHERE status = 'edit_details' AND (id = ? OR order_id = ?)
+                     RETURNING id`,
+                    [new Date().toISOString(), operatorIdentity(req), String(requestRows[0].shopper_id || ''), String(requestRows[0].order_id || '')]
+                );
+                orderConfirmed = !!(flip && flip.length);
+                if (orderConfirmed) invalidateCache('shoppers');
+            } catch (flipErr) {
+                console.warn('[ItemRequests] auto-confirm on close failed (non-fatal):', flipErr.message);
+            }
+        }
+
+        logOperatorActivity(req, 'item_request_dismiss', `Closed request #${id} as ${status}${note ? ` (${note})` : ''}${orderConfirmed ? ' — order confirmed' : ''}`);
+        res.json({ success: true, status, order_confirmed: orderConfirmed });
+    } catch (error) {
+        console.error('Item request dismiss error:', error);
+        res.status(500).json({ error: 'Failed to close item request' });
+    }
+});
+
 // Live shipping address from the Shopify order — used by the edit modal's
 // "Pull from Shopify" button so hub address fields can be re-synced
 router.get('/shoppers/:id/shopify-address', verifyToken, async (req, res) => {
@@ -2592,6 +2943,20 @@ async function notifyCustomerOfCancellation(shopper, reason) {
     );
 }
 
+// Which hub identity performed a shopper lifecycle action. `confirmed_by` already
+// records the CHANNEL (manual / whatsapp / website); this records the person, so
+// the analytics panel can answer "confirmed by which operator". Resolved from the
+// JWT, never from the request body. The master admin resolves to its login name
+// ('shopper_admin' for the hub passcode, ADMIN_USERNAME for the backend), which is
+// exactly what separates owner-made confirms from operator-made ones — activity
+// logging skips admin entirely (see logOperatorActivity), so without this column
+// there is no way to attribute those rows at all.
+function operatorIdentity(req) {
+    const identity = req.admin || {};
+    const raw = identity.username || (identity.role === 'admin' ? 'admin' : null);
+    return raw ? String(raw).slice(0, 100) : null;
+}
+
 // Update shopper status manually (Confirm/Reject)
 router.post('/shoppers/:id/status', verifyToken, requirePermission('edit_orders'), async (req, res) => {
     try {
@@ -2623,6 +2988,8 @@ router.post('/shoppers/:id/status', verifyToken, requirePermission('edit_orders'
         // Track confirmation method for non-pending statuses
         if (['confirmed', 'cancelled', 'edit_details'].includes(status)) {
             updateData.confirmed_by = 'manual';
+            const actor = operatorIdentity(req);
+            if (actor) updateData.confirmed_by_operator = actor;
         }
         if (status === 'cancelled') {
             updateData.cancel_reason = reason;
@@ -3102,12 +3469,18 @@ router.get('/shoppers/export', verifyToken, requirePermission('export'), async (
 // Inbox Export - export orders/messages from inbox with filters
 router.get('/inbox/export', verifyToken, requirePermission('export'), async (req, res) => {
     try {
-        const { tab = 'confirmed', startDate, endDate, confirmedBy, paymentMethod, deliveryType, search, format = 'xlsx', orderIds, dateField = 'updated_at' } = req.query;
+        const { tab = 'confirmed', startDate, endDate, confirmedBy, paymentMethod, deliveryType, search, format = 'xlsx', orderIds, dateField = 'updated_at', operator } = req.query;
         logOperatorActivity(req, 'export', `Inbox export (tab: ${tab}, format: ${format})`);
 
         // Validate dateField
         const validDateFields = ['created_at', 'updated_at'];
         const safeDateField = validDateFields.includes(dateField) ? dateField : 'updated_at';
+
+        // Operator attribution follows the same admin-only rule as the inbox list
+        // and the analytics panel, so an exported sheet cannot carry a column the
+        // operator UI is not allowed to show.
+        const canSeeOperator = req.admin && req.admin.role === 'admin';
+        const operatorFilter = canSeeOperator && operator ? String(operator).slice(0, 100) : null;
 
         let whereClause = 'WHERE 1=1';
         const params = [];
@@ -3131,6 +3504,10 @@ router.get('/inbox/export', verifyToken, requirePermission('export'), async (req
             if (confirmedBy) {
                 whereClause += ' AND s.confirmed_by = ?';
                 params.push(confirmedBy);
+            }
+            if (operatorFilter) {
+                whereClause += ' AND s.confirmed_by_operator = ?';
+                params.push(operatorFilter);
             }
             if (paymentMethod) {
                 whereClause += ' AND s.payment_method = ?';
@@ -3188,7 +3565,7 @@ router.get('/inbox/export', verifyToken, requirePermission('export'), async (req
         const sql = `
             SELECT s.name, s.phone, s.email, s.order_id, s.address, s.city, s.province, s.zip,
                    s.payment_method, s.items_json, s.status, s.created_at, s.customer_message,
-                   s.delivery_type, s.confirmed_by, s.updated_at,
+                   s.delivery_type, s.confirmed_by, s.updated_at, ${canSeeOperator ? 's.confirmed_by_operator,' : ''}
                    COALESCE(s.order_total, o.total) as order_total,
                    o.awb, o.courier_name
             FROM store_shoppers s
@@ -3230,6 +3607,7 @@ router.get('/inbox/export', verifyToken, requirePermission('export'), async (req
                 'Payment Method': s.payment_method || '',
                 'Delivery Type': s.delivery_type || 'Standard',
                 'Confirmed By': s.confirmed_by || '',
+                ...(canSeeOperator ? { 'Confirmed By Operator': s.confirmed_by_operator || 'unrecorded' } : {}),
                 'Products': productsStr,
                 'City': s.city || '',
                 'AWB': s.awb || '',
@@ -3304,7 +3682,7 @@ router.get('/chat/unread', verifyToken, async (req, res) => {
         const filterClause = [];
         const filterParams = [];
         if (search) {
-            filterClause.push('(c.name LIKE ? OR u.phone LIKE ? OR ls.order_id LIKE ?)');
+            filterClause.push('(cf.name LIKE ? OR u.phone LIKE ? OR ls.order_id LIKE ?)');
             const searchParam = `%${search}%`;
             filterParams.push(searchParam, searchParam, searchParam);
         }
@@ -3313,19 +3691,26 @@ router.get('/chat/unread', verifyToken, async (req, res) => {
             filterParams.push(actionType);
         }
         const outerWhere = filterClause.length ? ` AND ${filterClause.join(' AND ')}` : '';
-        // The page always joins (it returns name/order/shopper columns); the count
-        // only joins when a filter actually references them.
-        const pageJoins = 'LEFT JOIN latest_shopper ls ON ls.phone = u.phone LEFT JOIN customers c ON c.phone = u.phone';
-        const countJoins = outerWhere ? pageJoins : '';
+        const needsShopperFilter = Boolean(search || actionType);
+        const needsCustomerFilter = Boolean(search);
+        // Only the columns a filter actually touches are joined, and they are
+        // aliased cf/ls so they cannot collide with the hydration joins outside
+        // the page sub-select.
+        const filterJoins = [
+            needsShopperFilter ? 'LEFT JOIN latest_shopper ls ON ls.phone = u.phone' : '',
+            needsCustomerFilter ? 'LEFT JOIN customers cf ON cf.phone = u.phone' : ''
+        ].filter(Boolean).join(' ');
 
-        // Latest shopper row per phone. DISTINCT ON walks
-        // idx_store_shoppers_phone_created; the previous shape recomputed this
-        // with a GROUP BY self-join over the whole table on every request.
+        // Latest shopper row per phone, narrowed to the two columns a filter can
+        // reference. (phone, created_at DESC) INCLUDE (order_id, status, ...) is
+        // exactly idx_store_shoppers_phone_order_cover, so this runs index-only:
+        // 54,779 rows in ~80ms. The wide projection it replaces had to walk the
+        // 227MB heap of ~2KB rows in index order for the same 54,779 rows
+        // (measured 11,055ms), and it did so for every unread conversation
+        // (~29k) to render a page of 20 — that one node is what tripped the
+        // 30s statement_timeout in production.
         const latestShopperCte = `latest_shopper AS (
-                SELECT DISTINCT ON (s1.phone)
-                       s1.phone, s1.id, s1.order_id, s1.status, s1.order_total,
-                       s1.delivery_type, s1.payment_method, s1.confirmed_by,
-                       s1.created_at, s1.updated_at, s1.last_response_at
+                SELECT DISTINCT ON (s1.phone) s1.phone, s1.order_id, s1.status
                 FROM store_shoppers s1
                 ORDER BY s1.phone, s1.created_at DESC
             )`;
@@ -3334,8 +3719,7 @@ router.get('/chat/unread', verifyToken, async (req, res) => {
         // The old GROUP BY + MAX(message_content) + MAX() per shopper column
         // aggregated every unread message (41k rows), spilled a 5MB sort to disk
         // and took ~7.9s — long enough to consume the whole pool.
-        const unreadSql = `
-            WITH unread AS (
+        const unreadCte = `unread AS (
                 SELECT DISTINCT ON (m.customer_phone)
                        m.customer_phone AS phone,
                        m.created_at     AS last_message_at,
@@ -3345,18 +3729,41 @@ router.get('/chat/unread', verifyToken, async (req, res) => {
                   AND NOT EXISTS (SELECT 1 FROM message_reads mr WHERE mr.message_id = m.id)
                   ${dateClause}
                 ORDER BY m.customer_phone, m.created_at DESC
-            ),
-            ${latestShopperCte}
-            SELECT u.phone, u.last_message_at, u.latest_message,
+            )`;
+
+        // Page first, hydrate second: LIMIT chooses the 20 conversations, then the
+        // shopper and name lookups run 20 times each off idx_store_shoppers_phone
+        // and the unique idx_customers_phone, instead of hashing all 84k customers
+        // into every request. Both hydration joins are at-most-one-row per phone
+        // (LATERAL ... LIMIT 1, unique key), so they cannot change the row set or
+        // its order and pagination stays equivalent to the old single query.
+        const unreadSql = `
+            WITH ${unreadCte}${needsShopperFilter ? `,${latestShopperCte}` : ''},
+            page AS (
+                SELECT u.phone, u.last_message_at, u.latest_message
+                FROM unread u
+                ${filterJoins}
+                WHERE 1=1 ${outerWhere}
+                ORDER BY u.last_message_at DESC
+                LIMIT ? OFFSET ?
+            )
+            SELECT p.phone, p.last_message_at, p.latest_message,
                    ls.id AS shopper_id, ls.order_id, ls.status, ls.order_total,
                    ls.delivery_type, ls.payment_method, ls.confirmed_by,
                    ls.created_at, ls.updated_at, ls.last_response_at,
                    c.name
-            FROM unread u
-            ${pageJoins}
-            WHERE 1=1 ${outerWhere}
-            ORDER BY u.last_message_at DESC
-            LIMIT ? OFFSET ?
+            FROM page p
+            LEFT JOIN LATERAL (
+                SELECT s2.id, s2.order_id, s2.status, s2.order_total, s2.delivery_type,
+                       s2.payment_method, s2.confirmed_by, s2.created_at, s2.updated_at,
+                       s2.last_response_at
+                FROM store_shoppers s2
+                WHERE s2.phone = p.phone
+                ORDER BY s2.created_at DESC
+                LIMIT 1
+            ) ls ON TRUE
+            LEFT JOIN customers c ON c.phone = p.phone
+            ORDER BY p.last_message_at DESC
         `;
         const pageRows = await dbAdapter.query(unreadSql, [...dateParams, ...filterParams, parseInt(limit), parseInt(offset)]);
 
@@ -3382,19 +3789,23 @@ router.get('/chat/unread', verifyToken, async (req, res) => {
 
         // Total conversations with unread messages. The joins are skipped when no
         // filter references them, which keeps the badge count query cheap.
+        //
+        // DISTINCT rather than DISTINCT ON + ORDER BY created_at DESC: this CTE
+        // only feeds a COUNT, and both forms yield exactly one row per phone, so
+        // carrying created_at through the sort bought nothing while making the
+        // unread scan cost the same 5.3s it does on the badge endpoint.
         const countSql = `
             WITH unread AS (
-                SELECT DISTINCT ON (m.customer_phone) m.customer_phone AS phone
+                SELECT DISTINCT m.customer_phone AS phone
                 FROM messages m
                 WHERE m.message_type = 'incoming'
                   AND NOT EXISTS (SELECT 1 FROM message_reads mr WHERE mr.message_id = m.id)
                   ${dateClause}
-                ORDER BY m.customer_phone, m.created_at DESC
             )
-            ${outerWhere ? `, ${latestShopperCte}` : ''}
+            ${outerWhere ? `,${latestShopperCte}` : ''}
             SELECT COUNT(*)::int AS total
             FROM unread u
-            ${countJoins}
+            ${outerWhere ? filterJoins : ''}
             WHERE 1=1 ${outerWhere}
         `;
         const countParams = outerWhere ? [...dateParams, ...filterParams] : [...dateParams];
@@ -3427,8 +3838,6 @@ router.get('/chat/unread/count', verifyToken, async (req, res) => {
     try {
         const { startDate, endDate } = req.query;
         const cacheKey = `chat_unread_count:${startDate || 'all'}:${endDate || 'all'}`;
-        const cached = getCached(cacheKey);
-        if (cached) return res.json(cached);
 
         let dateClause = '';
         const dateParams = [];
@@ -3445,19 +3854,27 @@ router.get('/chat/unread/count', verifyToken, async (req, res) => {
             dateParams.push(utcEndDate);
         }
 
-        const rows = await dbAdapter.query(`
-            SELECT COUNT(*)::int AS total FROM (
-                SELECT DISTINCT ON (m.customer_phone) m.customer_phone
+        // getOrLoad rather than getCached/setCache so simultaneous badge polls
+        // share one in-flight query instead of each starting their own — two
+        // dashboards opening together used to double this scan and take the
+        // pool with it (logged pool waits of 370-450ms on unrelated queries).
+        //
+        // The count needs no per-phone "latest" row, so DISTINCT ON plus its
+        // ORDER BY customer_phone, created_at DESC only made the sort carry
+        // created_at for all 94k unread messages (6.7MB) to arrive at a number.
+        // COUNT(DISTINCT customer_phone) is the same value by definition and
+        // sorts on one narrow column: measured 5270ms -> 306ms.
+        const result = await caches.unread.getOrLoad(cacheKey, async () => {
+            const rows = await dbAdapter.query(`
+                SELECT COUNT(DISTINCT m.customer_phone)::int AS total
                 FROM messages m
                 WHERE m.message_type = 'incoming'
                   AND NOT EXISTS (SELECT 1 FROM message_reads mr WHERE mr.message_id = m.id)
                   ${dateClause}
-                ORDER BY m.customer_phone, m.created_at DESC
-            ) unread
-        `, dateParams);
+            `, dateParams);
+            return { success: true, total: rows[0]?.total || 0 };
+        }, 60 * 1000);
 
-        const result = { success: true, total: rows[0]?.total || 0 };
-        setCache(cacheKey, result, 'unread', 60 * 1000);
         res.json(result);
     } catch (error) {
         console.error('Unread count fetch error:', error);
@@ -3838,11 +4255,17 @@ router.post('/chat/send-template', verifyToken, requirePermission('send_messages
 // Get recently confirmed orders
 router.get('/shoppers/recent-confirmed', verifyToken, async (req, res) => {
     try {
-        const { limit = 20, offset = 0, startDate, endDate, confirmedBy, paymentMethod, deliveryType, search, dateField = 'updated_at' } = req.query;
+        const { limit = 20, offset = 0, startDate, endDate, confirmedBy, paymentMethod, deliveryType, search, dateField = 'updated_at', operator } = req.query;
 
         // Validate dateField to prevent SQL injection
         const validDateFields = ['created_at', 'updated_at'];
         const safeDateField = validDateFields.includes(dateField) ? dateField : 'updated_at';
+
+        // Per-operator attribution is admin-only (agreed visibility rule): the
+        // column is neither selected nor filterable for an operator token, so it
+        // never reaches the payload a colleague could read.
+        const canSeeOperator = req.admin && req.admin.role === 'admin';
+        const operatorFilter = canSeeOperator && operator ? String(operator).slice(0, 100) : null;
 
         // Build date filter
         let dateClause = '';
@@ -3864,6 +4287,12 @@ router.get('/shoppers/recent-confirmed', verifyToken, async (req, res) => {
         if (confirmedBy) {
             dateClause += ' AND s.confirmed_by = ?';
             dateParams.push(confirmedBy);
+        }
+
+        // Confirmed-by-operator filter
+        if (operatorFilter) {
+            dateClause += ' AND s.confirmed_by_operator = ?';
+            dateParams.push(operatorFilter);
         }
 
         // Payment method filter
@@ -3890,7 +4319,7 @@ router.get('/shoppers/recent-confirmed', verifyToken, async (req, res) => {
             SELECT s.id, s.phone, s.name, s.order_id, s.status, s.customer_message,
                    s.last_response_at, s.created_at, s.updated_at, s.order_total, s.delivery_type,
                    s.payment_method, s.items_json, s.email, s.address, s.city, s.province, s.zip,
-                   s.confirmed_by,
+                   s.confirmed_by, ${canSeeOperator ? 's.confirmed_by_operator,' : ''}
                    o.awb, o.courier_name, o.status as order_status, o.tracking_url,
                    COALESCE(s.order_total, o.total) as order_total
             FROM store_shoppers s
@@ -3920,6 +4349,10 @@ router.get('/shoppers/recent-confirmed', verifyToken, async (req, res) => {
         if (confirmedBy) {
             countDateClause += ' AND confirmed_by = ?';
             countParams.push(confirmedBy);
+        }
+        if (operatorFilter) {
+            countDateClause += ' AND confirmed_by_operator = ?';
+            countParams.push(operatorFilter);
         }
         if (paymentMethod) {
             countDateClause += ' AND payment_method = ?';
@@ -3995,22 +4428,296 @@ router.get('/analytics/orders', verifyToken, async (req, res) => {
     }
 });
 
+// Inbox Confirmation Analytics — how orders got confirmed (manual vs WhatsApp
+// vs website/gokwik), aggregated per IST day. Runs on the confirmed tab of
+// the inbox. Optimizations:
+// - pure server-side aggregation: one GROUP BY day×method scan returns at most
+//   days×methods rows, so no row payload or page-size limit applies
+// - the GROUP BY expression is only evaluated on rows that already survived an
+//   index range scan on the raw timestamp column (idx_store_shoppers_status_updated
+//   / _created plus the confirmed_by covering index), keeping the query sargable
+// - results cached in the shared 'stats' LRU; 'recent' skips the cache so
+//   post-mutation refreshes never serve stale counts
+// - window clamped to MAX_ANALYTICS_SPAN_DAYS: an unbounded custom range makes
+//   the planner abandon the index and full-scan the wide heap (measured on the
+//   live table: 26ms at 30 days via Index Scan vs 529ms Seq Scan at 365 days)
+const MAX_ANALYTICS_SPAN_DAYS = 182;
+router.get('/inbox/confirmation-analytics', verifyToken, async (req, res) => {
+    try {
+        const { startDate, endDate, confirmedBy, paymentMethod, deliveryType, search, dateField = 'updated_at', recent, operator } = req.query;
+
+        const validDateFields = ['created_at', 'updated_at'];
+        const safeDateField = validDateFields.includes(dateField) ? dateField : 'updated_at';
+
+        // The per-operator dimension is admin-only. It is resolved here rather than
+        // filtered out at render time so the column never enters a non-admin
+        // payload, and the cache key below carries the identity class so an
+        // admin-shaped response can never be served to an operator token.
+        const canSeeOperator = req.admin && req.admin.role === 'admin';
+        const operatorFilter = canSeeOperator && operator ? String(operator).slice(0, 100) : null;
+
+        // Default window: last 30 days (IST) — bounded keeps the scan cheap
+        let startStr = startDate;
+        let endStr = endDate;
+        if (!startStr || !endStr) {
+            const istNow = new Date(Date.now() + 5.5 * 60 * 60 * 1000);
+            const fmtDay = d => d.toISOString().slice(0, 10);
+            const ist30 = new Date(istNow.getTime() - 30 * 24 * 60 * 60 * 1000);
+            startStr = startStr || fmtDay(ist30);
+            endStr = endStr || fmtDay(istNow);
+        }
+
+        // Clamp the requested span (calendar days, inclusive) and report what
+        // was actually measured so the UI label cannot lie about the numbers.
+        const startD0 = new Date(`${String(startStr).slice(0, 10)}T00:00:00Z`);
+        const endD0 = new Date(`${String(endStr).slice(0, 10)}T00:00:00Z`);
+        if (isNaN(startD0) || isNaN(endD0) || startD0 > endD0) {
+            return res.status(400).json({ error: 'Invalid date range' });
+        }
+        const requestedDays = Math.round((endD0 - startD0) / 86400000) + 1;
+        if (requestedDays > MAX_ANALYTICS_SPAN_DAYS) {
+            startStr = new Date(endD0.getTime() - (MAX_ANALYTICS_SPAN_DAYS - 1) * 86400000).toISOString().slice(0, 10);
+        }
+
+        const baseParams = [];
+        let where = "WHERE s.status = 'confirmed'";
+        where += ` AND s.${safeDateField} >= ? AND s.${safeDateField} <= ?`;
+        const utcStart = fromISTtoUTC(startStr.includes('T') ? startStr : `${startStr} 00:00:00`) || `${startStr} 00:00:00`;
+        const utcEnd = fromISTtoUTC(endStr.includes('T') ? endStr : `${endStr} 23:59:59`) || `${endStr} 23:59:59`;
+        baseParams.push(utcStart, utcEnd);
+
+        if (confirmedBy) { where += ' AND s.confirmed_by = ?'; baseParams.push(confirmedBy); }
+        if (operatorFilter) { where += ' AND s.confirmed_by_operator = ?'; baseParams.push(operatorFilter); }
+        if (paymentMethod) { where += ' AND s.payment_method = ?'; baseParams.push(paymentMethod); }
+        if (deliveryType) { where += ' AND s.delivery_type = ?'; baseParams.push(deliveryType); }
+        let searchClause = '';
+        if (search) {
+            searchClause = ' AND (s.name LIKE ? OR s.phone LIKE ? OR s.order_id LIKE ?)';
+            const searchParam = `%${search}%`;
+            baseParams.push(searchParam, searchParam, searchParam);
+        }
+
+        const cacheKey = `inbox_conf_analytics:${safeDateField}:${startStr.slice(0, 10)}:${endStr.slice(0, 10)}:${confirmedBy || 'all'}:${paymentMethod || 'all'}:${deliveryType || 'all'}:${operatorFilter || 'all'}:${canSeeOperator ? 'admin' : 'op'}`;
+        const useCache = !search && recent !== 'true';
+        if (useCache) {
+            const cached = getCached(cacheKey);
+            if (cached) return res.json(cached);
+        }
+
+        // Single scan: day × confirmation method buckets (bounded by the clamp:
+        // at most MAX_ANALYTICS_SPAN_DAYS × known methods rows come back)
+        const daySql = `
+            SELECT TO_CHAR(DATE(s.${safeDateField} AT TIME ZONE 'UTC' AT TIME ZONE 'Asia/Kolkata'), 'YYYY-MM-DD') as date,
+                   COALESCE(s.confirmed_by, 'unknown') as method,
+                   COUNT(*)::int as count
+            FROM store_shoppers s
+            ${where}${searchClause}
+            GROUP BY 1, 2
+            ORDER BY 1 DESC, 2
+        `;
+
+        // Previous equal-length period for the trend — aggregates only, no rows
+        const startD = new Date(`${startStr.slice(0, 10)}T00:00:00Z`);
+        const endD = new Date(`${endStr.slice(0, 10)}T00:00:00Z`);
+        const spanDays = Math.max(1, Math.min(MAX_ANALYTICS_SPAN_DAYS, Math.round((endD - startD) / 86400000) + 1));
+        const prevEnd = new Date(startD.getTime() - 24 * 60 * 60 * 1000);
+        const prevStart = new Date(prevEnd.getTime() - (spanDays - 1) * 24 * 60 * 60 * 1000);
+        const utcPrevStart = fromISTtoUTC(`${prevStart.toISOString().slice(0, 10)} 00:00:00`) || `${prevStart.toISOString().slice(0, 10)} 00:00:00`;
+        const utcPrevEnd = fromISTtoUTC(`${prevEnd.toISOString().slice(0, 10)} 23:59:59`) || `${prevEnd.toISOString().slice(0, 10)} 23:59:59`;
+        const prevParams = [utcPrevStart, utcPrevEnd];
+        let prevWhere = `WHERE s.status = 'confirmed' AND s.${safeDateField} >= ? AND s.${safeDateField} <= ?`;
+        if (confirmedBy) { prevWhere += ' AND s.confirmed_by = ?'; prevParams.push(confirmedBy); }
+        // Added before prevSql is built so the headline trend stays on the same
+        // filter set as the current period, instead of comparing all operators
+        // against one operator.
+        if (operatorFilter) { prevWhere += ' AND s.confirmed_by_operator = ?'; prevParams.push(operatorFilter); }
+        if (paymentMethod) { prevWhere += ' AND s.payment_method = ?'; prevParams.push(paymentMethod); }
+        if (deliveryType) { prevWhere += ' AND s.delivery_type = ?'; prevParams.push(deliveryType); }
+        const prevSql = `
+            SELECT COALESCE(s.confirmed_by, 'unknown') as method, COUNT(*)::int as count
+            FROM store_shoppers s
+            ${prevWhere}
+            GROUP BY 1
+        `;
+
+        // Second pass, admin only: day × who. 'automated' is a bot or website
+        // confirmation (no person involved), 'unrecorded' is a human confirmation
+        // from before the attribution column existed. Separating them is what stops
+        // the operator table implying nobody was working. Same WHERE as the method
+        // scan, so both ride idx_store_shoppers_confirmed_operator and the whole
+        // panel stays at four aggregate queries with no row payload.
+        const actorExpr = `COALESCE(s.confirmed_by_operator, CASE WHEN s.confirmed_by = 'manual' THEN 'unrecorded' ELSE 'automated' END)`;
+        const actorDaySql = canSeeOperator ? `
+            SELECT TO_CHAR(DATE(s.${safeDateField} AT TIME ZONE 'UTC' AT TIME ZONE 'Asia/Kolkata'), 'YYYY-MM-DD') as date,
+                   ${actorExpr} as actor,
+                   COUNT(*)::int as count
+            FROM store_shoppers s
+            ${where}${searchClause}
+            GROUP BY 1, 2
+            ORDER BY 1 DESC, 2
+        ` : null;
+        const prevActorSql = canSeeOperator ? `
+            SELECT ${actorExpr} as actor, COUNT(*)::int as count
+            FROM store_shoppers s
+            ${prevWhere}
+            GROUP BY 1
+        ` : null;
+
+        const [dayRows, prevRows, actorRows, prevActorRows] = await Promise.all([
+            dbAdapter.query(daySql, baseParams),
+            search ? Promise.resolve([]) : dbAdapter.query(prevSql, prevParams),
+            // The operator half degrades on its own: if this new column or index is
+            // somehow absent on a restarted container, the method/daily panel still
+            // renders instead of the whole endpoint 500ing.
+            actorDaySql ? dbAdapter.query(actorDaySql, baseParams).catch(err => {
+                console.warn('[InboxAnalytics] operator pass skipped:', err.message);
+                return [];
+            }) : Promise.resolve([]),
+            (actorDaySql && !search) ? dbAdapter.query(prevActorSql, prevParams).catch(() => []) : Promise.resolve([])
+        ]);
+
+        // Shape day rows → { daily, methodTotals } without a second query
+        const byDate = new Map();
+        const methodTotals = {};
+        for (const r of dayRows || []) {
+            if (!r.date) continue;
+            if (!byDate.has(r.date)) byDate.set(r.date, { date: r.date, manual: 0, whatsapp: 0, other: 0, total: 0, methods: {} });
+            const day = byDate.get(r.date);
+            const c = Number(r.count) || 0;
+            const bucket = (r.method === 'manual' || r.method === 'whatsapp') ? r.method : 'other';
+            day[bucket] += c;
+            day.total += c;
+            day.methods[r.method] = (day.methods[r.method] || 0) + c;
+            methodTotals[r.method] = (methodTotals[r.method] || 0) + c;
+        }
+
+        // day × actor → daily[].byActor (drives the per-date operator table and the
+        // stacked-by-operator chart) plus a per-actor day map for peak/active days.
+        const actorRollup = new Map();
+        for (const r of actorRows || []) {
+            if (!r.date || !r.actor) continue;
+            const c = Number(r.count) || 0;
+            const day = byDate.get(r.date);
+            if (day) {
+                if (!day.byActor) day.byActor = {};
+                day.byActor[r.actor] = (day.byActor[r.actor] || 0) + c;
+            }
+            if (!actorRollup.has(r.actor)) actorRollup.set(r.actor, { count: 0, byDay: {} });
+            const a = actorRollup.get(r.actor);
+            a.count += c;
+            a.byDay[r.date] = (a.byDay[r.date] || 0) + c;
+        }
+        const prevActorTotals = {};
+        for (const r of prevActorRows || []) {
+            if (!r.actor) continue;
+            prevActorTotals[r.actor] = (prevActorTotals[r.actor] || 0) + (Number(r.count) || 0);
+        }
+
+        const daily = Array.from(byDate.values()).sort((a, b) => (a.date < b.date ? 1 : -1));
+
+        const sum = (days, key) => days.reduce((acc, d) => acc + d[key], 0);
+        const total = sum(daily, 'total');
+        const manual = sum(daily, 'manual');
+        const whatsapp = sum(daily, 'whatsapp');
+        const other = sum(daily, 'other');
+        const prevTotals = { total: 0, manual: 0, whatsapp: 0, other: 0 };
+        for (const r of prevRows || []) {
+            const c = Number(r.count) || 0;
+            const bucket = (r.method === 'manual' || r.method === 'whatsapp') ? r.method : 'other';
+            prevTotals[bucket] += c;
+            prevTotals.total += c;
+        }
+        const pct = (cur, prev) => prev > 0 ? Math.round(((cur - prev) / prev) * 100) : null;
+        const activeDays = daily.length || 1;
+        const peak = daily.reduce((best, d) => (!best || d.total > best.total ? d : best), null);
+        const pctOf = (n) => total > 0 ? Math.round((n / total) * 1000) / 10 : 0;
+
+        // Operator ranking. avg_per_day divides by the days that person actually
+        // worked rather than the whole window, so someone who joined last week is
+        // not reported as slow. automated/unrecorded stay in the list — hiding them
+        // would make the named rows look like they sum to everything.
+        const AUTOMATED = 'automated';
+        const UNRECORDED = 'unrecorded';
+        const operatorList = Array.from(actorRollup.entries()).map(([actor, a]) => {
+            const dates = Object.keys(a.byDay).sort();
+            let peakDay = null;
+            for (const d of dates) {
+                if (!peakDay || a.byDay[d] > peakDay.count) peakDay = { date: d, count: a.byDay[d] };
+            }
+            return {
+                actor,
+                count: a.count,
+                pct: pctOf(a.count),
+                share_pct: null,
+                days_active: dates.length,
+                avg_per_day: Math.round((a.count / (dates.length || 1)) * 10) / 10,
+                peak_day: peakDay,
+                last_date: dates.length ? dates[dates.length - 1] : null,
+                change_pct: pct(a.count, prevActorTotals[actor] || 0)
+            };
+        }).sort((x, y) => y.count - x.count);
+
+        const automatedCount = (actorRollup.get(AUTOMATED) || {}).count || 0;
+        const unrecordedCount = (actorRollup.get(UNRECORDED) || {}).count || 0;
+        const humanTotal = total - automatedCount;
+        const attributed = operatorList
+            .filter(o => o.actor !== AUTOMATED && o.actor !== UNRECORDED)
+            .reduce((acc, o) => acc + o.count, 0);
+        // share_pct is against human confirms only: "Pooja did 46% of the manual
+        // work" rather than 46% of everything including the bot.
+        for (const o of operatorList) {
+            o.share_pct = o.actor === AUTOMATED ? null
+                : (humanTotal > 0 ? Math.round((o.count / humanTotal) * 1000) / 10 : 0);
+        }
+
+        const response = {
+            success: true,
+            range: { startDate: startStr.slice(0, 10), endDate: endStr.slice(0, 10), dateField: safeDateField, spanDays, clamped: requestedDays > spanDays, operator: operatorFilter || null },
+            summary: {
+                total,
+                manual, whatsapp, other,
+                manual_pct: pctOf(manual), whatsapp_pct: pctOf(whatsapp), other_pct: pctOf(other),
+                avg_per_day: Math.round((total / activeDays) * 10) / 10,
+                peak_day: peak ? { date: peak.date, total: peak.total } : null,
+                change_pct: {
+                    total: pct(total, prevTotals.total),
+                    manual: pct(manual, prevTotals.manual),
+                    whatsapp: pct(whatsapp, prevTotals.whatsapp)
+                }
+            },
+            methods: Object.entries(methodTotals)
+                .map(([method, count]) => ({ method, count, pct: pctOf(count) }))
+                .sort((a, b) => b.count - a.count),
+            operators: canSeeOperator ? operatorList : [],
+            attribution: canSeeOperator ? {
+                human_total: humanTotal,
+                attributed,
+                unrecorded: unrecordedCount,
+                automated: automatedCount,
+                coverage_pct: humanTotal > 0 ? Math.round((attributed / humanTotal) * 1000) / 10 : 0
+            } : null,
+            daily
+        };
+
+        if (useCache) setCache(cacheKey, response, 'stats', 60 * 1000);
+        res.json(response);
+    } catch (error) {
+        console.error('Inbox confirmation analytics error:', error);
+        res.status(500).json({ error: 'Failed to fetch confirmation analytics' });
+    }
+});
+
 // Get chat analytics (response rates, etc.)
 router.get('/chat/analytics/overview', verifyToken, async (req, res) => {
     try {
         const { startDate, endDate, noLimit } = req.query;
-        
-        // Check cache first (3 min TTL for analytics)
+
         const analyticsCacheKey = `analytics_overview:${startDate || 'all'}:${endDate || 'all'}:${noLimit || 'false'}`;
-        const cached = getCached(analyticsCacheKey);
-        if (cached) {
-            return res.json(cached);
-        }
-        
+
         // Build date filter - support custom date range or noLimit for all data
         let dateFilter = "";
         const dateParams = [];
-        
+
         if (startDate && endDate) {
             // Convert IST dates from frontend to UTC for database query
             const utcStartDate = fromISTtoUTC(startDate + ' 00:00:00') || (startDate + ' 00:00:00');
@@ -4022,57 +4729,71 @@ router.get('/chat/analytics/overview', verifyToken, async (req, res) => {
             dateFilter = "WHERE s.created_at >= NOW() - INTERVAL '30 days'";
         }
         // If noLimit=true and no dates, dateFilter stays empty (ALL historical data)
-        
+
         // Same derived 'shipped' semantics as the /shoppers list endpoint:
         // a confirmed shopper whose orders row carries an AWB / shipped status.
         // 'confirmed' therefore only counts confirmed-but-not-yet-shipped shoppers.
         const shippedExpr = `(o.awb IS NOT NULL OR o.status = 'shipped')`;
-        
-        // Get overall stats - lightweight aggregation
-        const stats = await dbAdapter.query(`
-            SELECT 
-                COUNT(*) as total_orders,
-                COUNT(DISTINCT s.phone) as total_shoppers,
-                SUM(CASE WHEN s.status = 'confirmed' AND NOT COALESCE(${shippedExpr}, false) THEN 1 ELSE 0 END) as confirmed_count,
-                SUM(CASE WHEN s.status = 'confirmed' AND ${shippedExpr} THEN 1 ELSE 0 END) as shipped_count,
-                SUM(CASE WHEN s.status = 'cancelled' THEN 1 ELSE 0 END) as cancelled_count,
-                SUM(CASE WHEN s.status = 'edit_details' THEN 1 ELSE 0 END) as edit_requests_count,
-                SUM(CASE WHEN s.status = 'pending' THEN 1 ELSE 0 END) as pending_count,
-                SUM(CASE WHEN s.customer_message IS NOT NULL THEN 1 ELSE 0 END) as responded_count,
-                AVG(CASE WHEN s.response_count > 0 THEN s.response_count END) as avg_response_count
-            FROM store_shoppers s
-            LEFT JOIN orders o ON o.order_id = s.order_id
-            ${dateFilter}
-        `, dateParams);
-        
-        // Get daily stats with per-status breakdown (IST timezone)
-        // created_at is TIMESTAMP (no tz) storing UTC — convert UTC→IST correctly
-        const dailyStats = await dbAdapter.query(`
-            SELECT 
-                TO_CHAR(DATE(s.created_at AT TIME ZONE 'UTC' AT TIME ZONE 'Asia/Kolkata'), 'YYYY-MM-DD') as date,
-                COUNT(*) as total,
-                SUM(CASE WHEN s.status = 'confirmed' AND NOT COALESCE(${shippedExpr}, false) THEN 1 ELSE 0 END) as confirmed,
-                SUM(CASE WHEN s.status = 'confirmed' AND ${shippedExpr} THEN 1 ELSE 0 END) as shipped,
-                SUM(CASE WHEN s.status = 'pending' THEN 1 ELSE 0 END) as pending,
-                SUM(CASE WHEN s.status = 'cancelled' THEN 1 ELSE 0 END) as cancelled,
-                SUM(CASE WHEN s.status = 'edit_details' THEN 1 ELSE 0 END) as edit_details,
-                SUM(CASE WHEN s.status != 'pending' THEN 1 ELSE 0 END) as responded
-            FROM store_shoppers s
-            LEFT JOIN orders o ON o.order_id = s.order_id
-            ${dateFilter}
-            GROUP BY DATE(s.created_at AT TIME ZONE 'UTC' AT TIME ZONE 'Asia/Kolkata')
-            ORDER BY date DESC
-        `, dateParams);
-        
-        const response = {
-            success: true,
-            overview: stats[0] || {},
-            daily: dailyStats
-        };
-        
-        // Cache for 15 minutes — analytics queries are expensive
-        setCache(analyticsCacheKey, response, 'stats', 15 * 60 * 1000);
-        
+
+        // Overall stats plus the daily per-status breakdown, run concurrently
+        // inside a single-flight loader.
+        //
+        // Both used to be sequential awaits behind a bare getCached/setCache
+        // pair, so nothing stopped two dashboards opening at once from each
+        // running the full-history aggregation: the log shows the same
+        // "COUNT(*) as total_orders" statement twice 4s apart at 2418ms and
+        // 5897ms, holding two of ten pool slots and pushing 370-450ms of
+        // queueing onto every unrelated query in between. getOrLoad shares one
+        // in-flight promise per key, and Promise.all makes the pair cost the
+        // slower of the two instead of their sum.
+        //
+        // Cache for 15 minutes — analytics queries are expensive. Stays in the
+        // 'stats' namespace so admin actions that call invalidateCache('stats')
+        // keep refreshing it early.
+        const response = await caches.stats.getOrLoad(analyticsCacheKey, async () => {
+            const [stats, dailyStats] = await Promise.all([
+                dbAdapter.query(`
+                    SELECT
+                        COUNT(*) as total_orders,
+                        COUNT(DISTINCT s.phone) as total_shoppers,
+                        SUM(CASE WHEN s.status = 'confirmed' AND NOT COALESCE(${shippedExpr}, false) THEN 1 ELSE 0 END) as confirmed_count,
+                        SUM(CASE WHEN s.status = 'confirmed' AND ${shippedExpr} THEN 1 ELSE 0 END) as shipped_count,
+                        SUM(CASE WHEN s.status = 'cancelled' THEN 1 ELSE 0 END) as cancelled_count,
+                        SUM(CASE WHEN s.status = 'edit_details' THEN 1 ELSE 0 END) as edit_requests_count,
+                        SUM(CASE WHEN s.status = 'pending' THEN 1 ELSE 0 END) as pending_count,
+                        SUM(CASE WHEN s.customer_message IS NOT NULL THEN 1 ELSE 0 END) as responded_count,
+                        AVG(CASE WHEN s.response_count > 0 THEN s.response_count END) as avg_response_count
+                    FROM store_shoppers s
+                    LEFT JOIN orders o ON o.order_id = s.order_id
+                    ${dateFilter}
+                `, dateParams),
+
+                // created_at is TIMESTAMP (no tz) storing UTC — convert UTC→IST correctly
+                dbAdapter.query(`
+                    SELECT
+                        TO_CHAR(DATE(s.created_at AT TIME ZONE 'UTC' AT TIME ZONE 'Asia/Kolkata'), 'YYYY-MM-DD') as date,
+                        COUNT(*) as total,
+                        SUM(CASE WHEN s.status = 'confirmed' AND NOT COALESCE(${shippedExpr}, false) THEN 1 ELSE 0 END) as confirmed,
+                        SUM(CASE WHEN s.status = 'confirmed' AND ${shippedExpr} THEN 1 ELSE 0 END) as shipped,
+                        SUM(CASE WHEN s.status = 'pending' THEN 1 ELSE 0 END) as pending,
+                        SUM(CASE WHEN s.status = 'cancelled' THEN 1 ELSE 0 END) as cancelled,
+                        SUM(CASE WHEN s.status = 'edit_details' THEN 1 ELSE 0 END) as edit_details,
+                        SUM(CASE WHEN s.status != 'pending' THEN 1 ELSE 0 END) as responded
+                    FROM store_shoppers s
+                    LEFT JOIN orders o ON o.order_id = s.order_id
+                    ${dateFilter}
+                    GROUP BY DATE(s.created_at AT TIME ZONE 'UTC' AT TIME ZONE 'Asia/Kolkata')
+                    ORDER BY date DESC
+                `, dateParams)
+            ]);
+
+            return {
+                success: true,
+                overview: stats[0] || {},
+                daily: dailyStats
+            };
+        }, 15 * 60 * 1000);
+
         res.json(response);
     } catch (error) {
         console.error('Chat analytics error:', error);
@@ -4468,12 +5189,33 @@ router.get('/follow-up/campaigns/:id/export', verifyToken, async (req, res) => {
 // Support Portal Management Endpoints
 // ============================================
 
+// Support Desk agents (permission 'support_desk') may READ the portal engine
+// (the desk Settings tabs mirror this dashboard), but every mutation — and the
+// plain-password reveal — stays master-admin only. permissionGate has already
+// verified the JWT and set req.admin for every request under /api/admin.
+router.use('/support-portals', (req, res, next) => {
+    if (req.admin && req.admin.role === 'admin') return next();
+    const isPasswordRead = req.method === 'GET' && /\/\d+\/password(?:\?.*)?$/.test(req.originalUrl || req.url || '');
+    if (req.method === 'GET' && !isPasswordRead) return next();
+    return res.status(403).json({
+        success: false,
+        error: 'Portal and distribution changes are master-admin only. Desk agents have read-only access.'
+    });
+});
+
 // Helper to generate a random slug
 function generateSlug(name) {
     const base = name.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '');
     const suffix = Math.random().toString(36).substring(2, 8);
     return `${base}-${suffix}`;
 }
+
+// Bulk distribution tools (auto-distribute / rebalance / assign-unassigned) act
+// on accounts-section tickets only — the storefront Help & Tickets queue the
+// desk shows. Widget-bot tickets share channel='website' (they carry 'WDG-'
+// numbers and are portal-assigned at creation), and WhatsApp/Instagram rows are
+// already separated by channel, so both stay out of every bulk sweep.
+const ACCOUNTS_SCOPE_SQL = "channel = 'website' AND ticket_number NOT LIKE 'WDG-%'";
 
 // Helper to generate a random password
 function generatePassword(length = 10) {
@@ -5019,8 +5761,8 @@ router.post('/support-portals/auto-distribute', verifyToken, async (req, res) =>
             return res.status(400).json({ success: false, error: 'Count must be between 2 and 20' });
         }
 
-        // Build ticket query based on filters
-        let ticketQuery = "SELECT id, created_at, status FROM support_tickets WHERE status = 'open'";
+        // Build ticket query based on filters (accounts-section tickets only)
+        let ticketQuery = `SELECT id, created_at, status FROM support_tickets WHERE status = 'open' AND ${ACCOUNTS_SCOPE_SQL}`;
         const queryParams = [];
 
         // Apply date/time filters
@@ -5417,7 +6159,7 @@ router.post('/support-portals/rebalance', verifyToken, async (req, res) => {
         }
 
         const tickets = await dbAdapter.query(
-            `SELECT id FROM support_tickets WHERE ${whereClause} AND status = 'open' ORDER BY created_at ASC`
+            `SELECT id FROM support_tickets WHERE ${whereClause} AND status = 'open' AND ${ACCOUNTS_SCOPE_SQL} ORDER BY created_at ASC`
         );
 
         if (!tickets || tickets.length === 0) {
@@ -5591,7 +6333,7 @@ router.post('/support-portals/assign-unassigned', verifyToken, async (req, res) 
             return res.status(404).json({ success: false, error: 'Portal not found' });
         }
 
-        let sql = 'UPDATE support_tickets SET portal_id = ? WHERE portal_id IS NULL';
+        let sql = `UPDATE support_tickets SET portal_id = ? WHERE portal_id IS NULL AND ${ACCOUNTS_SCOPE_SQL}`;
         const params = [portalId];
 
         if (status) {
@@ -5600,7 +6342,7 @@ router.post('/support-portals/assign-unassigned', verifyToken, async (req, res) 
         }
 
         if (limit && Number.isFinite(limit)) {
-            sql = `UPDATE support_tickets SET portal_id = ? WHERE id IN (SELECT id FROM support_tickets WHERE portal_id IS NULL${status ? ' AND status = ?' : ''} ORDER BY created_at DESC LIMIT ?)`;
+            sql = `UPDATE support_tickets SET portal_id = ? WHERE id IN (SELECT id FROM support_tickets WHERE portal_id IS NULL AND ${ACCOUNTS_SCOPE_SQL}${status ? ' AND status = ?' : ''} ORDER BY created_at DESC LIMIT ?)`;
             params.length = 0;
             params.push(portalId);
             if (status) params.push(status);
@@ -5741,18 +6483,24 @@ router.get('/support-analytics/ai-overview', verifyToken, async (req, res) => {
         const cached = getCached(cacheKey);
         if (cached) return res.json(cached);
 
-        // Build reusable date filter
-        const dateClauses = [];
-        const dateParams = [];
-        if (date_from) {
-            dateClauses.push('created_at >= ?::date AT TIME ZONE \'Asia/Kolkata\'');
-            dateParams.push(date_from);
-        }
-        if (date_to) {
-            dateClauses.push('created_at < (?::date + INTERVAL \'1 day\') AT TIME ZONE \'Asia/Kolkata\'');
-            dateParams.push(date_to);
-        }
+        // Build reusable date filter — validated YYYY-MM-DD IST days with the
+        // offset applied to the parameters, so created_at stays index-friendly
+        // (the old `?::date AT TIME ZONE` form forced a timestamptz cast on the column)
+        const dateFilters = istRangeClauses('created_at', date_from, date_to);
+        const dateClauses = dateFilters.map(f => f.clause);
+        const dateParams = dateFilters.map(f => f.param);
         const dateWhere = dateClauses.length ? ` AND ${dateClauses.join(' AND ')}` : '';
+        // Portal perf JOIN needs the same bounds on t.created_at, parameterized
+        // (the previous version interpolated date_from as a literal and dropped date_to)
+        const tRange = istRangeClauses('t.created_at', date_from, date_to);
+        const portalJoinDateFilter = tRange.length ? ' AND ' + tRange.map(c => c.clause).join(' AND ') : '';
+        const portalJoinDateParams = tRange.map(c => c.param);
+        // Resolution trend follows the selected range (by updated_at), else last 7 days
+        const updRange = istRangeClauses('updated_at', date_from, date_to);
+        const trendWhere = updRange.length
+            ? ' AND ' + updRange.map(c => c.clause).join(' AND ')
+            : " AND updated_at >= NOW() - INTERVAL '7 days'";
+        const trendParams = updRange.map(c => c.param);
 
         const [
             totalStats,
@@ -5830,9 +6578,9 @@ router.get('/support-analytics/ai-overview', verifyToken, async (req, res) => {
                 COUNT(t.id) FILTER (WHERE t.status = 'open')::int AS open_count,
                 COUNT(t.id) FILTER (WHERE t.is_read = false)::int AS unread
             FROM support_portals p
-            LEFT JOIN support_tickets t ON t.portal_id = p.id${dateWhere ? ` AND t.created_at >= '${date_from || '1970-01-01'}'::date AT TIME ZONE 'Asia/Kolkata'` : ''}
+            LEFT JOIN support_tickets t ON t.portal_id = p.id${portalJoinDateFilter}
             GROUP BY p.id, p.name
-            ORDER BY assigned DESC`),
+            ORDER BY assigned DESC`, portalJoinDateParams),
 
             // AI confidence distribution
             dbAdapter.query(`SELECT
@@ -5847,15 +6595,15 @@ router.get('/support-analytics/ai-overview', verifyToken, async (req, res) => {
             GROUP BY tier
             ORDER BY tier ASC`, dateParams),
 
-            // Resolution trend (last 7 days)
+            // Resolution trend (in-range when a range is set, else last 7 days)
             dbAdapter.query(`SELECT
                 TO_CHAR(DATE(updated_at AT TIME ZONE 'UTC' AT TIME ZONE 'Asia/Kolkata'), 'YYYY-MM-DD') AS day,
                 COUNT(*) FILTER (WHERE status = 'resolved')::int AS resolved,
                 COUNT(*)::int AS total
             FROM support_tickets
-            WHERE updated_at >= NOW() - INTERVAL '7 days'
+            WHERE 1=1${trendWhere}
             GROUP BY DATE(updated_at AT TIME ZONE 'UTC' AT TIME ZONE 'Asia/Kolkata')
-            ORDER BY day ASC`),
+            ORDER BY day ASC`, trendParams),
 
             // Today's stats
             dbAdapter.query(`SELECT
@@ -5870,7 +6618,7 @@ router.get('/support-analytics/ai-overview', verifyToken, async (req, res) => {
             dbAdapter.query(`SELECT
                 ROUND(AVG(EXTRACT(EPOCH FROM (updated_at - created_at)))::numeric, 0)::int AS avg_seconds
             FROM support_tickets
-            WHERE status = 'resolved' AND updated_at > created_at${dateWhere.replace('created_at', 'created_at')}`, dateParams),
+            WHERE status = 'resolved' AND updated_at > created_at${dateWhere}`, dateParams),
 
             // Peak day
             dbAdapter.query(`SELECT
@@ -7161,14 +7909,70 @@ async function fetchReturnsServerPipeline(windowDays) {
     return require('../services/customerContextService').fetchReturnsServerPipeline(windowDays);
 }
 
+const inventoryInFlight = new Map();
+const INVENTORY_PEAK_DB_CLIENTS = 3;
+const INVENTORY_RESERVED_DB_SLOTS = 4;
+
+function inventoryHasHeadroom() {
+    const inUse = Math.max(0, (pool.totalCount || 0) - (pool.idleCount || 0));
+    const maxClients = pool.options.max || 10;
+    return (pool.waitingCount || 0) === 0
+        && inUse + INVENTORY_PEAK_DB_CLIENTS <= maxClients - INVENTORY_RESERVED_DB_SLOTS;
+}
+
+function sendInventoryOutcome(outcome, res, shared = false) {
+    const body = shared && outcome.status === 200 && outcome.body?.success && !outcome.body?.debug
+        ? { ...outcome.body, cached: true }
+        : outcome.body;
+    return res.status(outcome.status).json(body);
+}
+
 router.get('/inventory', verifyToken, async (req, res) => {
+    const windowDays = Math.max(0, Math.min(parseInt(req.query.window, 10) || 90, 730));
+    const force = req.query.refresh === '1' || req.query.refresh === 'true';
+    const cacheKey = `inventory_intel:${windowDays}`;
+    if (!force) {
+        const cached = getCached(cacheKey);
+        if (cached) return res.json({ ...cached, cached: true });
+    }
+
+    // A cold rebuild detoasts ~20MB of items_json. Share both the result and
+    // failures so waiters never launch duplicate scans after a cache miss.
+    const baseFlightKey = `${cacheKey}:${req.query.debug === '1' ? 'debug' : 'full'}`;
+    const flightKey = `${baseFlightKey}:${force ? 'forced' : 'normal'}`;
+    const reusableKey = force ? flightKey : `${baseFlightKey}:forced`;
+    const pending = inventoryInFlight.get(reusableKey)
+        || (!force ? inventoryInFlight.get(flightKey) : null);
+    if (pending) return sendInventoryOutcome(await pending, res, true);
+
+    // A forced refresh must not reuse stale catalog/bundle inputs from a normal
+    // build. Wait for that build to finish instead of running two heavy scans.
+    if (force) {
+        const normalPending = inventoryInFlight.get(`${baseFlightKey}:normal`);
+        if (normalPending) {
+            await normalPending;
+            const forcedPending = inventoryInFlight.get(flightKey);
+            if (forcedPending) return sendInventoryOutcome(await forcedPending, res, true);
+        }
+    }
+
+    const load = Promise.resolve().then(() => handleInventoryRequest(req));
+    inventoryInFlight.set(flightKey, load);
+    try {
+        return sendInventoryOutcome(await load, res);
+    } finally {
+        if (inventoryInFlight.get(flightKey) === load) inventoryInFlight.delete(flightKey);
+    }
+});
+
+async function handleInventoryRequest(req) {
     try {
         const windowDays = Math.max(0, Math.min(parseInt(req.query.window, 10) || 90, 730));
         const force = req.query.refresh === '1' || req.query.refresh === 'true';
         const cacheKey = `inventory_intel:${windowDays}`;
         if (!force) {
             const cached = getCached(cacheKey);
-            if (cached) return res.json({ ...cached, cached: true });
+            if (cached) return { status: 200, body: { ...cached, cached: true } };
         }
 
         const shopifyService = require('../services/shopifyService');
@@ -7188,11 +7992,14 @@ router.get('/inventory', verifyToken, async (req, res) => {
             }));
             const totalVariants = catalog.reduce((s, p) => s + (p.variants?.length || 0), 0);
             const variantsWithStock = catalog.reduce((s, p) => s + (p.variants || []).filter(v => v.inventory > 0).length, 0);
-            return res.json({
-                debug: true,
-                catalog_size: { products: catalog.length, variants: totalVariants, with_stock: variantsWithStock },
-                sample_products: sample
-            });
+            return {
+                status: 200,
+                body: {
+                    debug: true,
+                    catalog_size: { products: catalog.length, variants: totalVariants, with_stock: variantsWithStock },
+                    sample_products: sample
+                }
+            };
         }
 
         const windowSql = windowDays > 0 ? `AND created_at >= NOW() - INTERVAL '${windowDays} days'` : '';
@@ -7205,51 +8012,67 @@ router.get('/inventory', verifyToken, async (req, res) => {
             setCache(bundleCacheKey, bundleRows, 'stats', 3600000); // Cache for 1 hour
         }
 
-        // Two lightweight per-row scans — optimized for index usage.
-        // A) windowed history → delivered + RTO buckets (split into two queries to avoid OR)
-        // B) current in-circulation shipments (never window-trimmed)
-        const [historyDelivered, historyRto, circulationRows, returnRows, exchangeRows, rsPipeline, salesRows] = await Promise.all([
-            // History: delivered orders
+        // ONE forward-order scan replaces the four separate ones this route used
+        // to fire (delivered history, RTO history, circulation, 84-day sales).
+        // The WHERE clause is the exact union of rows those buckets consume, so
+        // pending/cancelled rows inside the date window never cross the wire.
+        const inWindowSql = windowDays > 0
+            ? `(s.created_at >= NOW() - INTERVAL '${windowDays} days')`
+            : 'TRUE';
+        const circulationSql = `(s.status = 'confirmed'
+            AND (o.awb IS NOT NULL OR o.status = 'shipped')
+            AND COALESCE(o.status, '') NOT IN ('delivered','rto','cancelled','failed'))`;
+        const forwardWhereSql = `((${inWindowSql})
+                AND (o.status = 'delivered' OR s.status = 'rto' OR o.status = 'rto'))
+            OR (s.created_at >= NOW() - INTERVAL '84 days'
+                AND o.status IN ('delivered','shipped'))
+            OR ${circulationSql}`;
+
+        // Recheck after the catalog/bundle work: the warm-up's earlier admission
+        // check cannot reserve slots while HTTP and Shopify calls are in flight.
+        if (req.admin?.username === 'cache-warm' && !inventoryHasHeadroom()) {
+            return { status: 503, body: { success: false, error: 'Inventory warm-up deferred under database load' } };
+        }
+
+        const [forwardRows, returnRows, exchangeRows, rsPipeline] = await Promise.all([
             dbAdapter.query(`
-                SELECT s.items_json, s.status AS shopper_status, o.status AS order_status
-                FROM store_shoppers s
-                INNER JOIN orders o ON o.order_id = s.order_id
-                WHERE s.items_json IS NOT NULL
-                  AND o.status = 'delivered'
-                  ${windowDays > 0 ? `AND s.created_at >= NOW() - INTERVAL '${windowDays} days'` : ''}
-            `),
-            // History: RTO orders (order status OR shopper status)
-            dbAdapter.query(`
-                SELECT s.items_json, s.status AS shopper_status, COALESCE(o.status, '') AS order_status
+                SELECT s.items_json, s.status AS shopper_status, s.created_at,
+                       COALESCE(o.status, '') AS order_status, o.awb,
+                       ${inWindowSql} AS in_window,
+                       (s.created_at >= NOW() - INTERVAL '84 days') AS in_sales
                 FROM store_shoppers s
                 LEFT JOIN orders o ON o.order_id = s.order_id
                 WHERE s.items_json IS NOT NULL
-                  AND (s.status = 'rto' OR o.status = 'rto')
-                  ${windowDays > 0 ? `AND s.created_at >= NOW() - INTERVAL '${windowDays} days'` : ''}
-            `),
-            dbAdapter.query(`
-                SELECT s.items_json, s.status AS shopper_status, o.status AS order_status, o.awb
-                FROM store_shoppers s
-                INNER JOIN orders o ON o.order_id = s.order_id
-                WHERE s.items_json IS NOT NULL
-                  AND s.status = 'confirmed'
-                  AND (o.awb IS NOT NULL OR o.status = 'shipped')
-                  AND COALESCE(o.status, '') NOT IN ('delivered','rto','cancelled','failed')
+                  AND (${forwardWhereSql})
             `),
             dbAdapter.query(`SELECT items FROM returns WHERE status IN ('pending_approval','initiated','approved','pickup_scheduled') ${windowSql}`),
-            dbAdapter.query(`SELECT old_items, new_items FROM exchanges WHERE status IN ('pending_approval','initiated','pickup_scheduled') ${windowSql}`),
-            fetchReturnsServerPipeline(windowDays),
-            // Trailing 84 days of shipped/delivered units for velocity & forecast
-            // series — always a fixed window, independent of the pipeline window.
-            dbAdapter.query(`
-                SELECT s.items_json, s.created_at
-                FROM store_shoppers s
-                INNER JOIN orders o ON o.order_id = s.order_id
-                WHERE s.items_json IS NOT NULL
-                  AND s.created_at >= NOW() - INTERVAL '84 days'
-                  AND o.status IN ('delivered','shipped')
-            `)
+            dbAdapter.query(`SELECT old_items, new_items FROM exchanges WHERE status IN ('pending_approval','initiated','approved','pickup_scheduled') ${windowSql}`),
+            fetchReturnsServerPipeline(windowDays)
         ]);
+
+        // Re-apply the legacy WHERE predicates to the scan rows so the
+        // aggregation below stays row-for-row identical. Verified against the
+        // live table for windows 30 / 90 / 730 / unbounded: identical per-bucket
+        // row multisets (md5 of items_json) in all four cases.
+        const historyDelivered = [];
+        const historyRto = [];
+        const circulationRows = [];
+        const salesRows = [];
+        const TERMINAL_ORDER_STATUS = new Set(['delivered', 'rto', 'cancelled', 'failed']);
+        for (const row of forwardRows) {
+            if (row.in_window) {
+                if (row.order_status === 'delivered') historyDelivered.push(row);
+                if (row.shopper_status === 'rto' || row.order_status === 'rto') historyRto.push(row);
+            }
+            if (row.shopper_status === 'confirmed'
+                && (row.awb || row.order_status === 'shipped')
+                && !TERMINAL_ORDER_STATUS.has(row.order_status)) {
+                circulationRows.push(row);
+            }
+            if (row.in_sales && (row.order_status === 'delivered' || row.order_status === 'shipped')) {
+                salesRows.push(row);
+            }
+        }
 
         // ---------- Bundle / combo expansion (Zoho configuration) ----------
         // Combos & bundles are NOT distinct products — zoho_bundle_map breaks
@@ -7365,6 +8188,9 @@ router.get('/inventory', verifyToken, async (req, res) => {
                 return Array.isArray(parsed) ? parsed : [];
             } catch (_) { return []; }
         };
+        // items_json is ~1.2KB of the row payload and a delivered row feeds both
+        // the delivered bucket and the velocity series — parse each row once.
+        const itemsOf = (row) => (row.__items || (row.__items = parseItems(row.items_json)));
 
         // Expand combo/bundle line items into their single-product components
         // per zoho_bundle_map; non-bundle items pass through untouched.
@@ -7430,14 +8256,14 @@ router.get('/inventory', verifyToken, async (req, res) => {
         };
         for (const row of circulationRows) {
             const bucket = classifyRow(row);
-            if (bucket) addItemUnits(parseItems(row.items_json), bucket);
+            if (bucket) addItemUnits(itemsOf(row), bucket);
         }
-        // Process split history queries (delivered + RTO)
+        // History buckets split out of the shared forward scan
         for (const row of historyDelivered) {
-            addItemUnits(parseItems(row.items_json), 'delivered');
+            addItemUnits(itemsOf(row), 'delivered');
         }
         for (const row of historyRto) {
-            addItemUnits(parseItems(row.items_json), 'rto_incoming');
+            addItemUnits(itemsOf(row), 'rto_incoming');
         }
 
         // 2) Open customer returns → stock coming back
@@ -7489,7 +8315,7 @@ router.get('/inventory', verifyToken, async (req, res) => {
             if (!ts || isNaN(ts)) continue;
             const ageDays = Math.floor((nowTs - ts) / 86400000);
             if (ageDays < 0 || ageDays >= VEL_DAYS) continue;
-            for (const item of expandBundleItems(parseItems(row.items_json))) {
+            for (const item of expandBundleItems(itemsOf(row))) {
                 const qty = Math.max(1, parseInt(item.quantity ?? item.qty, 10) || 1);
                 const resolved = resolveItem(item);
                 if (!resolved || !resolved.v) {
@@ -7767,12 +8593,12 @@ router.get('/inventory', verifyToken, async (req, res) => {
             }
         };
         setCache(cacheKey, response, 'stats', 60 * 60 * 1000); // 1 hour — inventory data changes slowly, cache aggressively
-        res.json(response);
+        return { status: 200, body: response };
     } catch (error) {
         console.error('Inventory intelligence error:', error);
-        res.status(500).json({ success: false, error: 'Failed to compute inventory intelligence' });
+        return { status: 500, body: { success: false, error: 'Failed to compute inventory intelligence' } };
     }
-});
+}
 
 // ── Inventory Name Aliases (admin) ──
 // Human-confirmed mappings between order-item names and the real Shopify
@@ -7996,12 +8822,15 @@ router.post('/inventory/bulk-in', verifyToken, async (req, res) => {
         const { invalidateCache } = require('../utils/cache');
         invalidateCache();
 
-        // Optional mirror to Shopify: queue a rate-limited delta push job (same
-        // pipeline the sync workbench uses). Non-blocking — the UI polls the job.
+        // Optional mirror to Shopify: queue a rate-limited push job (same
+        // pipeline the sync workbench uses). The Projected figure is the
+        // target — Shopify is set to quantity_after, not shifted by our delta.
+        // Non-blocking — the UI polls the job.
         let shopifySync = null;
         if (sync_shopify) {
             shopifySync = await queueBulkShopifyPush(results.map(r => ({
-                sku_key: r.sku_key, product_name: r.product_name, size: r.size, delta: r.quantity_added,
+                sku_key: r.sku_key, product_name: r.product_name, size: r.size,
+                delta: r.quantity_added, target: r.quantity_after,
             })), reference || 'bulk_in', performed_by || 'hub_operator');
         }
 
@@ -8081,7 +8910,8 @@ router.post('/inventory/bulk-out', verifyToken, async (req, res) => {
         let shopifySync = null;
         if (sync_shopify) {
             shopifySync = await queueBulkShopifyPush(results.map(r => ({
-                sku_key: r.sku_key, product_name: r.product_name, size: r.size, delta: -r.quantity_removed,
+                sku_key: r.sku_key, product_name: r.product_name, size: r.size,
+                delta: -r.quantity_removed, target: r.quantity_after,
             })), reference || 'bulk_out', performed_by || 'hub_operator');
         }
 
@@ -8204,8 +9034,9 @@ router.post('/inventory/sync-from-shopify', verifyToken, async (req, res) => {
 
 // ── SHOPIFY ⇄ STOCK ROOM two-way sync workbench ──
 // Pull: Shopify-side bulk edits land here (adds + quantity alignment) via
-// batched SQL. Push: hub quantities (or Bulk In/Out deltas) are written to
-// Shopify through a rate-limited background job the UI polls for progress.
+// batched SQL. Push: hub quantities (or Bulk In/Out projected targets) are
+// written to Shopify through a rate-limited background job the UI polls for
+// progress.
 
 // Shared by bulk-in/bulk-out when sync_shopify is requested. Never throws —
 // a Shopify mirror failure must not fail the local bulk operation.

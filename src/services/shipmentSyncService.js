@@ -393,6 +393,17 @@ async function applyTransitionSideEffects(shipment, newStatus, opts = {}) {
         console.log(`📦 Shipment #${shipment.id} (${shipment.order_id}, AWB ${shipment.awb}): ${shipment.status} → ${newStatus} [carrier: "${carrierStatusText}"]`);
     }
 
+    // A return is physically back only at rto_delivered. Restock the Stock Room
+    // here rather than in the Zoho hook so ZOHO_AUTO_SYNC=false cannot disable
+    // inventory updates, and so both cron and manual tracking refreshes share it.
+    if (newStatus === 'rto_delivered') {
+        try {
+            await require('./shoppersInventoryService').restockRTOOrder({ order_number: shipment.order_id });
+        } catch (hookErr) {
+            console.warn(`⚠️ Stock Room RTO restock failed for ${shipment.order_id}:`, hookErr.message);
+        }
+    }
+
     // Zoho middleware hook — auto COD reconciliation + RTO credit notes
     const isRtoVariantInner = (status) => status === 'rto' || (status && status.startsWith('rto_'));
     if (newStatus === 'delivered' || isRtoVariantInner(newStatus)) {

@@ -34,10 +34,11 @@
         page: 0,
         pageSize: 25,
         bulkItems: [],
+        bulkSearch: '',       // retained so a rebuild does not discard the operator's query
         bulkReference: '',
         bulkNotes: '',
         bulkOutMode: false,   // false = Bulk In (add), true = Bulk Out (subtract)
-        bulkPushShopify: localStorage.getItem('srBulkPushShopify') === '1', // mirror bulk deltas to Shopify
+        bulkPushShopify: localStorage.getItem('srBulkPushShopify') === '1', // mirror bulk moves to Shopify (lands on Projected)
     };
 
     /* ── API ── */
@@ -133,7 +134,8 @@
        SHOPIFY SYNC WORKBENCH — two-way bulk sync
        Pull  : Shopify → Stock Room (compare, select, batched apply)
        Push  : Stock Room → Shopify (rate-limited background job + polling)
-       Bulk In/Out can mirror their deltas to Shopify directly (toggle).
+       Bulk In/Out can mirror to Shopify directly (toggle): Shopify is set to
+       the Projected figures, not shifted by our local delta.
        ════════════════════════════════════════════════════════════════════ */
     const SW = {
         built: false,
@@ -705,10 +707,6 @@
             return;
         }
         if (e.target.id === 'swMode') { SW.pull.mode = e.target.value; SW.pull.plan = null; swFetchPlan('pull', SW.pull.force); }
-        if (e.target.id === 'swBulkShopify') {
-            SR.bulkPushShopify = !!e.target.checked;
-            localStorage.setItem('srBulkPushShopify', SR.bulkPushShopify ? '1' : '0');
-        }
     });
 
     document.addEventListener('input', (e) => {
@@ -754,32 +752,117 @@
 
     /* ── bulk inventory-in ── */
     function addToBulk(skuKey) {
-        const item = SR.inventory.find(i => i.sku_key === skuKey);
+        const item = stockRow(skuKey);
         if (!item) return;
         const existing = SR.bulkItems.find(b => b.sku_key === skuKey);
         if (existing) { existing.qty += 1; }
         else { SR.bulkItems.push({ sku_key: item.sku_key, product_name: item.product_name, size: item.size, category: item.category, qty: 1 }); }
-        renderBulkModal();
+        renderBulkModal(true);
     }
 
-    function removeFromBulk(skuKey) { SR.bulkItems = SR.bulkItems.filter(b => b.sku_key !== skuKey); renderBulkModal(); }
+    function removeFromBulk(skuKey) { SR.bulkItems = SR.bulkItems.filter(b => b.sku_key !== skuKey); renderBulkModal(false); }
 
-    function updateBulkQty(skuKey, qty) {
+    // sku_key can carry spaces and brackets, so match on the dataset rather than building a selector
+    function bulkCell(attr, dataKey, skuKey) {
+        return [...document.querySelectorAll(attr)].find(el => el.dataset[dataKey] === skuKey) || null;
+    }
+
+    function bulkQtyInput(skuKey) { return bulkCell('[data-sr-bulk-qty]', 'srBulkQty', skuKey); }
+
+    function bulkProjInput(skuKey) { return bulkCell('[data-sr-bulk-proj]', 'srBulkProj', skuKey); }
+
+    // The explanation under a Projected field is owned solely by the entry path, so a background
+    // repaint can never erase a message the operator still needs to read.
+    function setProjHint(skuKey, text) {
+        const hint = bulkCell('[data-sr-bulk-projh]', 'srBulkProjh', skuKey);
+        if (hint) hint.textContent = text;
+    }
+
+    // The valid Projected window for a row. Bulk Out against zero stock has no reachable target, so
+    // both bounds come back null rather than an impossible min > max pair.
+    function projBounds(curQty, isOut) {
+        if (!isOut) return { min: curQty + 1, max: null };
+        return curQty >= 1 ? { min: 0, max: curQty - 1 } : { min: null, max: null };
+    }
+
+    // CURRENT must come from the full snapshot, never SR.inventory — that is the toolbar-filtered
+    // subset, so any SKU the operator had filtered out would read back as 0 in stock.
+    function stockRow(skuKey) {
+        return (SR.allInventory || []).find(i => i.sku_key === skuKey) || null;
+    }
+
+    function updateBulkQty(skuKey, qty, commit = true) {
         const item = SR.bulkItems.find(b => b.sku_key === skuKey);
-        if (item) {
-            let q = Math.max(0, parseInt(qty) || 0);
+        if (!item) return;
+        const n = parseInt(String(qty).trim(), 10);
+        if (Number.isNaN(n)) {
+            // "", "-" or "e" mid-typing — hold position until the field commits
+            if (!commit) return;
+            item.qty = 1;
+        } else {
+            let q = Math.max(0, n);
             // In Bulk Out mode, cap at current stock
             if (SR.bulkOutMode) {
-                const current = SR.inventory.find(i => i.sku_key === skuKey);
-                const maxQty = current ? current.quantity : 0;
-                q = Math.min(q, maxQty);
+                const current = stockRow(skuKey);
+                q = Math.min(q, current ? current.quantity : 0);
             }
             item.qty = q;
-            if (item.qty === 0) removeFromBulk(skuKey); else renderBulkModal();
         }
+        // Committing never drops the row — 0 or a cleared field snaps back to 1, removal is the × button's job
+        if (commit && item.qty < 1) item.qty = 1;
+        refreshBulkDerived();
+        if (commit) { const input = bulkQtyInput(skuKey); if (input) input.value = item.qty; }
     }
 
-    function openBulkModal(outMode = false) { SR.bulkItems = []; SR.bulkReference = ''; SR.bulkNotes = ''; SR.bulkOutMode = !!outMode; renderBulkModal(); updateBulkModalChrome(); const m = document.getElementById('srBulkModal'); if (m) m.style.display = 'flex'; }
+    // An impossible target leaves qty exactly as it was, puts the last valid Projected back into the
+    // field and says why. bulkItems[].qty stays the only stored number either way.
+    function revertProjected(skuKey, item, curQty, message) {
+        refreshBulkDerived();
+        const el = bulkProjInput(skuKey);
+        if (el) el.value = SR.bulkOutMode ? curQty - item.qty : curQty + item.qty;
+        setProjHint(skuKey, message);
+    }
+
+    // Projected is the second entry surface: typing the stock level you want to land on derives the
+    // delta. Both endpoints reject quantity <= 0 for the whole batch, so a target that would derive
+    // a zero or negative delta is never committed.
+    function updateBulkProjected(skuKey, value, commit = true) {
+        const item = SR.bulkItems.find(b => b.sku_key === skuKey);
+        if (!item) return;
+        const current = stockRow(skuKey);
+        const curQty = current ? current.quantity : 0;
+        const isOut = SR.bulkOutMode;
+        const n = parseInt(String(value).trim(), 10);
+        if (Number.isNaN(n)) {
+            if (!commit) return;                     // cleared or a lone '-', hold position
+            revertProjected(skuKey, item, curQty, 'Projected must be a number');
+            return;
+        }
+        const derived = isOut ? curQty - n : n - curQty;
+        // Hold while typing: current 78 -> 1200 passes through 1, 12 and 120, all momentarily
+        // invalid. Reverting on a keystroke would make the field impossible to use.
+        if (derived < 1 || (isOut && n < 0)) {
+            if (!commit) return;
+            revertProjected(skuKey, item, curQty, isOut
+                ? `Projected must be between 0 and ${Math.max(0, curQty - 1)}`
+                : `Projected must be at least ${curQty + 1}`);
+            return;
+        }
+        item.qty = derived;
+        setProjHint(skuKey, '');
+        refreshBulkDerived();
+        if (commit) { const el = bulkProjInput(skuKey); if (el) el.value = isOut ? curQty - item.qty : curQty + item.qty; }
+    }
+
+    function openBulkModal(outMode = false) { SR.bulkItems = []; SR.bulkSearch = ''; SR.bulkReference = ''; SR.bulkNotes = ''; SR.bulkOutMode = !!outMode; renderBulkModal(true); updateBulkModalChrome(); const m = document.getElementById('srBulkModal'); if (m) m.style.display = 'flex'; refreshBulkSnapshot(); }
+
+    // Stock Room caches its snapshot across tab switches (memory smart), so CURRENT would otherwise
+    // show whatever the DB said when the tab first opened. Re-fetch and repaint the cells in place.
+    function refreshBulkSnapshot() {
+        // Derived cells only — repainting the results panel here would make it reappear over the
+        // table on its own. It is recomputed from the fresh snapshot whenever it is reopened.
+        return loadInventory(true).then(refreshBulkDerived);
+    }
     function closeBulkModal() { const m = document.getElementById('srBulkModal'); if (m) m.style.display = 'none'; }
 
     function updateBulkModalChrome() {
@@ -798,7 +881,7 @@
         }
     }
 
-    function renderBulkModal() {
+    function renderBulkModal(focusSearch) {
         const modal = document.getElementById('srBulkModal');
         if (!modal) return;
         const totalItems = SR.bulkItems.length;
@@ -809,13 +892,13 @@
 
         modal.querySelector('.sr-bulk-body').innerHTML = `
             <div class="sr-bulk-search">
-                <input type="text" id="srBulkSearch" placeholder="Search SKU or product name..." class="sr-bulk-search-input" autocomplete="off">
+                <input type="text" id="srBulkSearch" placeholder="Search SKU or product name..." class="sr-bulk-search-input" autocomplete="off" value="${esc(SR.bulkSearch)}">
                 <div id="srBulkSearchResults" class="sr-bulk-search-results"></div>
             </div>
             <div class="sr-bulk-selected">
                 <div class="sr-bulk-selected-header">
                     <h4>Selected SKUs (${totalItems})</h4>
-                    <span class="sr-bulk-total-qty">Total units: ${num(totalQty)}</span>
+                    <span class="sr-bulk-total-qty" id="srBulkTotalQty">Total units: ${num(totalQty)}</span>
                 </div>
                 ${totalItems === 0 ? `
                     <div class="sr-bulk-empty">
@@ -829,17 +912,18 @@
                         <thead><tr><th>Product</th><th>Size</th><th>Current</th><th>${qtyLabel}</th><th>Projected</th><th></th></tr></thead>
                         <tbody>
                             ${SR.bulkItems.map(b => {
-                                const current = SR.inventory.find(i => i.sku_key === b.sku_key);
+                                const current = stockRow(b.sku_key);
                                 const curQty = current ? current.quantity : 0;
                                 const proj = isOut ? curQty - b.qty : curQty + b.qty;
-                                const projClass = proj <= 0 ? 'sr-bulk-projected sr-zero' : proj <= (current?.reorder_level || 0) ? 'sr-bulk-projected sr-reorder' : '';
-                                const maxHint = isOut ? `<span class="sr-bulk-max" title="Max: ${curQty}">max ${curQty}</span>` : '';
+                                const projClass = proj <= 0 ? ' sr-zero' : proj <= (current?.reorder_level || 0) ? ' sr-reorder' : '';
+                                const bounds = projBounds(curQty, isOut);
+                                const maxHint = isOut ? `<span class="sr-bulk-max" data-sr-bulk-maxh="${esc(b.sku_key)}" title="Max: ${curQty}">max ${curQty}</span>` : '';
                                 return `<tr>
                                     <td class="sr-bulk-product">${esc(b.product_name)}</td>
                                     <td class="sr-bulk-size">${esc(b.size)}</td>
-                                    <td class="sr-bulk-current">${num(curQty)}</td>
+                                    <td class="sr-bulk-current" data-sr-bulk-cur="${esc(b.sku_key)}">${num(curQty)}</td>
                                     <td><input type="number" min="1" ${isOut ? `max="${curQty}"` : ''} value="${b.qty}" class="sr-bulk-qty-input" data-sr-bulk-qty="${esc(b.sku_key)}">${maxHint}</td>
-                                    <td class="${projClass}">${num(proj)}</td>
+                                    <td class="sr-bulk-proj-cell"><input type="number"${bounds.min === null ? '' : ` min="${bounds.min}"`}${bounds.max === null ? '' : ` max="${bounds.max}"`} value="${proj}" class="sr-bulk-projected-input${projClass}" data-sr-bulk-proj="${esc(b.sku_key)}"><span class="sr-bulk-proj-hint" data-sr-bulk-projh="${esc(b.sku_key)}"></span></td>
                                     <td><button class="sr-bulk-remove" data-sr="bulk-remove" data-sku="${esc(b.sku_key)}" title="Remove">&times;</button></td>
                                 </tr>`;
                             }).join('')}
@@ -858,12 +942,58 @@
                 </div>
                 <label class="sr-bulk-shopify-toggle">
                     <input type="checkbox" id="srBulkShopify" ${SR.bulkPushShopify ? 'checked' : ''}>
-                    Also apply the same ${isOut ? 'reductions' : 'additions'} to Shopify stock
+                    Also set Shopify stock to these Projected figures
                 </label>
             </div>`;
 
         const searchInput = modal.querySelector('#srBulkSearch');
-        if (searchInput) { searchInput.addEventListener('input', (e) => handleBulkSearch(e.target.value)); searchInput.focus(); }
+        if (searchInput) {
+            searchInput.addEventListener('input', (e) => { SR.bulkSearch = e.target.value; handleBulkSearch(e.target.value); });
+            // The results panel floats over the Selected SKUs table, so a rebuild leaves it closed.
+            // Bound to click rather than focus so the programmatic focus() below does not reopen it.
+            searchInput.addEventListener('click', () => handleBulkSearch(SR.bulkSearch));
+            searchInput.addEventListener('keydown', (e) => {
+                if (e.key === 'Escape') { handleBulkSearch(''); searchInput.blur(); }
+            });
+            if (focusSearch) searchInput.focus();
+        }
+    }
+
+    // Patch only the derived cells in place. A full renderBulkModal() per keystroke rebuilds
+    // the table, destroys the focused input and pulls focus back into the search box.
+    function refreshBulkDerived() {
+        const modal = document.getElementById('srBulkModal');
+        if (!modal) return;
+        const isOut = SR.bulkOutMode;
+        const totalEl = modal.querySelector('#srBulkTotalQty');
+        if (totalEl) totalEl.textContent = `Total units: ${num(SR.bulkItems.reduce((s, b) => s + b.qty, 0))}`;
+        modal.querySelectorAll('[data-sr-bulk-proj]').forEach(projInput => {
+            const skuKey = projInput.dataset.srBulkProj;
+            const bulk = SR.bulkItems.find(b => b.sku_key === skuKey);
+            if (!bulk) return;
+            const current = stockRow(skuKey);
+            const curQty = current ? current.quantity : 0;
+            const curCell = bulkCell('[data-sr-bulk-cur]', 'srBulkCur', skuKey);
+            if (curCell) curCell.textContent = num(curQty);
+            if (isOut) {
+                const hint = bulkCell('[data-sr-bulk-maxh]', 'srBulkMaxh', skuKey);
+                if (hint) { hint.title = `Max: ${curQty}`; hint.textContent = `max ${curQty}`; }
+                const input = bulkQtyInput(skuKey);
+                if (input) input.setAttribute('max', curQty);
+            }
+            const proj = isOut ? curQty - bulk.qty : curQty + bulk.qty;
+            projInput.className = 'sr-bulk-projected-input' + (proj <= 0 ? ' sr-zero' : proj <= (current?.reorder_level || 0) ? ' sr-reorder' : '');
+            // The bounds follow the live CURRENT, so a background stock change keeps the window honest
+            const bounds = projBounds(curQty, isOut);
+            if (bounds.min === null) projInput.removeAttribute('min'); else projInput.setAttribute('min', bounds.min);
+            if (bounds.max === null) projInput.removeAttribute('max'); else projInput.setAttribute('max', bounds.max);
+            // Never write into the field the operator is typing in — that is how a caret gets lost.
+            // The two entry surfaces are symmetric: typing Qty refreshes Projected, typing Projected
+            // refreshes Qty, and a background repaint touches neither while it holds focus.
+            if (projInput !== document.activeElement) projInput.value = proj;
+            const qtyInput = bulkQtyInput(skuKey);
+            if (qtyInput && qtyInput !== document.activeElement) qtyInput.value = bulk.qty;
+        });
     }
 
     function handleBulkSearch(query) {
@@ -871,7 +1001,7 @@
         if (!container) return;
         if (!query || query.length < 2) { container.innerHTML = ''; return; }
         const q = query.toLowerCase();
-        const matches = SR.inventory.filter(i =>
+        const matches = (SR.allInventory || []).filter(i =>
             !SR.bulkItems.find(b => b.sku_key === i.sku_key) &&
             (i.product_name.toLowerCase().includes(q) || i.sku_key.toLowerCase().includes(q) || i.size.toLowerCase().includes(q))
         ).slice(0, 15);
@@ -892,7 +1022,7 @@
         const endpoint = isOut ? '/api/admin/inventory/bulk-out' : '/api/admin/inventory/bulk-in';
         const label = isOut ? 'Bulk Inventory-Out' : 'Bulk Inventory-In';
 
-        if (!window.confirm(`Confirm ${label}\n\n${SR.bulkItems.length} SKU(s) · ${totalQty} total units\nReference: ${SR.bulkReference || 'None'}${SR.bulkPushShopify ? '\n\n＋ Same deltas will be pushed to Shopify.' : ''}`)) return;
+        if (!window.confirm(`Confirm ${label}\n\n${SR.bulkItems.length} SKU(s) · ${totalQty} total units\nReference: ${SR.bulkReference || 'None'}${SR.bulkPushShopify ? '\n\n＋ Shopify stock will be set to the Projected figures.' : ''}`)) return;
         try {
             const result = await apiFetch(endpoint, {
                 method: 'POST',
@@ -1016,8 +1146,8 @@
 
         const sevenDaysAgo = Date.now() - 7 * 86400000;
         const recentAdj = SR.adjustments.filter(a => new Date(a.created_at).getTime() > sevenDaysAgo);
-        const recentIn = recentAdj.filter(a => a.adjustment_type === 'stock_in' || a.adjustment_type === 'bulk_in').reduce((s, a) => s + Math.abs(a.quantity_change), 0);
-        const recentOut = recentAdj.filter(a => a.adjustment_type === 'stock_out' || a.adjustment_type === 'bulk_out').reduce((s, a) => s + Math.abs(a.quantity_change), 0);
+        const recentIn = recentAdj.filter(a => a.adjustment_type === 'stock_in' || a.adjustment_type === 'bulk_in' || ['sale_restock', 'rto_restock', 'return_restock', 'exchange_restock'].includes(a.adjustment_type)).reduce((s, a) => s + Math.abs(a.quantity_change), 0);
+        const recentOut = recentAdj.filter(a => a.adjustment_type === 'stock_out' || a.adjustment_type === 'bulk_out' || ['sale', 'exchange_sale'].includes(a.adjustment_type)).reduce((s, a) => s + Math.abs(a.quantity_change), 0);
 
         // Update page header
         const headerP = main.querySelector('.ict-page-head p');
@@ -1092,7 +1222,7 @@
                         <td class="ict-mono ict-muted"><code>${esc(a.sku_key)}</code></td>
                         <td>${esc(a.product_name)}</td>
                         <td class="ict-muted">${esc(a.size)}</td>
-                        <td>${pill(a.adjustment_type === 'stock_in' || a.adjustment_type === 'bulk_in' ? 'healthy' : a.adjustment_type === 'stock_out' || a.adjustment_type === 'bulk_out' ? 'critical' : 'info', a.adjustment_type.replace('_', ' '))}</td>
+                        <td>${pill(a.adjustment_type === 'stock_in' || a.adjustment_type === 'bulk_in' || ['sale_restock', 'rto_restock', 'return_restock', 'exchange_restock'].includes(a.adjustment_type) ? 'healthy' : a.adjustment_type === 'stock_out' || a.adjustment_type === 'bulk_out' || ['sale', 'exchange_sale'].includes(a.adjustment_type) ? 'critical' : 'info', a.adjustment_type.replace('_', ' '))}</td>
                         <td class="ict-num ${a.quantity_change >= 0 ? 'ict-healthy-text' : 'ict-critical-text'}" style="font-weight:600">${a.quantity_change >= 0 ? '+' : ''}${num(a.quantity_change)}</td>
                         <td class="ict-num ict-muted">${num(a.quantity_before)}</td>
                         <td class="ict-num ict-strong">${num(a.quantity_after)}</td>
@@ -1121,8 +1251,8 @@
 
         const sevenDaysAgo = Date.now() - 7 * 86400000;
         const recentAdj = SR.adjustments.filter(a => new Date(a.created_at).getTime() > sevenDaysAgo);
-        const recentIn = recentAdj.filter(a => a.adjustment_type === 'stock_in' || a.adjustment_type === 'bulk_in').reduce((s, a) => s + Math.abs(a.quantity_change), 0);
-        const recentOut = recentAdj.filter(a => a.adjustment_type === 'stock_out' || a.adjustment_type === 'bulk_out').reduce((s, a) => s + Math.abs(a.quantity_change), 0);
+        const recentIn = recentAdj.filter(a => a.adjustment_type === 'stock_in' || a.adjustment_type === 'bulk_in' || ['sale_restock', 'rto_restock', 'return_restock', 'exchange_restock'].includes(a.adjustment_type)).reduce((s, a) => s + Math.abs(a.quantity_change), 0);
+        const recentOut = recentAdj.filter(a => a.adjustment_type === 'stock_out' || a.adjustment_type === 'bulk_out' || ['sale', 'exchange_sale'].includes(a.adjustment_type)).reduce((s, a) => s + Math.abs(a.quantity_change), 0);
 
         main.innerHTML = `
             <div class="sr-container">
@@ -1247,23 +1377,66 @@
         const view = document.getElementById('inventoryView');
         if (!view || view.style.display === 'none') return;
 
-        // Bulk qty input
+        // Bulk projected input — typing derives the delta and patches cells in place; the hint goes
+        // away the moment the operator starts correcting, and an invalid target only reverts on commit
+        const projInput = e.target.closest('[data-sr-bulk-proj]');
+        if (projInput) {
+            const sku = projInput.dataset.srBulkProj;
+            if (sku) { setProjHint(sku, ''); updateBulkProjected(sku, projInput.value, false); }
+            return;
+        }
+
+        // Bulk qty input — typing only patches the derived cells, never re-renders (that steals focus)
         const qtyInput = e.target.closest('[data-sr-bulk-qty]');
         if (qtyInput) {
             const sku = qtyInput.dataset.srBulkQty;
-            if (sku) updateBulkQty(sku, qtyInput.value);
+            if (sku) updateBulkQty(sku, qtyInput.value, false);
+            return;
         }
+
+        // Sync the meta fields as they are typed so a row add/remove re-render can't wipe them
+        if (e.target.id === 'srBulkRef') { SR.bulkReference = e.target.value; }
+        else if (e.target.id === 'srBulkNotes') { SR.bulkNotes = e.target.value; }
     });
 
     document.addEventListener('change', (e) => {
         const view = document.getElementById('inventoryView');
         if (!view || view.style.display === 'none') return;
 
+        // Bulk projected commit (blur or spinner) — derive the delta, or revert an impossible target
+        const projInput = e.target.closest('[data-sr-bulk-proj]');
+        if (projInput) {
+            const sku = projInput.dataset.srBulkProj;
+            if (sku) updateBulkProjected(sku, projInput.value, true);
+            return;
+        }
+
+        // Bulk qty commit (blur or spinner) — clamp and write the normalised number back into the field
+        const qtyInput = e.target.closest('[data-sr-bulk-qty]');
+        if (qtyInput) {
+            const sku = qtyInput.dataset.srBulkQty;
+            if (sku) updateBulkQty(sku, qtyInput.value, true);
+            return;
+        }
+
         const id = e.target.id;
         if (id === 'srCategoryFilter') { SR.categoryFilter = e.target.value; applyFiltersAndRender(); }
         else if (id === 'srStatusFilter') { SR.statusFilter = e.target.value; applyFiltersAndRender(); }
-        else if (id === 'srBulkRef') { SR.bulkReference = e.target.value; }
-        else if (id === 'srBulkNotes') { SR.bulkNotes = e.target.value; }
+        else if (id === 'srBulkShopify') { SR.bulkPushShopify = e.target.checked; localStorage.setItem('srBulkPushShopify', SR.bulkPushShopify ? '1' : '0'); }
+    });
+
+    // The results panel floats over the Selected SKUs table, so it must go away when the operator
+    // interacts with anything outside the search box. mousedown on a result is inside the box, so
+    // it is not cleared before the click that selects it lands.
+    document.addEventListener('mousedown', (e) => {
+        const view = document.getElementById('inventoryView');
+        if (!view || view.style.display === 'none') return;
+        const modal = document.getElementById('srBulkModal');
+        if (!modal || modal.style.display === 'none') return;
+        if (!e.target.closest) return;
+        if (e.target.closest('.sr-bulk-search')) return;
+        const container = document.getElementById('srBulkSearchResults');
+        if (container) container.innerHTML = '';
     });
 
     /* ── tab integration (memory smart) ── */
@@ -1293,6 +1466,7 @@
         addToBulk,
         removeFromBulk,
         updateBulkQty,
+        updateBulkProjected,
         openBulkModal,
         closeBulkModal,
         confirmBulkIn,

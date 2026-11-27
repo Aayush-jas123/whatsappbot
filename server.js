@@ -26,7 +26,7 @@ installConsoleShim(createAppLogger({ level: 'warn' }));
 const messageHandler = require('./src/handlers/messageHandler');
 const adminRoutes = require('./src/routes/adminRoutes');
 const followUpService = require('./src/services/followUpService');
-const { testConnection, initializeDatabase, dbAdapter } = require('./src/database/db');
+const { testConnection, initializeDatabase, dbAdapter, pool } = require('./src/database/db');
 const { startCacheStatsLogging, getCacheStats } = require('./src/utils/cache');
 const { createHealthRouter } = require('./src/routes/healthRoutes');
 
@@ -209,7 +209,9 @@ const deskCsp = helmet({
             'style-src': ["'self'", "'unsafe-inline'", 'https://fonts.googleapis.com'],
             'font-src': ["'self'", 'https://fonts.gstatic.com'],
             'img-src': ["'self'", 'data:', 'https:'],
-            'connect-src': ["'self'"],
+            // Support images upload straight from the browser to the
+            // dedicated Cloudinary account, so the desk needs to XHR it.
+            'connect-src': ["'self'", 'https://api.cloudinary.com'],
             'frame-ancestors': ["'none'"]
         }
     }
@@ -245,6 +247,23 @@ app.get(['/', '/admin'], (req, res) => {
 });
 
 // Serve support portal
+// CSP override so the portal can (a) upload support images directly from
+// the browser to the dedicated Cloudinary account and (b) render them from
+// res.cloudinary.com — neither host is in helmet's default 'self' policy.
+app.use('/portal/support', helmet({
+    contentSecurityPolicy: {
+        directives: {
+            'default-src': ["'self'"],
+            'script-src': ["'self'", 'https://static.cloudflareinsights.com'],
+            'script-src-attr': ["'unsafe-inline'"],
+            'style-src': ["'self'", "'unsafe-inline'", 'https://fonts.googleapis.com'],
+            'font-src': ["'self'", 'https://fonts.gstatic.com'],
+            'img-src': ["'self'", 'data:', 'blob:', 'https://res.cloudinary.com', 'https:'],
+            'connect-src': ["'self'", 'https://api.cloudinary.com'],
+            'frame-ancestors': ["'none'"]
+        }
+    }
+}));
 app.use('/portal/support', express.static(path.join(__dirname, 'public', 'portal', 'support')));
 
 // Admin API routes
@@ -308,6 +327,11 @@ app.use('/api/support/admin', supportDeskRoutes);
 const supportRoutes = require('./src/routes/supportRoutes');
 app.use('/api/support', supportRoutes);
 
+// Website mirror of the WhatsApp post-purchase Confirm/Cancel/Edit flow —
+// consumed by the Shopify order detail page (phone + order-number claim).
+const orderConfirmationRoutes = require('./src/routes/orderConfirmationRoutes');
+app.use('/api/order-confirmation', orderConfirmationRoutes);
+
 // Instagram webhook rate limiter — DISABLED (Instagram bot turned off)
 // Instagram Graph API allows ~500 calls/hour; 300/min per IP is generous
 // for DM + comment traffic while protecting against burst floods.
@@ -329,6 +353,16 @@ app.use('/api/support', supportRoutes);
 const abandonedCartCron = require('./src/services/abandonedCartCron');
 const reengagementCron = require('./src/services/reengagementCron');
 const shipmentSyncCron = require('./src/services/shipmentSyncCron');
+const supportMediaRetentionCron = require('./src/services/supportMediaRetentionCron');
+// Cancelled Shopify orders → Zoho invoice voids. Shopify never subscribed
+// orders/cancelled to /webhooks/zoho/orders/cancelled, so the webhook handler
+// on its own voids nothing; this sweep is the feed that actually works.
+const zohoCancelSweepCron = require('./src/services/zohoCancelSweepCron');
+// Delivered COD orders → Zoho invoice payments. The live carrier hook fires
+// once at the delivery transition and never looks again, so a rate limit or a
+// not-yet-synced invoice left the order unpaid permanently. This sweep is the
+// backstop that actually drains that backlog.
+const zohoCodSweepCron = require('./src/services/zohoCodSweepCron');
 
 // Periodic duplicate invoice sweeper — runs every 15 min to catch any
 // invoices created by the native Zoho ↔ Shopify integration
@@ -615,6 +649,16 @@ async function handleStatusUpdate(statuses) {
       if (result.changes > 0) {
         console.log(`[STATUS] Message ${waMessageId} → ${dbStatus}`);
       }
+
+      // Advance the support_media lifecycle for any outbound support image
+      // sent under this wamid (monotonic: a late 'sent' never downgrades a
+      // 'delivered'). Best-effort — never fail the webhook on it.
+      try {
+        const supportMediaService = require('./src/services/supportMediaService');
+        await supportMediaService.applyDeliveryStatus(waMessageId, dbStatus);
+      } catch (mediaErr) {
+        console.error(`[STATUS] support_media update skipped for ${waMessageId}:`, mediaErr.message);
+      }
       
       // Also update follow-up recipient status if applicable
       if (whatsappStatus === 'delivered' || whatsappStatus === 'read') {
@@ -792,33 +836,58 @@ async function startServer() {
         abandonedCartCron.init();
         reengagementCron.init();
         shipmentSyncCron.init();
+        // Deletes support images from the dedicated Cloudinary account 45
+        // days after a ticket is finally closed. No-ops if creds are absent.
+        supportMediaRetentionCron.init();
+        // Gated on the variable zohoService actually reads (ZOHO_ORGANIZATION_ID).
+        // Not ZOHO_ORG_ID — that one is set nowhere, which is why the duplicate
+        // sweeper above has never fired in production.
+        if (process.env.ZOHO_ORGANIZATION_ID) zohoCancelSweepCron.init();
+        if (process.env.ZOHO_ORGANIZATION_ID) zohoCodSweepCron.init();
 
-        // Keep the Inventory Control Tower's 3-min snapshot cache perpetually
-        // warm so the hub view opens instantly; without this the first open
-        // after a deploy pays for the full reconciliation pass.
-        const warmInventoryTower = async () => {
-            try {
-                const jwt = require('jsonwebtoken');
-                const { adminCredentialFingerprint } = require('./src/middleware/auth');
-                const token = jwt.sign(
-                    { username: 'cache-warm', role: 'admin', credFp: adminCredentialFingerprint() },
-                    process.env.JWT_SECRET,
-                    { expiresIn: '60s' }
-                );
-                const port = process.env.PORT || 3000;
-                const res = await fetch(`http://localhost:${port}/api/admin/inventory?window=90`, {
-                    headers: { Authorization: `Bearer ${token}` }
-                });
-                if (!res.ok) throw new Error(`HTTP ${res.status}`);
-                // Drain the response body so the socket can be reused / reaped
-                await res.arrayBuffer().catch(() => {});
-                console.log('✅ Inventory tower cache warmed');
-            } catch (error) {
-                console.warn('⚠️ Inventory tower warm-up failed (non-critical):', error.message);
+        // Keep the Inventory Control Tower's snapshot cached so the hub view opens
+        // instantly. A cold rebuild detoasts ~20MB of items_json and can take 5–16s
+        // on a fresh pooler cache, so it must not collide with post-deploy portal
+        // traffic. Delay the first attempt and leave at least four pool slots free.
+        let inventoryWarmInFlight = null;
+        const warmInventoryTower = () => {
+            if (inventoryWarmInFlight) return inventoryWarmInFlight;
+            const inUse = Math.max(0, (pool.totalCount || 0) - (pool.idleCount || 0));
+            const peakInventoryClients = 3;
+            const reservedPoolSlots = 4;
+            const maxPoolClients = pool.options.max || 10;
+            if ((pool.waitingCount || 0) > 0
+                || inUse + peakInventoryClients > maxPoolClients - reservedPoolSlots) {
+                return Promise.resolve();
             }
+            inventoryWarmInFlight = (async () => {
+                try {
+                    const jwt = require('jsonwebtoken');
+                    const { adminCredentialFingerprint } = require('./src/middleware/auth');
+                    const token = jwt.sign(
+                        { username: 'cache-warm', role: 'admin', credFp: adminCredentialFingerprint() },
+                        process.env.JWT_SECRET,
+                        { expiresIn: '60s' }
+                    );
+                    const port = process.env.PORT || 3000;
+                    const res = await fetch(`http://localhost:${port}/api/admin/inventory?window=90`, {
+                        headers: { Authorization: `Bearer ${token}` }
+                    });
+                    // Drain the response body so the socket can be reused / reaped
+                    await res.arrayBuffer().catch(() => {});
+                    // The route rechecks pool headroom after catalog work; a 503 means
+                    // this attempt was safely deferred and the next interval will retry.
+                    if (res.status === 503) return;
+                    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+                    console.log('✅ Inventory tower cache warmed');
+                } catch (error) {
+                    console.warn('⚠️ Inventory tower warm-up failed (non-critical):', error.message);
+                }
+            })().finally(() => { inventoryWarmInFlight = null; });
+            return inventoryWarmInFlight;
         };
-        setTimeout(warmInventoryTower, 8000);
-        setInterval(warmInventoryTower, 150000); // refresh before the 3-min TTL lapses
+        setTimeout(warmInventoryTower, 45000);
+        setInterval(warmInventoryTower, 150000); // repopulate the 1-hour snapshot if it was purged
 
         // ── Unified memory watchdog ─────────────────────────────────────
         // One adaptive 120s timer replaces the previous stack of overlapping
@@ -837,15 +906,8 @@ async function startServer() {
         const SettingsModel = require('./src/models/Settings');
         const followUpService = require('./src/services/followUpService');
         const shiprocketService = require('./src/services/shiprocketService');
-        // Lazy-load zohoItemResolver — only needed for cache clearing on pressure
-        let _zohoItemResolver = null;
-        function getZohoItemResolver() {
-            if (!_zohoItemResolver) {
-                try { _zohoItemResolver = require('./src/services/zohoItemResolver'); }
-                catch (e) { /* module may not exist in all deploys */ }
-            }
-            return _zohoItemResolver;
-        }
+        // zohoItemResolver's item cache is process-wide but bounded (LRU cap 300,
+        // 10 min TTL), so it needs no pressure-time sweep.
 
         let watchdogTick = 0;
         setInterval(() => {
@@ -857,8 +919,8 @@ async function startServer() {
                 const reaped = reapIdleSockets();
                 if (reaped > 0) console.log(`[MEMORY] Reaped ${reaped} idle TLS socket(s)`);
 
-                // 2. Drain idle pg connections (~5-10MB native TLS each)
-                if ((pool.idleCount || 0) > 0) {
+                // 2. Drain idle pg connections above the one-session warm minimum
+                if ((pool.idleCount || 0) > 1) {
                     const closed = pool.endIdleClients();
                     if (closed > 0) console.log(`[MEMORY] Closed ${closed} idle pg connection(s) (total=${pool.totalCount})`);
                 }
@@ -908,12 +970,9 @@ async function startServer() {
 
                     try { shiprocketService.orderCache.clear(); } catch (e) { /* ignore */ }
 
-                    // Clear zohoItemResolver caches (unbounded itemCache Map)
+                    // The Zoho item cache is bounded (see above); invalidate the
+                    // LRU query caches that feed everything else.
                     try {
-                        const zir = getZohoItemResolver();
-                        // zohoItemResolver doesn't expose a clear() — the resolver
-                        // is created per-run by callers, so there's no global handle.
-                        // Instead, invalidate the LRU caches that feed it.
                         invalidateCache('queries');
                     } catch (e) { /* ignore */ }
 
@@ -934,8 +993,8 @@ async function startServer() {
                         taskQueue.length = 0;
                     } catch (e) { /* ignore */ }
                     try {
-                        const closed = pool.endIdleClients();
-                        if (closed > 0) console.log(`[MEMORY] Emergency: closed ${closed} idle pg connections`);
+                        const closed = pool.endIdleClients(0);
+                        if (closed > 0) console.log(`[MEMORY] Emergency: closed ${closed} idle pg connection(s)`);
                     } catch (e) { /* ignore */ }
                 }
             } catch (e) {

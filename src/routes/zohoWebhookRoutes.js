@@ -8,6 +8,8 @@ const zohoSyncService = require('../services/zohoSyncService');
 const zohoReturnService = require('../services/zohoReturnService');
 const zohoCodService = require('../services/zohoCodService');
 const zohoService = require('../services/zohoService');
+const zohoCancelService = require('../services/zohoCancelService');
+const shoppersInventoryService = require('../services/shoppersInventoryService');
 
 // ============================================================
 // SHOPIFY WEBHOOK VERIFICATION (HMAC-SHA256)
@@ -76,6 +78,11 @@ router.post('/orders/create', verifyShopifyWebhook, async (req, res) => {
     try {
         const order = req.body;
         console.log(`📦 Zoho webhook: order created #${order.order_number || order.id}`);
+        // The Stock Room is separate from Shopify stock. Keep this call here as
+        // well as the shopper-ingestion path because either webhook subscription
+        // may be the one that delivers a given order. Run it before Zoho so an
+        // accounting outage cannot leave hub stock unchanged.
+        await shoppersInventoryService.deductOrderStock(order);
         await zohoSyncService.syncOrderToZoho(order);
     } catch (err) {
         console.error('❌ Zoho webhook order/create error:', err.message);
@@ -102,10 +109,14 @@ router.post('/orders/updated', verifyShopifyWebhook, async (req, res) => {
 });
 
 // ============================================================
-// SHOPIFY ORDER CANCELLED — void the Zoho invoice when the order
-// never shipped (cancelled-before-dispatch orders must not carry a
-// live invoice). Already-dispatched orders are left untouched — any
-// later RTO is handled via credit note, never invoice deletion.
+// SHOPIFY ORDER CANCELLED — the invoice follows the cancellation.
+// A cancelled order must not carry a live Zoho invoice, whether or not the
+// parcel had already shipped, and a paid invoice has its receipt removed
+// first (see zohoCancelService for the full rule and its safety rails).
+//
+// NOTE: Shopify has never had this topic subscribed to this URL, so this
+// handler is not the working feed — see src/services/zohoCancelService.js,
+// which owns the void rule and runs hourly against the same data.
 // ============================================================
 
 router.post('/orders/cancelled', verifyShopifyWebhook, async (req, res) => {
@@ -118,59 +129,11 @@ router.post('/orders/cancelled', verifyShopifyWebhook, async (req, res) => {
 
         console.log(`📦 Zoho cancel: processing cancellation for order #${orderId}`);
 
-        // Anything fulfilled (not cancelled) means it shipped — keep invoice
-        const shipped = (order.fulfillments || []).some(f =>
-            f.status !== 'cancelled' && f.status !== 'failure'
-        );
-        if (shipped) {
-            console.log(`ℹ️ Zoho cancel: order #${orderId} was shipped — invoice kept (RTOs handled via credit note)`);
-            return;
+        await shoppersInventoryService.restockCancelledOrder(order);
+        const result = await zohoCancelService.processCancellation(order);
+        if (result.voided > 0) {
+            console.log(`✅ Zoho cancel: order #${orderId} — ${result.voided} invoice(s) voided`);
         }
-
-        const invoices = await zohoService.searchInvoice({ reference_number: orderId });
-
-        if (invoices.length === 0) {
-            console.log(`ℹ️ Zoho cancel: order #${orderId} — no invoices found in Zoho (may not have been synced yet)`);
-        }
-
-        let voided = 0;
-        for (const inv of invoices) {
-            if (inv.status === 'void' || inv.status === 'deleted') continue;
-            try {
-                // Void (never delete) — keeps the audit trail
-                await zohoService.voidInvoice(inv.invoice_id);
-                voided++;
-            } catch (voidErr) {
-                console.warn(`⚠️ Zoho cancel: void failed for invoice ${inv.invoice_id} (order #${orderId}): ${voidErr.message}`);
-            }
-        }
-
-        if (voided > 0) {
-            console.log(`✅ Zoho cancel: order #${orderId} cancelled before dispatch — ${voided} invoice(s) voided`);
-        }
-
-        // Mark the sync log so retries/backfill don't revive the invoice.
-        // If no row exists yet (cancel arrived before create), insert one so
-        // the create webhook sees 'cancelled' and skips invoice creation.
-        try {
-            const { dbAdapter } = require('../database/db');
-            const updated = await dbAdapter.run(
-                `UPDATE zoho_sync_log SET status = ?, error_message = ?, updated_at = NOW()
-                 WHERE shopify_order_id = ? AND status IN ('synced', 'pending', 'retry')`,
-                ['cancelled', 'Order cancelled before dispatch — invoice voided', orderId]
-            );
-            // If no row was updated, the order hasn't been synced yet — insert
-            // a cancelled row so the pending create webhook won't create it.
-            const rowsAffected = updated?.changes || updated?.rowCount || 0;
-            if (rowsAffected === 0) {
-                await dbAdapter.run(
-                    `INSERT INTO zoho_sync_log (shopify_order_id, status, error_message, created_at, updated_at)
-                     VALUES (?, 'cancelled', 'Order cancelled before sync — invoice creation blocked', NOW(), NOW())`,
-                    [orderId]
-                );
-                console.log(`📝 Zoho cancel: order #${orderId} — inserted cancel guard row (no prior sync existed)`);
-            }
-        } catch (e) { /* log-only */ }
 
         // Flag matching hub rows as cancelled on the order channel so the
         // Shoppers Hub shows the "Synced" badge on these cancelled orders.
@@ -261,6 +224,8 @@ router.post('/refunds/create', verifyShopifyWebhook, async (req, res) => {
             };
         }
 
+        await inventorySideEffect('refund restock', () =>
+            shoppersInventoryService.restockShopifyRefund(shopifyOrder, refund));
         await zohoReturnService.handleShopifyRefund(shopifyOrder, refund);
     } catch (err) {
         console.error('❌ Zoho webhook refunds/create error:', err.message);
@@ -299,6 +264,15 @@ function parseJsonBody(req, res, next) {
     next();
 }
 
+async function inventorySideEffect(label, work) {
+    try {
+        return await work();
+    } catch (error) {
+        console.error(`❌ Stock Room ${label} error:`, error.message);
+        return null;
+    }
+}
+
 // ============================================================
 // CARRIER DELIVERY WEBHOOK — COD reconciliation + RTO
 // Called by existing carrier webhook handlers or Delhivery/Shiprocket
@@ -326,6 +300,10 @@ router.post('/carrier/delivery', requireInternalToken, parseJsonBody, async (req
                 deliveryDate: delivery_date || new Date().toISOString().split('T')[0]
             });
         } else if (status === 'rto' || status === 'rto_delivered') {
+            if (status === 'rto_delivered') {
+                await inventorySideEffect('RTO restock', () =>
+                    shoppersInventoryService.restockRTOOrder({ order_number: order_id }));
+            }
             // RTO — need original order data
             const syncLog = await require('../database/db').dbAdapter.query(
                 'SELECT original_payload FROM zoho_sync_log WHERE shopify_order_id = ? ORDER BY created_at DESC LIMIT 1',
@@ -360,7 +338,7 @@ router.post('/exchange', requireInternalToken, parseJsonBody, async (req, res) =
     res.status(200).json({ received: true });
 
     try {
-        const { order_id, original_items, exchanged_items } = req.body || {};
+        const { order_id, request_id, original_items, exchanged_items, inventory_event, inventory_only } = req.body || {};
         if (!order_id) {
             console.warn('⚠️ Zoho exchange webhook: missing order_id');
             return;
@@ -383,6 +361,21 @@ router.post('/exchange', requireInternalToken, parseJsonBody, async (req, res) =
             shopifyOrder = { order_number: order_id, id: order_id, line_items: original_items || [] };
         }
 
+        if (inventory_event === 'replacement_dispatched') {
+            await inventorySideEffect('exchange replacement deduction', () => shoppersInventoryService.deductExchangeReplacement({
+                order: shopifyOrder,
+                items: exchanged_items || [],
+                eventId: request_id
+            }));
+        } else if (inventory_event === 'return_received') {
+            await inventorySideEffect('exchange return restock', () => shoppersInventoryService.restockExchangeItems({
+                order: shopifyOrder,
+                items: original_items || [],
+                eventId: request_id
+            }));
+        }
+        if (inventory_only) return;
+
         await zohoReturnService.handleExchange(
             shopifyOrder,
             original_items || [],
@@ -403,12 +396,26 @@ router.post('/return', requireInternalToken, parseJsonBody, async (req, res) => 
     res.status(200).json({ received: true });
 
     try {
-        const { order_id, return_items } = req.body || {};
+        const { order_id, request_id, return_items, return_type, inventory_event, inventory_only } = req.body || {};
         if (!order_id) {
             console.warn('⚠️ Zoho return webhook: missing order_id');
             return;
         }
         console.log(`🔁 Zoho webhook: return for order #${order_id}`);
+
+        if (inventory_event === 'return_received') {
+            const isExchange = return_type === 'exchange';
+            await inventorySideEffect('return restock', () => shoppersInventoryService.restockReturnedItems({
+                order: { order_number: order_id },
+                items: return_items || [],
+                eventId: request_id,
+                referencePrefix: isExchange ? 'exchange:' : 'return:',
+                adjustmentType: isExchange
+                    ? shoppersInventoryService.EXCHANGE_RESTOCK
+                    : shoppersInventoryService.RETURN_RESTOCK
+            }));
+        }
+        if (inventory_only) return;
 
         await zohoReturnService.handleReturnsServerReturn(order_id, return_items || []);
     } catch (err) {

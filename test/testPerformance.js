@@ -154,3 +154,100 @@ test('arbitrary req.admin cannot bypass permissions and changed tokens are rever
     assert.equal(res.statusCode, 401);
     assert.equal(calls(), 2);
 });
+
+function inventoryRouteFixture() {
+    const filename = path.resolve(__dirname, '../src/routes/adminRoutes.js');
+    const source = fs.readFileSync(filename, 'utf8');
+    const start = source.indexOf('const inventoryInFlight = new Map()');
+    const end = source.indexOf('async function handleInventoryRequest(req)');
+    assert.ok(start >= 0 && end > start, 'inventory single-flight block must remain extractable');
+    const context = {
+        router: { get(_path, _verifyToken, handler) { context.handler = handler; } },
+        verifyToken: () => {},
+        getCached: () => null,
+        pool: { totalCount: 0, idleCount: 0, waitingCount: 0, options: { max: 10 } },
+        handleInventoryRequest: async () => ({ status: 200, body: { success: true } })
+    };
+    vm.createContext(context);
+    vm.runInContext(source.slice(start, end), context, { filename });
+    return context;
+}
+
+function inventoryRequest(force = false) {
+    return { query: force ? { refresh: '1' } : {}, admin: { username: 'operator' } };
+}
+
+test('inventory waiters share failures instead of launching duplicate scans', async () => {
+    const fixture = inventoryRouteFixture();
+    const build = deferred();
+    let calls = 0;
+    fixture.handleInventoryRequest = async () => { calls++; return build.promise; };
+    const first = response(), second = response();
+    const pending = [
+        fixture.handler(inventoryRequest(), first),
+        fixture.handler(inventoryRequest(), second)
+    ];
+    await tick();
+    assert.equal(calls, 1);
+    build.resolve({ status: 500, body: { success: false, error: 'offline' } });
+    await Promise.all(pending);
+    assert.equal(calls, 1);
+    assert.equal(first.statusCode, 500);
+    assert.equal(second.statusCode, 500);
+    assert.equal(second.body.error, 'offline');
+});
+
+test('forced inventory refresh waits for a normal build, then refreshes once', async () => {
+    const fixture = inventoryRouteFixture();
+    const normal = deferred(), forced = deferred();
+    const calls = [];
+    fixture.handleInventoryRequest = async (req) => {
+        const isForced = req.query.refresh === '1';
+        calls.push(isForced ? 'forced' : 'normal');
+        return isForced ? forced.promise : normal.promise;
+    };
+    const normalResponse = response();
+    const forcedResponses = [response(), response()];
+    const pending = [fixture.handler(inventoryRequest(), normalResponse)];
+    pending.push(...forcedResponses.map(res => fixture.handler(inventoryRequest(true), res)));
+    await tick();
+    assert.deepEqual(calls, ['normal']);
+    normal.resolve({ status: 200, body: { success: true, generation: 'normal' } });
+    await tick();
+    assert.deepEqual(calls, ['normal', 'forced']);
+    forced.resolve({ status: 200, body: { success: true, generation: 'forced' } });
+    await Promise.all(pending);
+    assert.deepEqual(calls, ['normal', 'forced']);
+    assert.equal(normalResponse.body.generation, 'normal');
+    assert.ok(forcedResponses.every(res => res.body.generation === 'forced'));
+});
+
+test('ordinary inventory requests reuse an in-flight forced refresh', async () => {
+    const fixture = inventoryRouteFixture();
+    const build = deferred();
+    let calls = 0;
+    fixture.handleInventoryRequest = async () => { calls++; return build.promise; };
+    const first = response(), second = response();
+    const pending = [
+        fixture.handler(inventoryRequest(true), first),
+        fixture.handler(inventoryRequest(), second)
+    ];
+    await tick();
+    assert.equal(calls, 1);
+    build.resolve({ status: 200, body: { success: true, generation: 'forced' } });
+    await Promise.all(pending);
+    assert.equal(calls, 1);
+    assert.equal(second.body.generation, 'forced');
+    assert.equal(second.body.cached, true);
+});
+
+test('inventory headroom reserves three query clients and four portal slots', () => {
+    const fixture = inventoryRouteFixture();
+    fixture.pool.totalCount = 7;
+    fixture.pool.idleCount = 4;
+    assert.equal(fixture.inventoryHasHeadroom(), true);
+    fixture.pool.totalCount = 8;
+    assert.equal(fixture.inventoryHasHeadroom(), false);
+    fixture.pool.waitingCount = 1;
+    assert.equal(fixture.inventoryHasHeadroom(), false);
+});

@@ -10,8 +10,11 @@ const pool = new Pool({
   // every other request queued until the 15s connect timeout fired
   // ("timeout exceeded when trying to connect" in the webhook/widget/portal paths).
   max: 10,
-  min: 0, // Allow all connections to close when idle (saves ~10MB native)
-  idleTimeoutMillis: 10000, // Close idle connections after 10s (was 20s)
+  // One warm session removes the 330–450ms Supabase handshake seen on trivial
+  // lookups. allowExitOnIdle keeps one-off scripts/tests from hanging on it.
+  min: 1,
+  allowExitOnIdle: true,
+  idleTimeoutMillis: 10000, // Close connections above the warm minimum after 10s
   connectionTimeoutMillis: 15000, // Allow up to 15s during warm-up bursts
   // Client-side guard: a query that never returns must not pin a pool slot forever
   query_timeout: 35000
@@ -122,23 +125,28 @@ pool.on('error', (err) => {
 });
 
 // Monitor pool utilization every 30 seconds when active (>50%)
+// unref(): a monitoring timer must never be what keeps a process alive - it is
+// the reason offline scripts and `node --test` hang after finishing their work.
+// The server keeps its own listening handles, so the warning still fires.
 setInterval(() => {
   const utilization = (pool.totalCount / pool.options.max) * 100;
   if (utilization > 50) {
     console.warn(`📊 DB POOL: ${pool.totalCount}/${pool.options.max} (${utilization.toFixed(0)}%) | Waiting: ${pool.waitingCount}`);
   }
-}, 30000);
+}, 30000).unref();
 
 // CRITICAL FIX: pg Pool does NOT have endIdleClients() — implement it manually
-// This drains idle connections to free native TLS buffers (~5-10MB per idle connection)
-// Without this, native memory grows unbounded and causes OOM at 512MB
+// Routine watchdog passes keep one warm session; emergency memory pressure passes 0.
+// This bounds native TLS buffers (~5-10MB per idle connection) without paying a
+// fresh pooler handshake for every low-volume request.
 // pg-pool v3 stores IdleItem wrappers ({ client, idleListener, timeoutId }) in
 // this._idle — we must unwrap the client and use pool._remove() so the pool's
 // bookkeeping (_clients, idle timers, listeners) stays consistent. Calling
 // .end() on the wrapper itself silently no-ops and leaks/orphans connections.
-pool.endIdleClients = function() {
+pool.endIdleClients = function(keepWarm = 1) {
   let closed = 0;
-  while (this._idle && this._idle.length > 0) {
+  const keep = Math.max(0, Math.min(Number(keepWarm) || 0, this.options.max));
+  while (this._idle && this._idle.length > keep) {
     const item = this._idle[this._idle.length - 1];
     const client = item && item.client ? item.client : item;
     try {
@@ -351,6 +359,9 @@ async function initializeDatabase() {
     // Initialize Shopper Confirmations Table
     await initializeShopperConfirmationsTable();
     
+    // Initialize Order Item Change Requests Table (website edit-panel item swaps)
+    await initializeOrderItemRequestsTable();
+    
     // Initialize Follow-Up Campaigns Tables
     await initializeFollowUpTables();
     
@@ -378,6 +389,9 @@ async function initializeDatabase() {
 
     // Initialize Widget Chat Tables (persisted website bot conversations)
     await initializeWidgetChatTables();
+
+    // Initialize Support Media table (Cloudinary-backed image lifecycle)
+    await initializeSupportMediaTable();
     
     // Initialize Manual Inventory Tables (bulk inventory-in tracking)
     await initializeManualInventoryTables();
@@ -441,6 +455,10 @@ async function initializeShoppersTable() {
       { name: 'response_count', type: 'INTEGER DEFAULT 0' },
       { name: 'delivery_type', type: 'VARCHAR(20)' },
       { name: 'confirmed_by', type: 'VARCHAR(50)' },
+      // Which hub identity performed the action that set confirmed_by. Channel
+      // ('manual'/'whatsapp'/'website') lives in confirmed_by; this is the person.
+      // NULL for automated confirmations and for manual ones predating the column.
+      { name: 'confirmed_by_operator', type: 'VARCHAR(100)' },
       { name: 'conversation_lock_until', type: 'TIMESTAMP' },
       { name: 'gokwik_order_id', type: 'TEXT' },
       { name: 'rto_risk', type: 'VARCHAR(20)' },
@@ -482,6 +500,38 @@ async function initializeShopperConfirmationsTable() {
     console.log('✅ Shopper confirmations table initialized');
   } catch (error) {
     console.error('❌ Failed to initialize shopper_confirmations table:', error.message);
+  }
+}
+
+// Structured item-change requests raised by the website order-confirmation
+// edit panel (size/qty/remove on existing lines + new items picked from the
+// Shopify catalog). The hub queue works off these rows; the full request text
+// also stays in the store_shoppers message log as EDIT_REQUEST_JSON for the
+// customer-facing "Latest edit request" block.
+async function initializeOrderItemRequestsTable() {
+  try {
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS order_item_requests (
+        id BIGSERIAL PRIMARY KEY,
+        shopper_id TEXT,
+        order_id TEXT NOT NULL,
+        phone TEXT,
+        request JSONB NOT NULL,
+        summary TEXT,
+        status VARCHAR(20) DEFAULT 'pending',
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        resolved_at TIMESTAMP,
+        resolved_by TEXT,
+        resolution_note TEXT
+      )
+    `);
+
+    await pool.query('CREATE INDEX IF NOT EXISTS idx_order_item_requests_status ON order_item_requests(status)');
+    await pool.query('CREATE INDEX IF NOT EXISTS idx_order_item_requests_order_id ON order_item_requests(order_id)');
+
+    console.log('✅ Order item requests table initialized');
+  } catch (error) {
+    console.error('❌ Failed to initialize order_item_requests table:', error.message);
   }
 }
 
@@ -633,6 +683,26 @@ async function initializeSupportPortalsTable() {
 
     // Follow-Up view: filter by status, sort by scheduled reminder time
     await pool.query('CREATE INDEX IF NOT EXISTS idx_support_tickets_follow_up ON support_tickets(status, follow_up_at)');
+
+    // ── Support desk Access tab: whitelist grants carry their own metadata ──
+    // The phone stays the only gate the storefront Help & Tickets tab has, so
+    // each grant also records how it was made, what it allows and when it lapses.
+    // All three are optional for the gate itself (accessService probes for them
+    // and degrades to the legacy shape), which is why ADD COLUMN runs here rather
+    // than depending on the hand-run migration landing first.
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS support_whitelist (
+        id SERIAL PRIMARY KEY,
+        phone VARCHAR(50) UNIQUE NOT NULL,
+        added_by VARCHAR(100),
+        note TEXT,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+      )
+    `);
+    await addColumnIfNotExists('support_whitelist', 'expires_at', 'TIMESTAMP');
+    await addColumnIfNotExists('support_whitelist', 'access_level', "VARCHAR(20) DEFAULT 'full'");
+    await addColumnIfNotExists('support_whitelist', 'source', "VARCHAR(40) DEFAULT 'manual'");
+    await pool.query('CREATE INDEX IF NOT EXISTS idx_support_whitelist_expires ON support_whitelist(expires_at) WHERE expires_at IS NOT NULL');
 
     // Add advanced distribution columns to support_portals
     const portalColumns = [
@@ -1041,9 +1111,64 @@ async function initializeWidgetChatTables() {
   }
 }
 
+// ── Support Media Pipeline Table ──
+// One row per support image across website Help & Tickets, the internal
+// Support Desk and the WhatsApp/Instagram portal. Tracks the full lifecycle
+// (browser direct-upload → send → carrier receipts → seen → 45-day purge).
+// Kept in sync with supabase_migration_support_media.sql.
+async function initializeSupportMediaTable() {
+  try {
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS support_media (
+        id                SERIAL PRIMARY KEY,
+        public_id         VARCHAR(300) NOT NULL UNIQUE,
+        channel           VARCHAR(20) NOT NULL,
+        ticket_ref        VARCHAR(100),
+        direction         VARCHAR(10) NOT NULL,
+        actor             VARCHAR(100),
+        mime_type         VARCHAR(100),
+        file_size         INTEGER,
+        width             INTEGER,
+        height            INTEGER,
+        secure_url        TEXT,
+        thumbnail_url     TEXT,
+        upload_status     VARCHAR(30) DEFAULT 'pending',
+        delivery_status   VARCHAR(30),
+        wa_message_id     VARCHAR(200),
+        thread_entry_idx  INTEGER,
+        message_id        INTEGER,
+        retention_due_at  TIMESTAMP,
+        purged_at         TIMESTAMP,
+        error_text        TEXT,
+        created_at        TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        updated_at        TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+      )
+    `);
+
+    // Per-column self-heal for environments where the table predates any
+    // added column (CREATE TABLE IF NOT EXISTS silently no-ops otherwise).
+    await addColumnIfNotExists('support_media', 'delivery_status', 'VARCHAR(30)');
+    await addColumnIfNotExists('support_media', 'wa_message_id', 'VARCHAR(200)');
+    await addColumnIfNotExists('support_media', 'thread_entry_idx', 'INTEGER');
+    await addColumnIfNotExists('support_media', 'message_id', 'INTEGER');
+    await addColumnIfNotExists('support_media', 'retention_due_at', 'TIMESTAMP');
+    await addColumnIfNotExists('support_media', 'purged_at', 'TIMESTAMP');
+    await addColumnIfNotExists('support_media', 'error_text', 'TEXT');
+
+    await pool.query('CREATE INDEX IF NOT EXISTS idx_media_ticket ON support_media(ticket_ref)');
+    await pool.query('CREATE INDEX IF NOT EXISTS idx_media_public ON support_media(public_id)');
+    await pool.query('CREATE INDEX IF NOT EXISTS idx_media_wa_msg ON support_media(wa_message_id) WHERE wa_message_id IS NOT NULL');
+    await pool.query('CREATE INDEX IF NOT EXISTS idx_media_retention ON support_media(retention_due_at) WHERE purged_at IS NULL');
+
+    console.log('✅ Support media table initialized');
+  } catch (error) {
+    console.error('❌ Failed to initialize support media table:', error.message);
+  }
+}
+
 // ── Manual Inventory Tracking Tables ──
-// Tracks manually-managed inventory (bulk inventory-in operations) independent
-// of Shopify. Used for the Shopper Hub bulk inventory-in feature.
+// Tracks manually-managed inventory independent of Shopify. Bulk moves, customer
+// sales, cancellation restocks, and Shopify workbench syncs all share this ledger.
 async function initializeManualInventoryTables() {
   try {
     // Manual inventory: current stock levels per SKU
@@ -1081,6 +1206,39 @@ async function initializeManualInventoryTables() {
     `);
     await pool.query('CREATE INDEX IF NOT EXISTS idx_inv_adjustments_sku ON inventory_adjustments(sku_key, created_at DESC)');
     await pool.query('CREATE INDEX IF NOT EXISTS idx_inv_adjustments_type ON inventory_adjustments(adjustment_type, created_at DESC)');
+    // One sale/restock entry per order and SKU. The transaction also takes an
+    // order-level advisory lock; these indexes are the durable dedupe guard
+    // across processes and webhook retries.
+    await pool.query(`
+      CREATE UNIQUE INDEX IF NOT EXISTS uq_inventory_adjustments_sale_order_sku
+      ON inventory_adjustments(reference, sku_key)
+      WHERE adjustment_type = 'sale'
+    `);
+    await pool.query(`
+      CREATE UNIQUE INDEX IF NOT EXISTS uq_inventory_adjustments_restock_order_sku
+      ON inventory_adjustments(reference, sku_key)
+      WHERE adjustment_type = 'sale_restock'
+    `);
+    await pool.query(`
+      CREATE UNIQUE INDEX IF NOT EXISTS uq_inventory_adjustments_rto_order_sku
+      ON inventory_adjustments(reference, sku_key)
+      WHERE adjustment_type = 'rto_restock'
+    `);
+    await pool.query(`
+      CREATE UNIQUE INDEX IF NOT EXISTS uq_inventory_adjustments_return_event_sku
+      ON inventory_adjustments(reference, sku_key)
+      WHERE adjustment_type = 'return_restock'
+    `);
+    await pool.query(`
+      CREATE UNIQUE INDEX IF NOT EXISTS uq_inventory_adjustments_exchange_return_sku
+      ON inventory_adjustments(reference, sku_key)
+      WHERE adjustment_type = 'exchange_restock'
+    `);
+    await pool.query(`
+      CREATE UNIQUE INDEX IF NOT EXISTS uq_inventory_adjustments_exchange_sale_sku
+      ON inventory_adjustments(reference, sku_key)
+      WHERE adjustment_type = 'exchange_sale'
+    `);
 
     // Shopify ⇄ Stock Room sync run audit (workbench pulls/pushes + bulk mirrors)
     await pool.query(`
@@ -1161,6 +1319,12 @@ async function initializePerformanceIndexes() {
     await pool.query('CREATE INDEX IF NOT EXISTS idx_store_shoppers_created_at ON store_shoppers(created_at DESC)');
     // Composite index for inventory intelligence (status + created_at for filtering; items_json fetched from heap)
     await pool.query('CREATE INDEX IF NOT EXISTS idx_store_shoppers_status_created ON store_shoppers(status, created_at DESC)');
+    // Covering index for the inbox confirmation-analytics day×method aggregate
+    // (confirmed rows only; confirmed_by resolved from the index, no heap fetch)
+    await pool.query('CREATE INDEX IF NOT EXISTS idx_store_shoppers_confirmed_by ON store_shoppers(updated_at DESC, confirmed_by) WHERE status = \'confirmed\'');
+    // Same partial scan for the per-operator breakdown added to the confirmation
+    // analytics panel (day × operator aggregation on confirmed rows only)
+    await pool.query('CREATE INDEX IF NOT EXISTS idx_store_shoppers_confirmed_operator ON store_shoppers(updated_at DESC, confirmed_by_operator) WHERE status = \'confirmed\'');
     
     // Index for orders table (JOIN operations)
     await pool.query('CREATE INDEX IF NOT EXISTS idx_orders_order_id ON orders(order_id)');
@@ -1193,6 +1357,24 @@ async function initializePerformanceIndexes() {
     // shoppers list. Without it the planner used idx_ss_inv_cover (59MB because
     // it INCLUDEs items_json) and the count took 4.4s instead of ~140ms. ──
     await pool.query('CREATE INDEX IF NOT EXISTS idx_ss_status_order ON store_shoppers(status, order_id)');
+
+    // ── store_shoppers: functional index on digits-only phone. customerContextService
+    // matches phones via REGEXP_REPLACE, which no plain index can serve — the planner
+    // walked the whole table by created_at and regexp-filtered all ~52k rows (2-6s per
+    // customer-context rebuild, directly on the storefront Help tab's critical path).
+    // EXPLAIN-verified: the CTE-shaped query Bitmap Index Scans this in ~3ms.
+    // Built CONCURRENTLY (no write lock on the hot shoppers table), so it needs a
+    // dedicated client and must never run inside a transaction.
+    try {
+      const idxClient = await pool.connect();
+      try {
+        await idxClient.query("CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_ss_phone_digits ON store_shoppers (regexp_replace(COALESCE(phone, '')::text, '[^0-9]', '', 'g'))");
+      } finally {
+        idxClient.release();
+      }
+    } catch (idxErr) {
+      console.warn('⚠️ idx_ss_phone_digits build skipped:', idxErr.message);
+    }
 
     // ── shipments: sort key for the Shipped Orders list (was a full seq scan +
     // sort of 34k rows on every refresh: ~900ms) ──
@@ -1235,6 +1417,43 @@ async function initializePerformanceIndexes() {
     
     // Shipments: partial index for tracking URL lookups (only rows with tracking URLs)
     await pool.query('CREATE INDEX IF NOT EXISTS idx_shipments_awb_tracking_partial ON shipments(awb) WHERE tracking_url IS NOT NULL AND tracking_url <> \'\'');
+
+    // ── Access-tab phone aggregates: normalized phone as an indexable expression ──
+    // supportAccessService.normSql used to inline a CASE + REGEXP_REPLACE per
+    // row, so every Access-tab load re-ran full heap scans (900ms–23s queries
+    // in the Nov 23 logs). support_normalize_phone() is that exact mapping
+    // (10 digits -> 91+10, leading 0 dropped, 0091 stripped), declared
+    // IMMUTABLE because digit-stripping an ASCII pattern is deterministic.
+    // The b-tree expression indexes below match it so the COUNT(DISTINCT ...) /GROUP BY scans
+    // can run as index-only scans. Same DDL as migrate-add-phone-norm-indexes.js,
+    // which builds the big ones CONCURRENTLY without blocking writes.
+    await pool.query(`
+      CREATE OR REPLACE FUNCTION support_normalize_phone(raw text)
+      RETURNS text LANGUAGE sql IMMUTABLE AS $fn$
+        SELECT CASE
+          WHEN LENGTH(d) = 10 THEN '91' || d
+          WHEN LENGTH(d) = 11 AND LEFT(d, 1) = '0' THEN '91' || SUBSTRING(d FROM 2)
+          WHEN LENGTH(d) > 12 AND LEFT(d, 4) = '0091' THEN '91' || SUBSTRING(d FROM 5)
+          ELSE d
+        END
+        FROM (SELECT REGEXP_REPLACE(COALESCE(raw, ''), '[^0-9]', '', 'g') AS d) q
+      $fn$
+    `);
+    await pool.query(`
+      CREATE INDEX IF NOT EXISTS idx_support_tickets_phone_norm
+      ON support_tickets ((support_normalize_phone(customer_phone)))
+      INCLUDE (status, priority, team, reason, sub, customer_name, created_at)
+    `);
+    await pool.query(`
+      CREATE INDEX IF NOT EXISTS idx_support_order_cache_phone_norm
+      ON support_order_cache ((support_normalize_phone(customer_phone)))
+      INCLUDE (stage, placed_at, total, payment)
+    `);
+    await pool.query(`
+      CREATE INDEX IF NOT EXISTS idx_store_shoppers_phone_norm
+      ON store_shoppers ((support_normalize_phone(phone)))
+      INCLUDE (name, created_at)
+    `);
 
     console.log('✅ Performance indexes initialized');
   } catch (error) {

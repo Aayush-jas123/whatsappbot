@@ -4,7 +4,10 @@ const router = express.Router();
 const multer = require('multer');
 const Support = require('../services/supportService');
 const SupportSync = require('../services/supportSync');
+const SupportAccess = require('../services/supportAccessService');
 const cloudinary = require('../services/cloudinaryService');
+const supportMedia = require('../services/supportMediaService');
+const supportCloudinary = require('../services/supportCloudinaryService');
 
 // ============================================================
 // Customer-facing Support API — the "Help & Tickets" tab inside
@@ -12,9 +15,10 @@ const cloudinary = require('../services/cloudinaryService');
 //
 // Auth model: the theme injects the signed-in customer's phone
 // server-side (Liquid), the JS echoes it on every request as
-// X-Customer-Phone, and access additionally requires the phone to
-// be on support_whitelist (managed from the desk). No password,
-// no session — the storefront account is the identity provider.
+// X-Customer-Phone, and access is then decided by the desk's Access
+// tab (supportAccessService): the support_whitelist rows plus the
+// access policy mode. No password, no session — the storefront
+// account is the identity provider.
 // ============================================================
 
 // Uploads go to Cloudinary; disk storage keeps big files off the heap
@@ -36,10 +40,15 @@ async function verifyCustomerPhone(req, res, next) {
         if (!raw) return res.status(401).json({ error: 'Phone required' });
         const phone = Support.normalizePhone(raw);
         if (!phone || phone.length < 10) return res.status(401).json({ error: 'Invalid phone' });
-        if (!(await Support.isWhitelisted(phone))) {
-            return res.status(403).json({ error: 'Support access not enabled' });
+        // 60s in-memory access snapshot (shared with the order webhooks) — every
+        // customer request used to pay a DB round trip here, which dominates
+        // latency when the Render pool is cold. Revocations take up to 60s.
+        const access = await SupportAccess.checkAccess(phone);
+        if (!access.allowed) {
+            return res.status(403).json({ error: 'Support access not enabled', via: access.via });
         }
         req.customerPhone = phone;
+        req.customerAccess = access;
         next();
     } catch (error) {
         console.error('[Support] customer auth error:', error.message);
@@ -47,33 +56,47 @@ async function verifyCustomerPhone(req, res, next) {
     }
 }
 
+// Read-only grants (access level "view") may look at orders and their existing
+// tickets but must not start new conversations. Runs after verifyCustomerPhone.
+function requireFullAccess(req, res, next) {
+    if ((req.customerAccess && req.customerAccess.level) === 'view') {
+        return res.status(403).json({ error: 'This account has read-only support access' });
+    }
+    next();
+}
+
 // Thread is trimmed for the customer view; the desk reads the full row
 const publicTicket = Support.publicTicket;
 
-// ── Whitelist gate (no auth — the phone comes from Liquid injection) ──
-// Tells the theme whether to render the Help & Tickets tab at all.
+// ── Access gate (no auth — the phone comes from Liquid injection) ──
+// Tells the theme whether to render the Help & Tickets tab at all, and at what
+// level, so the storefront can hide the "raise a ticket" affordances for
+// read-only accounts instead of letting them hit a 403.
 router.get('/whitelist-check', async (req, res) => {
     try {
         const phone = Support.normalizePhone(req.query.phone || '');
         if (!phone) return res.json({ allowed: false });
-        if (!(await Support.isWhitelisted(phone))) return res.json({ allowed: false });
+        const access = await SupportAccess.checkAccess(phone);
+        if (!access.allowed) return res.json({ allowed: false, level: null, via: access.via });
 
         const cached = verifiedCustomers.get(phone);
         if (cached && Date.now() - cached.ts < VERIFY_TTL) {
-            return res.json({ allowed: true, name: cached.name, email: cached.email });
+            return res.json({ allowed: true, level: access.level, name: cached.name, email: cached.email });
         }
         try {
             const data = await SupportSync.shopifyREST(`customers.json?phone=${encodeURIComponent('+' + phone)}&limit=1`);
             const c = data.customers && data.customers[0];
-            if (!c) return res.json({ allowed: false });
+            // In "open" mode a phone we cannot match to a Shopify customer still
+            // has no account to read orders from, so the tab would be useless.
+            if (!c) return res.json({ allowed: false, level: null, via: 'no-storefront-account' });
             const profile = { name: [c.first_name, c.last_name].filter(Boolean).join(' '), email: c.email, ts: Date.now() };
             verifiedCustomers.set(phone, profile);
             if (verifiedCustomers.size > 500) verifiedCustomers.delete(verifiedCustomers.keys().next().value);
-            res.json({ allowed: true, name: profile.name, email: profile.email });
+            res.json({ allowed: true, level: access.level, name: profile.name, email: profile.email });
         } catch (shopErr) {
-            // Shopify lookup failed — the whitelist remains the access decision
+            // Shopify lookup failed — the access decision from the list stands
             console.warn('[Support] Shopify verify skipped:', shopErr.message);
-            res.json({ allowed: true });
+            res.json({ allowed: true, level: access.level });
         }
     } catch (error) {
         console.error('[Support] whitelist-check error:', error.message);
@@ -82,18 +105,55 @@ router.get('/whitelist-check', async (req, res) => {
 });
 
 // ── Customer orders (read from the webhook-fed cache) ──
+// Paginated: the storefront picker walks pages (default 5 per page) instead of
+// shipping every cached order at once. ?orderId= returns just that one order —
+// the per-order "Need Help?" flow uses it so a match on a later page never
+// forces the whole history down the wire.
 router.get('/orders', verifyCustomerPhone, async (req, res) => {
     try {
+        const key = Support.normOrderId;
+        if (req.query.orderId) {
+            const order = await Support.getOrderByNumber(req.query.orderId, req.customerPhone);
+            // Hub-sourced orders are already inside this phone's customer
+            // context, so ownership is proven by construction (same rule as
+            // /catalog; a cache-only order must match the requesting phone).
+            if (!order || (!order.hubSourced && order.customerKey !== req.customerPhone)) {
+                return res.status(404).json({ error: 'Order not found' });
+            }
+            const existing = await Support.openTicketForOrder(order.id);
+            await Support.attachItemImages([order]);
+            return res.json({
+                orders: [{
+                    ...order,
+                    openTicket: existing ? { id: existing.id, number: existing.ticket_number, status: existing.status } : null
+                }],
+                page: 1, limit: 1, total: 1, hasMore: false
+            });
+        }
+
+        const page = Math.max(1, parseInt(req.query.page) || 1);
+        const limit = Math.min(Math.max(parseInt(req.query.limit) || 5, 1), 20);
+        const offset = (page - 1) * limit;
+
         const [orders, tickets] = await Promise.all([
             Support.listOrdersByPhone(req.customerPhone),
             Support.listTicketsByPhone(req.customerPhone)
         ]);
         const openByOrder = {};
-        const key = Support.normOrderId;
         tickets.filter(t => t.status !== 'closed').forEach(t => {
             openByOrder[key(t.order_id)] = { id: t.id, number: t.ticket_number, status: t.status };
         });
-        res.json({ orders: orders.map(o => ({ ...o, openTicket: openByOrder[key(o.id)] || null })) });
+        const withTickets = orders.map(o => ({ ...o, openTicket: openByOrder[key(o.id)] || null }));
+        const pageRows = withTickets.slice(offset, offset + limit);
+        // Thumbnails are only resolved for the page being returned — the
+        // catalog map is process-cached, so this stays a pure lookup.
+        await Support.attachItemImages(pageRows);
+        res.json({
+            orders: pageRows,
+            page, limit,
+            total: withTickets.length,
+            hasMore: offset + limit < withTickets.length
+        });
     } catch (error) {
         console.error('[Support] orders error:', error.message);
         res.status(500).json({ error: 'Failed to load orders' });
@@ -143,7 +203,17 @@ router.get('/tickets/:id', verifyCustomerPhone, async (req, res) => {
         if (!t || t.customer_phone !== req.customerPhone) {
             return res.status(404).json({ error: 'Ticket not found' });
         }
-        res.json({ ticket: { ...Support.customerTicket(t), images: await Support.listTicketImages(t.id) } });
+        // Cloudinary-backed media, hydrated with live status. Opening the
+        // ticket is the customer's 'seen' receipt for agent-sent media.
+        const media = await supportMedia.listForTicket(t.ticket_number);
+        await supportMedia.markSeen(t.ticket_number, 'incoming');
+        res.json({
+            ticket: {
+                ...Support.customerTicket(t),
+                images: await Support.listTicketImages(t.id),
+                media: media.map(supportMedia.publicView)
+            }
+        });
     } catch (error) {
         console.error('[Support] ticket detail error:', error.message);
         res.status(500).json({ error: 'Failed to load ticket' });
@@ -151,7 +221,7 @@ router.get('/tickets/:id', verifyCustomerPhone, async (req, res) => {
 });
 
 // ── Create ticket ──
-router.post('/tickets', verifyCustomerPhone, async (req, res) => {
+router.post('/tickets', verifyCustomerPhone, requireFullAccess, async (req, res) => {
     try {
         const b = req.body || {};
         if (!b.orderId || !b.reason || !b.sub) {
@@ -201,6 +271,31 @@ router.post('/tickets', verifyCustomerPhone, async (req, res) => {
             desc: b.desc || '',
             images: Array.isArray(b.images) ? b.images.slice(0, 6) : []
         });
+
+        // Bind any Cloudinary media the customer staged before the ticket
+        // existed (raise form) to the freshly-created ticket.
+        const mediaIds = Array.isArray(b.media_ids) ? b.media_ids.map(Number).filter(Boolean) : [];
+        if (mediaIds.length) {
+            if (mediaIds.length > supportMedia.MAX_PER_MESSAGE) {
+                return res.status(400).json({ error: `Only ${supportMedia.MAX_PER_MESSAGE} images per message` });
+            }
+            // The photos belong to the opening customer message, so stamp them
+            // onto that thread entry. The storefront renders the *filtered*
+            // thread, where positional indexes no longer line up — the entry's
+            // own media_ids list is the anchor it reads. thread_entry_idx is
+            // still written for the desk, which consumes the raw thread.
+            const created = await Support.getTicket(ticket.id);
+            const thread = Array.isArray(created.thread) ? created.thread : [];
+            let idx = thread.findIndex(m => m && m.kind !== 'event' && m.role === 'customer');
+            if (idx < 0) {
+                thread.push({ role: 'customer', text: '', at: Date.now() });
+                idx = thread.length - 1;
+            }
+            thread[idx] = Object.assign({}, thread[idx], { media_ids: mediaIds });
+            await Support.updateTicket(ticket.id, { thread, has_images: true });
+            await supportMedia.attachToTicket(mediaIds, { ticketRef: ticket.ticket_number, threadEntryIdx: idx });
+        }
+
         res.json({ ticket: { id: ticket.id, ticket_number: ticket.ticket_number, status: ticket.status } });
     } catch (error) {
         console.error('[Support] create ticket error:', error.message);
@@ -209,7 +304,7 @@ router.post('/tickets', verifyCustomerPhone, async (req, res) => {
 });
 
 // ── Customer reply ──
-router.post('/tickets/:id/messages', verifyCustomerPhone, async (req, res) => {
+router.post('/tickets/:id/messages', verifyCustomerPhone, requireFullAccess, async (req, res) => {
     try {
         const t = await Support.getTicket(req.params.id);
         if (!t || t.customer_phone !== req.customerPhone) {
@@ -219,15 +314,27 @@ router.post('/tickets/:id/messages', verifyCustomerPhone, async (req, res) => {
             return res.status(400).json({ error: 'Ticket is closed. Reopen it to reply.' });
         }
         const text = String((req.body && req.body.text) || '').trim().slice(0, 5000);
-        if (!text) return res.status(400).json({ error: 'Message is empty' });
+        const mediaIds = Array.isArray(req.body && req.body.media_ids) ? req.body.media_ids : [];
+        if (!text && !mediaIds.length) return res.status(400).json({ error: 'Message is empty' });
+        if (mediaIds.length > supportMedia.MAX_PER_MESSAGE) {
+            return res.status(400).json({ error: `Only ${supportMedia.MAX_PER_MESSAGE} images per message` });
+        }
         const thread = Array.isArray(t.thread) ? t.thread : [];
-        thread.push({ role: 'customer', text, at: Date.now() });
+        const entry = { role: 'customer', text, at: Date.now() };
+        if (mediaIds.length) entry.media_ids = mediaIds.map(Number).filter(Boolean);
+        const entryIdx = thread.length;
+        thread.push(entry);
         const updated = await Support.updateTicket(t.id, {
             thread,
             status: t.status === 'awaiting' ? 'open' : t.status,
+            has_images: mediaIds.length ? true : t.has_images,
             last_customer_at: new Date().toISOString(),
             updated_at: new Date().toISOString()
         });
+        // Flip staged media to 'sent' and point it back at this thread entry.
+        if (mediaIds.length) {
+            await supportMedia.attachToMessage(mediaIds, { threadEntryIdx: entryIdx });
+        }
         res.json({ ticket: publicTicket(updated) });
     } catch (error) {
         console.error('[Support] customer reply error:', error.message);
@@ -258,7 +365,7 @@ router.patch('/tickets/:id/csat', verifyCustomerPhone, async (req, res) => {
 });
 
 // ── Reopen (within 7 days of resolution, once) ──
-router.post('/tickets/:id/reopen', verifyCustomerPhone, async (req, res) => {
+router.post('/tickets/:id/reopen', verifyCustomerPhone, requireFullAccess, async (req, res) => {
     try {
         const t = await Support.getTicket(req.params.id);
         if (!t || t.customer_phone !== req.customerPhone) {
@@ -287,7 +394,9 @@ router.post('/tickets/:id/reopen', verifyCustomerPhone, async (req, res) => {
 });
 
 // ── Image upload (Cloudinary) — returns URLs the create call references ──
-router.post('/upload', verifyCustomerPhone, upload.array('images', 3), async (req, res) => {
+// Legacy server-proxy path. Kept for any caller that has not migrated to
+// the signed direct-upload flow below; new UI uses /media/intent.
+router.post('/upload', verifyCustomerPhone, requireFullAccess, upload.array('images', 3), async (req, res) => {
     try {
         const urls = [];
         for (const file of (req.files || [])) {
@@ -302,6 +411,62 @@ router.post('/upload', verifyCustomerPhone, upload.array('images', 3), async (re
     } catch (error) {
         console.error('[Support] upload error:', error.message);
         res.status(500).json({ error: 'Upload failed' });
+    }
+});
+
+// ============================================================
+// Signed browser direct-upload (Cloudinary) — customer surface
+// ============================================================
+
+// 1. Ask for permission to upload one image. Returns a media row id and
+//    the signed params the browser POSTs straight to Cloudinary.
+router.post('/media/intent', verifyCustomerPhone, requireFullAccess, async (req, res) => {
+    try {
+        if (!supportCloudinary.isConfigured()) {
+            return res.status(503).json({ error: 'Image upload is not configured' });
+        }
+        const b = req.body || {};
+        const intent = await supportMedia.createIntent({
+            channel: 'website',
+            ticketRef: b.ticket_ref || null,
+            direction: 'incoming',
+            actor: req.customerPhone
+        });
+        res.json(intent);
+    } catch (error) {
+        console.error('[Support] media intent error:', error.message);
+        res.status(500).json({ error: 'Failed to start upload' });
+    }
+});
+
+// 2. Confirm the browser finished uploading — server verifies the asset
+//    really landed in our Cloudinary before marking it uploaded.
+router.post('/media/:id/finalize', verifyCustomerPhone, requireFullAccess, async (req, res) => {
+    try {
+        const row = await supportMedia.getById(req.params.id);
+        if (!row || row.actor !== req.customerPhone) {
+            return res.status(404).json({ error: 'Media not found' });
+        }
+        const updated = await supportMedia.finalize({ mediaId: row.id });
+        res.json({ media: supportMedia.publicView(updated) });
+    } catch (error) {
+        console.error('[Support] media finalize error:', error.message);
+        res.status(400).json({ error: error.message || 'Failed to confirm upload' });
+    }
+});
+
+// 3. Retry a failed upload — re-issues signed params for the same row.
+router.post('/media/:id/retry', verifyCustomerPhone, requireFullAccess, async (req, res) => {
+    try {
+        const row = await supportMedia.getById(req.params.id);
+        if (!row || row.actor !== req.customerPhone) {
+            return res.status(404).json({ error: 'Media not found' });
+        }
+        const fresh = await supportMedia.retry({ mediaId: row.id });
+        res.json(fresh);
+    } catch (error) {
+        console.error('[Support] media retry error:', error.message);
+        res.status(400).json({ error: error.message || 'Failed to retry upload' });
     }
 });
 

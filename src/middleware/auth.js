@@ -162,6 +162,9 @@ const ROUTE_PERMISSIONS = [
     { prefix: '/inbox/export', key: 'export' },
     { prefix: '/shoppers/multi-orders', key: 'multi_orders' },
     { prefix: '/shoppers', key: 'shoppers' },
+    // Website item-change queue: anyone who can see shoppers can see the
+    // requests; apply/dismiss carry their own edit_orders guard.
+    { prefix: '/order-item-requests', key: ['shoppers', 'edit_orders'] },
     { prefix: '/chat', key: 'inbox' },
     { prefix: '/follow-up', key: 'follow_up' },
     { prefix: '/shipping', key: 'shipped' },
@@ -171,7 +174,10 @@ const ROUTE_PERMISSIONS = [
     { prefix: '/settings', key: null },
     { prefix: '/templates', key: null },
     { prefix: '/broadcast', key: null },
-    { prefix: '/support-portals', key: null },
+    // Support Desk agents get READ access to the portal engine (the desk
+    // settings mirror the Command dashboard); mutations + password reads are
+    // locked to the master admin by an extra guard in adminRoutes.
+    { prefix: '/support-portals', key: 'support_desk' },
     { prefix: '/support-tickets/send-image', key: 'send_messages' },
     { prefix: '/support-tickets', key: null },
     { prefix: '/ig-comments', key: null },

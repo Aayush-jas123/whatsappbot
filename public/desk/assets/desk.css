@@ -19,19 +19,39 @@
   --desk-hint: #9CA3AF;
   --radius: 12px;
   --radius-sm: 8px;
+
+  /* 2. Print-derived detail tokens. --hair rules are deliberately weaker
+        than --desk-border so structure (gutters, dividers, fill rules) never
+        competes with the boxes that hold content. */
+  --hair: rgba(17, 24, 39, 0.08);
+  --hair-strong: rgba(17, 24, 39, 0.16);
+  --mono: 'JetBrains Mono', ui-monospace, SFMono-Regular, Menlo, monospace;
 }
 
 * { box-sizing: border-box; }
 
 html, body {
+  height: 100%;
+}
+body {
   margin: 0;
   padding: 0;
-  background: var(--desk-bg);
+  background-color: var(--desk-bg);
+  /* Registration grid: hard-stop hairlines at 3% ink give the shell a
+     substrate to sit on. Flat lines only — no wash, no glow. */
+  background-image:
+    linear-gradient(to right, rgba(17, 24, 39, 0.03) 1px, transparent 1px),
+    linear-gradient(to bottom, rgba(17, 24, 39, 0.03) 1px, transparent 1px);
+  background-size: 28px 28px;
   color: var(--desk-ink);
   font-family: 'Archivo', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
   font-size: 14px;
   line-height: 1.45;
   -webkit-font-smoothing: antialiased;
+  /* Viewport-locked app shell: the page itself never scrolls. Only the
+     inner regions (queue list, conversation thread, context rail) do, so
+     expanding an order card can never drag the chat/composer down. */
+  overflow: hidden;
 }
 
 button, input, select, textarea {
@@ -189,9 +209,12 @@ button, input, select, textarea {
 
 /* ---------- shell & topbar ---------- */
 .desk-shell {
+  height: 100dvh;
   max-width: 1560px;
   margin: 0 auto;
-  padding: 12px 16px 36px;
+  padding: 12px 16px 14px;
+  display: flex;
+  flex-direction: column;
 }
 .desk-topbar {
   display: flex;
@@ -199,6 +222,7 @@ button, input, select, textarea {
   justify-content: space-between;
   gap: 14px;
   margin-bottom: 14px;
+  flex-shrink: 0;
   padding: 10px 18px;
   background: #111827;
   border: 1px solid #1F2937;
@@ -212,18 +236,15 @@ button, input, select, textarea {
   gap: 10px;
   flex-shrink: 0;
 }
-.desk-logo-mark {
-  width: 28px;
-  height: 28px;
-  background: #FFFFFF;
-  color: #111827;
-  font-size: 11px;
+.desk-wordmark {
+  font-size: 12px;
   font-weight: 800;
-  border-radius: 6px;
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  letter-spacing: .04em;
+  letter-spacing: .22em;
+  text-transform: uppercase;
+  color: #FFFFFF;
+  padding-right: 10px;
+  border-right: 1px solid rgba(255, 255, 255, 0.25);
+  white-space: nowrap;
 }
 .desk-topbar h1 {
   font-size: 15px;
@@ -287,6 +308,9 @@ button, input, select, textarea {
   background: rgba(255, 255, 255, 0.14);
   border-color: rgba(255, 255, 255, 0.25);
 }
+/* Clickable pill (Logins today → Settings ▸ Logins) */
+.desk-kpi-click { cursor: pointer; }
+.desk-kpi-click:hover .val { text-decoration: underline; }
 .desk-kpi-pill .lbl {
   color: #9CA3AF;
   text-transform: uppercase;
@@ -317,11 +341,15 @@ button, input, select, textarea {
 .desk-kpis { display: none; }
 
 /* ---------- main layout ---------- */
+/* Fills every pixel left under the topbar; columns manage their own
+   height so nothing below the fold gets pushed away. */
 .desk-main {
   display: grid;
   grid-template-columns: 360px minmax(0, 1fr);
   gap: 14px;
-  align-items: start;
+  align-items: stretch;
+  flex: 1;
+  min-height: 0;
 }
 @media (max-width: 1020px) {
   .desk-main { grid-template-columns: 1fr; }
@@ -330,14 +358,14 @@ button, input, select, textarea {
 }
 
 /* ---------- left queue panel ---------- */
+/* Head (tabs/search/filters) pinned; only .desk-list scrolls inside. */
 .desk-queue {
   background: var(--desk-card);
   border: 1px solid var(--desk-border);
   border-radius: var(--radius);
   overflow: hidden;
-  position: sticky;
-  top: 14px;
-  max-height: calc(100vh - 28px);
+  position: relative;
+  min-height: 0;
   display: flex;
   flex-direction: column;
   box-shadow: 0 1px 2px rgba(17, 24, 39, 0.02);
@@ -345,6 +373,7 @@ button, input, select, textarea {
 .desk-queue-head {
   padding: 10px 12px 0;
   background: var(--desk-card);
+  flex-shrink: 0;
 }
 .desk-tabs {
   display: flex;
@@ -440,7 +469,9 @@ button, input, select, textarea {
   overflow-y: auto;
   flex: 1;
   border-top: 1px solid var(--desk-border);
-  contain: content;
+  /* layout+paint keep the long-list perf win; `style`/`content` would scope
+     the row index counters to each row and break the numbering. */
+  contain: layout paint;
 }
 .desk-row {
   padding: 10px 13px;
@@ -454,7 +485,7 @@ button, input, select, textarea {
   flex-direction: column;
   gap: 3px;
   background: var(--desk-card);
-  contain: layout style;
+  contain: layout;
 }
 .desk-row:hover {
   background: var(--desk-card-sub);
@@ -612,6 +643,41 @@ button, input, select, textarea {
   border: 1px solid var(--desk-border);
 }
 
+/* --- PORTAL ATTRIBUTION (three weights, three meanings) ---
+   Solid fill: the portal stamped on the ticket row, i.e. its owner.
+   Dotted rule: a shift portal claims it by created time only, so the row is
+   still unowned and another distribution run can move it.
+   Dashed rule: no portal shows this ticket anywhere. */
+.pill-portal {
+  background: var(--desk-fill);
+  color: var(--desk-ink) !important;
+  border: 1px solid var(--desk-border-strong);
+  max-width: 130px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.pill-portal-shift {
+  background: #FFFFFF;
+  color: var(--desk-sub) !important;
+  border: 1px dotted var(--desk-border-strong);
+  max-width: 130px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.pill-portal-none {
+  background: #FFFFFF;
+  color: var(--desk-hint) !important;
+  border: 1px dashed var(--desk-border);
+}
+.desk-portal-note {
+  font-size: 10px;
+  font-weight: 600;
+  color: var(--desk-muted);
+  letter-spacing: .01em;
+}
+
 /* Generic desk-tag & desk-pill base */
 .desk-tag {
   font-size: 9.5px;
@@ -688,11 +754,17 @@ button, input, select, textarea {
 .dot-ok { background: var(--desk-muted); }
 
 /* ---------- detail workspace ---------- */
+/* The detail column is its own scroll region; the unified header stays
+   pinned while the context rail scrolls beneath it. */
 .desk-detail {
   display: flex;
   flex-direction: column;
   gap: 14px;
-  min-height: calc(100vh - 120px);
+  min-height: 0;
+  overflow-y: auto;
+  overflow-x: hidden;
+  padding-right: 2px;
+  scroll-behavior: smooth;
 }
 .desk-card {
   background: var(--desk-card);
@@ -700,7 +772,7 @@ button, input, select, textarea {
   border-radius: var(--radius);
   padding: 16px 18px;
   box-shadow: 0 1px 2px rgba(17, 24, 39, 0.02);
-  contain: layout style;
+  contain: layout;
 }
 .desk-card h3 {
   margin: 0 0 10px;
@@ -730,7 +802,11 @@ button, input, select, textarea {
   text-transform: uppercase;
   color: var(--desk-ink);
 }
-.desk-head-icon { font-size: 14px; color: var(--desk-ink); }
+.desk-head-icon { display: inline-flex; align-items: center; justify-content: center; color: var(--desk-ink); }
+/* Stroke icons inherit currentColor; nudge inline glyphs onto the text baseline */
+.desk-section-subhead svg, .desk-tip svg, .desk-kv .v svg, .desk-note-header svg,
+.desk-approve-head .badge svg, .desk-bubble-detail svg, .desk-mode svg,
+.desk-orow-chev svg, .desk-collapse-arrow svg, .desk-sub-section-title svg { vertical-align: middle; }
 .desk-empty-detail {
   padding: 60px 20px;
   text-align: center;
@@ -740,8 +816,11 @@ button, input, select, textarea {
   background: var(--desk-card);
 }
 
-/* 1. Unified Ticket Header */
+/* 1. Unified Ticket Header — pinned while the detail column scrolls */
 .desk-unified-head {
+  position: sticky;
+  top: 0;
+  z-index: 6;
   background: var(--desk-card);
   border: 1px solid var(--desk-border);
   border-radius: var(--radius);
@@ -835,19 +914,22 @@ button, input, select, textarea {
   font-size: 12px;
 }
 
-/* 2. Reorganized Main Workspace Split (Action Col vs Context Col) */
+/* 2. Reorganized Main Workspace Split (Action Col vs Context Col).
+   Under 1240px the split stacks, so let the columns size to content and
+   the detail scroll region handles the overflow. */
 .desk-workspace-split {
   display: grid;
   grid-template-columns: 1.25fr 1fr;
   gap: 14px;
   align-items: stretch;
-  flex: 1;
+  flex: 1 1 auto;
+  min-height: 0;
 }
 @media (max-width: 1240px) {
   .desk-workspace-split {
     grid-template-columns: 1fr;
     align-items: start;
-    flex: initial;
+    flex: 0 0 auto;
   }
 }
 .desk-action-col {
@@ -855,13 +937,34 @@ button, input, select, textarea {
   flex-direction: column;
   gap: 14px;
   min-width: 0;
+  min-height: 0;
   height: 100%;
 }
+/* Context rail scrolls within its own column: expanding an order card
+   grows the rail internally instead of stretching the row and dragging
+   the conversation/composer down the page. */
 .desk-context-col {
   display: flex;
   flex-direction: column;
   gap: 14px;
   min-width: 0;
+  min-height: 0;
+  overflow-y: auto;
+  overflow-x: hidden;
+  padding: 2px 6px 8px 2px;
+  margin-right: -4px;
+  scroll-behavior: smooth;
+  scrollbar-width: thin;
+  scrollbar-color: var(--desk-border-strong) transparent;
+}
+/* Rail cards keep their natural height so the rail is what overflows.
+   Flex items shrink by default, and a card whose own overflow is not
+   `visible` (the order/customer cards use hidden for the collapse
+   animation) loses its automatic min-height floor entirely — the three
+   cards were squeezed into the rail, clipping Order History to ~114px of
+   ~775px content while the rail reported nothing to scroll. */
+.desk-context-col > * {
+  flex-shrink: 0;
 }
 
 /* ---------- Customer Info Card (Collapsible Animation) ---------- */
@@ -1381,6 +1484,13 @@ button, input, select, textarea {
 }
 .history-main { display: flex; align-items: center; gap: 8px; }
 .history-id { font-family: 'JetBrains Mono', monospace; font-weight: 700; font-size: 12px; color: var(--desk-ink); }
+
+/* Order ids that deep-link into the Shoppers Hub: inherit the text look,
+   reveal the link only on hover so the rail stays monochrome-clean. */
+.desk-orderext { color: inherit; text-decoration: none; cursor: pointer; }
+.desk-orderext:hover .history-id,
+.desk-orderext:hover .desk-order-chip { text-decoration: underline; text-underline-offset: 3px; text-decoration-thickness: 1px; }
+.desk-orderext:focus-visible { outline: 1px solid var(--desk-ink); outline-offset: 2px; }
 .highlight-tag {
   background: var(--desk-ink);
   color: #FFFFFF;
@@ -1392,6 +1502,80 @@ button, input, select, textarea {
 }
 .history-sub { font-size: 12px; color: var(--desk-muted); font-family: 'JetBrains Mono', monospace; }
 .history-total { font-weight: 700; color: var(--desk-ink); }
+
+/* ---------- Expandable Order Rows (ticket order first, details inline) ---------- */
+.desk-orow {
+  background: var(--desk-card-sub);
+  border: 1px solid var(--desk-border);
+  border-radius: var(--radius-sm);
+  overflow: hidden;
+  transition: border-color .15s ease;
+}
+.desk-orow:hover { border-color: var(--desk-border-strong); }
+.desk-orow.ticket-order {
+  background: var(--desk-fill);
+  border-color: var(--desk-border-strong);
+}
+.desk-orow-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 9px 12px;
+  cursor: pointer;
+  user-select: none;
+  flex-wrap: wrap;
+  font-size: 12.5px;
+}
+.desk-orow-head:hover { background: rgba(17, 24, 39, 0.04); }
+.desk-orow-spacer { flex: 1 1 auto; }
+.desk-orow-chev {
+  display: inline-flex;
+  color: var(--desk-sub);
+  transition: transform .2s ease;
+}
+.desk-orow.open .desk-orow-chev { transform: rotate(180deg); }
+.desk-orow-detail {
+  border-top: 1px dashed var(--desk-border-strong);
+  background: var(--desk-card);
+  padding: 12px 14px;
+}
+
+/* ---------- Lazy context column: skeleton + error ---------- */
+.desk-ctx-skeleton {
+  padding: 18px;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+.desk-ctx-skeleton .sk-line {
+  height: 12px;
+  border-radius: 6px;
+  background: var(--desk-fill);
+  animation: deskSkPulse 1.2s ease-in-out infinite;
+}
+.desk-ctx-skeleton .sk-block {
+  height: 64px;
+  border-radius: var(--radius-sm);
+  background: var(--desk-fill);
+  animation: deskSkPulse 1.2s ease-in-out infinite;
+}
+.desk-ctx-skeleton .sk-block.tall { height: 128px; }
+.desk-ctx-skeleton .sk-note {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 11.5px;
+  font-weight: 600;
+  color: var(--desk-muted);
+}
+@keyframes deskSkPulse { 0%, 100% { opacity: 1; } 50% { opacity: .45; } }
+.desk-ctx-error {
+  padding: 18px;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  align-items: flex-start;
+}
 
 /* ---------- Issue Details Card ---------- */
 .desk-desc-callout {
@@ -1457,11 +1641,24 @@ button, input, select, textarea {
   background: rgba(17, 24, 39, 0.75);
   color: #FFFFFF;
   font-size: 10px;
-  padding: 2px 4px;
+  padding: 3px;
   border-radius: 4px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
 }
 
 /* Action Approval Panel */
+.req-note {
+  background: var(--desk-card-sub);
+  border: 1px dashed var(--desk-border-strong);
+  border-radius: var(--radius-sm);
+  padding: 8px 12px;
+  margin-bottom: 10px;
+  font-size: 12px;
+  color: var(--desk-sub);
+}
+.req-note:empty { display: none; }
 .desk-approve {
   border: 1px solid var(--desk-border-strong);
   background: var(--desk-card-sub);
@@ -1607,13 +1804,21 @@ button, input, select, textarea {
 }
 
 /* ---------- Interactive Conversation Feed ---------- */
+/* Under the fixed shell the card simply fills its column and the thread
+   scrolls internally; the old 580px floor was what pushed the composer
+   below the fold on short viewports. */
 .desk-merged-card {
   display: flex;
   flex-direction: column;
   padding: 20px 22px;
   flex: 1;
-  min-height: 580px;
-  height: 100%;
+  min-height: 0;
+  /* The thread has a 180px floor and the issue block cannot shrink, so on a
+     short viewport the card's minimum content exceeds its column: without
+     this the tail painted past the card border (measured 119px of spill).
+     Scrolling the card keeps the composer reachable instead of overflowing. */
+  overflow-x: hidden;
+  overflow-y: auto;
 }
 .desk-thread-wrap {
   margin-top: 14px;
@@ -2063,6 +2268,41 @@ button, input, select, textarea {
 }
 
 /* Toast notification */
+/* ---------- portal engine tabs (Portals & Shifts / Distribution / Analytics) ---------- */
+.desk-set-sec { font-size: 11px; font-weight: 800; text-transform: uppercase; letter-spacing: .06em; color: var(--desk-ink); margin: 18px 0 8px; padding-top: 14px; border-top: 1px solid var(--desk-border); }
+.desk-set-sec:first-of-type { border-top: none; padding-top: 0; }
+.desk-form-grid select { width: 100%; padding: 9px 11px; border: 1px solid var(--desk-border); border-radius: 9px; font-size: 13px; background: #fff; font-family: inherit; }
+.desk-tblwrap { overflow-x: auto; }
+.desk-tbl { width: 100%; border-collapse: collapse; font-size: 12.5px; }
+.desk-tbl th { text-align: left; font-size: 10.5px; text-transform: uppercase; letter-spacing: .05em; color: var(--desk-muted); padding: 6px 8px; border-bottom: 1px solid var(--desk-border); white-space: nowrap; }
+.desk-tbl td { padding: 7px 8px; border-bottom: 1px solid #f0f0ed; vertical-align: middle; }
+.desk-tbl td.num, .desk-tbl th.num { text-align: right; }
+.desk-tbl td.acts { white-space: nowrap; text-align: right; }
+.desk-tbl .acts .desk-btn-plain { padding: 3px 6px; font-size: 11px; }
+.desk-btn-plain.danger { color: var(--desk-ink); font-weight: 800; text-decoration: underline; }
+.desk-util { display: flex; align-items: center; gap: 6px; }
+.desk-util .track { display: block; width: 52px; height: 6px; background: #efefec; border-radius: 3px; }
+.desk-util i { display: block; height: 6px; background: var(--desk-ink); border-radius: 3px; max-width: 100%; }
+.desk-chips { display: flex; gap: 8px; flex-wrap: wrap; margin-bottom: 6px; }
+.desk-chip { border: 1px solid var(--desk-border); border-radius: 10px; padding: 8px 13px; background: #fafaf8; }
+.desk-chip b { display: block; font-size: 17px; }
+.desk-chip span { font-size: 10.5px; text-transform: uppercase; letter-spacing: .05em; color: var(--desk-muted); }
+.desk-hours { display: flex; align-items: flex-end; gap: 2px; height: 64px; margin-bottom: 2px; }
+.desk-hours .b { flex: 1; background: var(--desk-ink); border-radius: 2px 2px 0 0; min-height: 2px; opacity: .85; }
+.desk-hours-x { display: flex; justify-content: space-between; font-size: 10px; color: var(--desk-hint); margin-bottom: 10px; }
+/* Logins tab: daily bars (count above, MM-DD below), same ink language as .desk-hours */
+.desk-login-bars { display: flex; align-items: flex-end; gap: 4px; height: 96px; margin-bottom: 2px; }
+.desk-login-bar { flex: 1; display: flex; flex-direction: column; align-items: center; justify-content: flex-end; height: 100%; min-width: 0; gap: 2px; }
+.desk-login-bar .bar { width: 100%; max-width: 26px; background: var(--desk-ink); border-radius: 3px 3px 0 0; min-height: 2px; opacity: .85; }
+.desk-login-bar .n { font-family: 'JetBrains Mono', monospace; font-size: 10px; font-weight: 700; color: var(--desk-ink); }
+.desk-login-bar .x { font-size: 9.5px; color: var(--desk-hint); white-space: nowrap; overflow: hidden; }
+.desk-check { display: inline-flex; align-items: center; gap: 7px; font-size: 12.5px; margin: 2px 14px 2px 0; }
+.desk-shift-row { display: flex; gap: 6px; align-items: center; margin-bottom: 6px; flex-wrap: wrap; }
+.desk-shift-row input { padding: 8px 10px; border: 1px solid var(--desk-border); border-radius: 8px; font-size: 12.5px; }
+.desk-shift-row input[data-s="name"] { flex: 1; min-width: 110px; }
+.desk-ro-note { background: var(--desk-fill); border: 1px solid var(--desk-border-strong); border-radius: 10px; padding: 9px 12px; font-size: 12px; margin-bottom: 10px; }
+.desk-tbl a, .desk-set-item a { color: var(--desk-ink); font-weight: 700; }
+
 .desk-toast {
   position: fixed;
   bottom: 22px;
@@ -2072,11 +2312,13 @@ button, input, select, textarea {
   color: #FFFFFF;
   font-size: 13px;
   font-weight: 600;
-  padding: 10px 18px;
-  border-radius: 999px;
+  padding: 10px 16px;
+  border-radius: 8px;
   z-index: 400;
-  box-shadow: 0 8px 24px rgba(17, 24, 39, 0.25);
-  border: 1px solid #374151;
+  box-shadow: 0 1px 0 rgba(17, 24, 39, 0.10), 0 10px 22px rgba(17, 24, 39, 0.16);
+  border: 1px solid #1F2937;
+  letter-spacing: .01em;
+  animation: deskToastMove .28s cubic-bezier(.22, 1, .36, 1) both;
 }
 .desk-toast.err {
   background: var(--desk-ink);
@@ -2104,3 +2346,843 @@ button, input, select, textarea {
   margin-right: 8px;
 }
 @keyframes deskspin { to { transform: rotate(360deg); } }
+
+/* ============================================================
+   Motion layer — monochrome entrance, hover and overlay polish.
+   Only opacity/transform animate (paint/compositor friendly);
+   every effect is disabled under prefers-reduced-motion below.
+   ============================================================ */
+@keyframes deskRise { from { opacity: 0; transform: translateY(10px); } to { opacity: 1; transform: none; } }
+@keyframes deskSlideIn { from { opacity: 0; transform: translateX(-8px); } to { opacity: 1; transform: none; } }
+@keyframes deskBubbleIn { from { opacity: 0; transform: translateY(8px) scale(.985); } to { opacity: 1; transform: none; } }
+@keyframes deskOverlayIn { from { opacity: 0; } to { opacity: 1; } }
+@keyframes deskModalIn { from { opacity: 0; transform: translateY(14px) scale(.98); } to { opacity: 1; transform: none; } }
+@keyframes deskToastMove { from { opacity: 0; transform: translate(-50%, 14px); } to { opacity: 1; transform: translate(-50%, 0); } }
+@keyframes deskRowFlash { 0% { background: var(--desk-fill-hover); } 100% { background: var(--desk-fill); } }
+
+/* Ticket selection: the re-rendered workspace cards settle in with a
+   staggered rise. Only this cluster animates — the queue list and the
+   lazy context rail keep their own rhythms so a mode switch mid-thread
+   never re-plays the whole page. */
+.desk-workspace-split > .desk-action-col,
+.desk-workspace-split > .desk-context-col > .desk-card,
+.desk-workspace-split > .desk-context-col > .desk-customer-info-card,
+.desk-workspace-split > .desk-context-col > .desk-order-card { animation: deskRise .34s cubic-bezier(.22, 1, .36, 1) both; }
+.desk-context-col > *:nth-child(2) { animation-delay: .05s; }
+.desk-context-col > *:nth-child(3) { animation-delay: .09s; }
+
+/* Queue rows fan in top-down (first 14 only) on every list render */
+.desk-list > .desk-row:nth-child(-n+14) { animation: deskSlideIn .3s cubic-bezier(.22, 1, .36, 1) both; }
+.desk-list > .desk-row:nth-child(2)  { animation-delay: .025s; }
+.desk-list > .desk-row:nth-child(3)  { animation-delay: .05s; }
+.desk-list > .desk-row:nth-child(4)  { animation-delay: .075s; }
+.desk-list > .desk-row:nth-child(5)  { animation-delay: .1s; }
+.desk-list > .desk-row:nth-child(6)  { animation-delay: .125s; }
+.desk-list > .desk-row:nth-child(7)  { animation-delay: .15s; }
+.desk-list > .desk-row:nth-child(8)  { animation-delay: .175s; }
+.desk-list > .desk-row:nth-child(9)  { animation-delay: .2s; }
+.desk-list > .desk-row:nth-child(10) { animation-delay: .225s; }
+.desk-list > .desk-row:nth-child(11) { animation-delay: .25s; }
+.desk-list > .desk-row:nth-child(12) { animation-delay: .275s; }
+.desk-list > .desk-row:nth-child(13) { animation-delay: .3s; }
+.desk-list > .desk-row:nth-child(14) { animation-delay: .325s; }
+
+/* Chat bubbles glide in when a thread mounts */
+.desk-thread .desk-msg-row, .desk-thread .desk-ev { animation: deskBubbleIn .3s ease both; }
+
+/* Selected row gets a one-shot ink wash under the left rail */
+.desk-row.selected { animation: deskRowFlash .5s ease; }
+
+/* Hover depth: a crisp ink edge instead of a lift. Panels are read-only
+   surfaces here, so they register the pointer without floating. */
+.desk-card,
+.desk-customer-info-card,
+.desk-order-card { transition: border-color .15s ease, box-shadow .15s ease; }
+.desk-card:hover,
+.desk-customer-info-card:hover,
+.desk-order-card:hover { box-shadow: 0 1px 0 var(--hair); border-color: var(--desk-ink); }
+.desk-ci-stat-tile,
+.desk-stat-tile { transition: border-color .15s ease, background .15s ease; }
+.desk-ci-stat-tile:hover,
+.desk-stat-tile:hover { border-color: var(--desk-ink); background: var(--desk-card); }
+.desk-history-row { transition: border-color .12s ease, transform .12s ease, background .12s ease; }
+.desk-history-row:hover { transform: translateX(2px); }
+
+/* Collapsible bodies: ease tuned for a weighted, professional settle */
+.desk-customer-body,
+.desk-order-body { transition: max-height .42s cubic-bezier(.33, 1, .68, 1), opacity .28s ease, padding .42s cubic-bezier(.33, 1, .68, 1); }
+
+/* Slim monochrome scrollbars on every inner scroll region */
+.desk-detail::-webkit-scrollbar,
+.desk-context-col::-webkit-scrollbar,
+.desk-thread::-webkit-scrollbar { width: 8px; }
+.desk-detail::-webkit-scrollbar-track,
+.desk-context-col::-webkit-scrollbar-track,
+.desk-thread::-webkit-scrollbar-track { background: transparent; }
+.desk-detail::-webkit-scrollbar-thumb,
+.desk-context-col::-webkit-scrollbar-thumb { background: var(--desk-border-strong); border-radius: 999px; border: 2px solid var(--desk-bg); }
+.desk-detail::-webkit-scrollbar-thumb:hover,
+.desk-context-col::-webkit-scrollbar-thumb:hover { background: var(--desk-muted); }
+
+/* Overlays fade, dialogs settle */
+.desk-modal-overlay { animation: deskOverlayIn .18s ease both; }
+.desk-modal { animation: deskModalIn .3s cubic-bezier(.22, 1, .36, 1) both; }
+.desk-lightbox { animation: deskOverlayIn .2s ease both; }
+.desk-lightbox img { animation: deskModalIn .28s cubic-bezier(.22, 1, .36, 1) both; }
+
+/* ============================================================
+   Detail layer — structure drawn with geometry: index gutters,
+   ruled section heads, hairline dividers, tabular figure columns
+   and corner registration ticks. Adds no colour, no glow, no
+   surface effect — the OFFCOMFRT print vocabulary only.
+   ============================================================ */
+
+/* ---------- 0. Primitives ---------- */
+::selection { background: var(--desk-ink); color: #FFFFFF; }
+input, textarea { caret-color: var(--desk-ink); }
+.desk-row:focus-visible,
+.desk-tab:focus-visible,
+.desk-mode:focus-visible,
+.desk-btn:focus-visible,
+.desk-btn-plain:focus-visible,
+.desk-btn-ci-solid:focus-visible,
+.desk-btn-ci-outline:focus-visible,
+.desk-select:focus-visible {
+  outline: 1px solid var(--desk-ink);
+  outline-offset: 2px;
+}
+.desk-topbar .desk-btn-plain:focus-visible { outline-color: #FFFFFF; }
+
+/* ---------- 1. Queue panel ---------- */
+/* Labelled head, then a numbered index gutter down the whole list so the
+   queue reads as a printed docket rather than a stack of cards. */
+.desk-queue-head::before {
+  content: 'TICKET QUEUE';
+  display: block;
+  font-family: var(--mono);
+  font-size: 9.5px;
+  font-weight: 700;
+  letter-spacing: .18em;
+  color: var(--desk-hint);
+  padding-bottom: 9px;
+  margin-bottom: 9px;
+  border-bottom: 1px solid var(--hair);
+}
+.desk-search {
+  padding-left: 28px;
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='12' viewBox='0 0 24 24' fill='none' stroke='%236B7280' stroke-width='2' stroke-linecap='round'%3E%3Ccircle cx='11' cy='11' r='7'/%3E%3Cpath d='M20 20l-4.3-4.3'/%3E%3C/svg%3E");
+  background-repeat: no-repeat;
+  background-position: 10px center;
+}
+.desk-list { counter-reset: desk-row; scrollbar-width: thin; scrollbar-color: var(--desk-border-strong) transparent; }
+.desk-row { counter-increment: desk-row; padding-left: 40px; }
+.desk-row::before {
+  content: counter(desk-row, decimal-leading-zero);
+  position: absolute;
+  left: 14px;
+  top: 12px;
+  font-family: var(--mono);
+  font-size: 9.5px;
+  font-weight: 500;
+  letter-spacing: .02em;
+  color: var(--desk-hint);
+}
+.desk-row::after {
+  content: '';
+  position: absolute;
+  left: 32px;
+  top: 10px;
+  bottom: 10px;
+  width: 1px;
+  background: var(--hair);
+}
+.desk-row.selected::before { color: var(--desk-ink); font-weight: 700; }
+.desk-row.selected::after { background: var(--hair-strong); }
+.desk-list::-webkit-scrollbar { width: 8px; }
+.desk-list::-webkit-scrollbar-track { background: transparent; }
+.desk-list::-webkit-scrollbar-thumb {
+  background: var(--desk-border-strong);
+  border-radius: 999px;
+  border: 2px solid var(--desk-card);
+}
+.desk-list::-webkit-scrollbar-thumb:hover { background: var(--desk-muted); }
+
+/* ---------- 2. Ruled section heads with index chips ---------- */
+/* One increment site per card (the card itself); the title's ::before only
+   reads the counter, otherwise every section number would advance by two. */
+.desk-workspace-split { counter-reset: desk-sec; }
+.desk-workspace-split .desk-card { counter-increment: desk-sec; }
+.desk-card-head > .desk-card-title { flex: 1 1 auto; min-width: 0; }
+.desk-card > .desk-card-head .desk-card-title::before {
+  content: counter(desk-sec, decimal-leading-zero);
+  flex: none;
+  font-family: var(--mono);
+  font-size: 9px;
+  font-weight: 700;
+  line-height: 1.4;
+  letter-spacing: .02em;
+  color: var(--desk-sub);
+  background: #FFFFFF;
+  border: 1px solid var(--desk-border-strong);
+  border-radius: 4px;
+  padding: 0 4px;
+}
+/* The rule that runs out to the card edge is what makes the head a head. */
+.desk-card > .desk-card-head .desk-card-title::after {
+  content: '';
+  flex: 1 1 20px;
+  min-width: 14px;
+  height: 1px;
+  align-self: center;
+  background: var(--desk-border);
+}
+.desk-head-icon {
+  width: 21px;
+  height: 21px;
+  flex: none;
+  border: 1px solid var(--desk-border);
+  border-radius: 5px;
+  background: var(--desk-card-sub);
+}
+.desk-section-subhead::before,
+.desk-sub-section-title::before {
+  content: '';
+  display: inline-block;
+  width: 14px;
+  height: 2px;
+  margin-right: 8px;
+  vertical-align: middle;
+  background: var(--desk-ink);
+}
+
+/* ---------- 3. Ticket header ---------- */
+/* Corner registration ticks frame the pinned header. */
+.desk-unified-head::before,
+.desk-unified-head::after {
+  content: '';
+  position: absolute;
+  width: 9px;
+  height: 9px;
+  pointer-events: none;
+}
+.desk-unified-head::before {
+  top: 5px;
+  left: 5px;
+  border-top: 1px solid var(--desk-border-strong);
+  border-left: 1px solid var(--desk-border-strong);
+}
+.desk-unified-head::after {
+  bottom: 5px;
+  right: 5px;
+  border-bottom: 1px solid var(--desk-border-strong);
+  border-right: 1px solid var(--desk-border-strong);
+}
+.desk-ticket-tag {
+  background: var(--desk-ink);
+  border-color: var(--desk-ink);
+  color: #FFFFFF;
+}
+.desk-head-num {
+  line-height: 1.15;
+  padding-bottom: 1px;
+  border-bottom: 2px solid var(--desk-ink);
+}
+.desk-unified-head-meta { padding: 9px 14px; gap: 14px; }
+.desk-meta-item { font-variant-numeric: tabular-nums; }
+.desk-meta-item + .desk-meta-item {
+  border-left: 1px solid var(--hair-strong);
+  padding-left: 14px;
+}
+
+/* ---------- 4. Conversation thread ---------- */
+.desk-thread { row-gap: 16px; }
+.desk-msg-bubble {
+  border-radius: 10px;
+  box-shadow: none;
+  letter-spacing: .005em;
+}
+.desk-msg-bubble.cust-bubble { border-top-left-radius: 2px; }
+.desk-msg-bubble.agent-bubble {
+  border-top-right-radius: 2px;
+  box-shadow: none;
+}
+/* Square hairline avatars: monogram plates, not profile bubbles. */
+.desk-chat-avatar {
+  width: 34px;
+  height: 34px;
+  border-radius: 7px;
+  font-family: var(--mono);
+  font-size: 11.5px;
+  letter-spacing: 0;
+}
+.desk-chat-avatar.agent { border: 1px solid var(--desk-ink); }
+.desk-msg-sender .sender-time { letter-spacing: .02em; }
+/* Audit lines become ruled dividers carrying their own label. */
+.desk-ev:not(.desk-ev-closed) {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  width: 100%;
+  padding: 0;
+  background: none;
+  border: none;
+  border-radius: 0;
+  font-family: var(--mono);
+  font-size: 9.5px;
+  font-weight: 600;
+  letter-spacing: .06em;
+  text-transform: uppercase;
+  color: var(--desk-muted);
+}
+.desk-ev:not(.desk-ev-closed)::before,
+.desk-ev:not(.desk-ev-closed)::after {
+  content: '';
+  flex: 1;
+  height: 1px;
+  background: var(--desk-border);
+}
+.desk-ev .ev-dot { display: none; }
+.desk-ev-closed {
+  font-size: 12px;
+  letter-spacing: .01em;
+  border-color: var(--desk-border-strong);
+}
+.desk-csat-stars { letter-spacing: 2px; }
+
+/* ---------- 5. Composer ---------- */
+/* Modes join into one segmented control: single outer frame, hairline
+   joins between segments, ink fill marks the active one. Scoped to the
+   composer because the settings modal reuses .desk-mode as loose tabs. */
+.desk-composer-modes {
+  gap: 0;
+  border: 1px solid var(--desk-border);
+  border-radius: var(--radius-sm);
+  background: var(--desk-card);
+  overflow: hidden;
+}
+.desk-composer-modes .desk-mode {
+  border: none;
+  border-right: 1px solid var(--desk-border);
+  border-radius: 0;
+  background: transparent;
+}
+.desk-composer-modes .desk-mode:last-child { border-right: none; }
+.desk-composer-modes .desk-mode.active { background: var(--desk-ink); }
+/* Settings tabs stay loose but get an ink underline for the active panel. */
+.desk-set-nav .desk-mode { position: relative; }
+.desk-set-nav .desk-mode.active::after {
+  content: '';
+  position: absolute;
+  left: 10px;
+  right: 10px;
+  bottom: -1px;
+  height: 2px;
+  background: var(--desk-ink);
+}
+.desk-composer-textarea {
+  line-height: 1.55;
+  border-color: var(--desk-border-strong);
+}
+.desk-composer-textarea::placeholder { color: var(--desk-hint); font-style: italic; }
+
+/* ---------- 6. Numeric columns ---------- */
+/* Totals and dates align on the right so each order row scans as a
+   ledger line instead of a sentence. */
+.desk-orow-head,
+.desk-history-row { font-variant-numeric: tabular-nums; }
+.desk-orow-head .history-date {
+  font-family: var(--mono);
+  font-size: 11px;
+  color: var(--desk-muted);
+  min-width: 104px;
+  text-align: right;
+}
+.history-total {
+  font-family: var(--mono);
+  font-size: 12px;
+  min-width: 78px;
+  text-align: right;
+}
+.desk-orow { transition: border-color .15s ease, background .15s ease; }
+.desk-orow.ticket-order { box-shadow: inset 3px 0 0 var(--desk-ink); }
+.desk-orow-detail { font-variant-numeric: tabular-nums; }
+
+/* ---------- 7. Tables, proofs and figures ---------- */
+.desk-items th,
+.desk-econ th { font-family: var(--mono); font-weight: 500; letter-spacing: .08em; }
+.desk-items th { border-bottom: 1px solid var(--desk-border-strong); }
+.desk-items tbody tr { transition: background .12s ease; }
+.desk-items tbody tr:hover { background: var(--desk-card-sub); }
+.desk-items td.num,
+.desk-econ td.cost { font-variant-numeric: tabular-nums; }
+/* Attachment index plates: numbered in DOM order, counters only. */
+.desk-imggrid { counter-reset: desk-proof; }
+.desk-proof-thumb { counter-increment: desk-proof; }
+.desk-proof-thumb::before {
+  content: counter(desk-proof, decimal-leading-zero);
+  position: absolute;
+  top: 4px;
+  left: 4px;
+  z-index: 1;
+  font-family: var(--mono);
+  font-size: 9px;
+  font-weight: 700;
+  color: #FFFFFF;
+  background: rgba(17, 24, 39, 0.78);
+  border-radius: 3px;
+  padding: 1px 4px;
+  line-height: 1.3;
+}
+.desk-proof-thumb { transition: transform .15s ease, border-color .15s ease, box-shadow .15s ease; }
+.desk-proof-thumb:hover { border-color: var(--desk-ink); box-shadow: 0 1px 0 var(--hair); transform: none; }
+.desk-mono,
+.history-sub { font-variant-numeric: tabular-nums; }
+
+/* ---------- 8. Passives: empty states, skeletons, dialogs ---------- */
+.desk-empty-detail {
+  padding: 56px 24px;
+  border-color: var(--desk-border-strong);
+}
+.desk-empty-detail::before {
+  content: '';
+  display: block;
+  width: 28px;
+  height: 1px;
+  margin: 0 auto 14px;
+  background: var(--desk-border-strong);
+}
+.desk-ctx-skeleton .sk-line,
+.desk-ctx-skeleton .sk-block {
+  background: var(--desk-card-sub);
+  border: 1px solid var(--hair);
+}
+.desk-modal-head { background: var(--desk-card-sub); }
+
+/* ---------- 9. Login card ---------- */
+.desk-login-card {
+  position: relative;
+  border-color: var(--desk-border-strong);
+  box-shadow: 0 1px 0 var(--hair), 0 18px 44px rgba(17, 24, 39, 0.10);
+}
+.desk-login-card::before {
+  content: '';
+  position: absolute;
+  top: 0;
+  left: 0;
+  right: 0;
+  height: 3px;
+  background: var(--desk-ink);
+  border-radius: 16px 16px 0 0;
+}
+.desk-login-card h1 { letter-spacing: .01em; }
+
+/* ---------- 10. Dark bar & metric leaders ---------- */
+/* Each KPI reads as a two-part label: caption | figure, split by a hairline
+   that is weaker than the pill's own border. */
+.desk-kpi-pill .lbl {
+  padding-right: 7px;
+  border-right: 1px solid rgba(255, 255, 255, 0.16);
+}
+.desk-kpi-pill .val { font-variant-numeric: tabular-nums; }
+.desk-kpi-pill.bad .lbl { border-right-color: rgba(17, 24, 39, 0.18); }
+.desk-ch-badge { font-family: var(--mono); font-weight: 500; }
+/* Dotted leader under each customer row: label left, figure right, rule
+   between them — the catalogue-index device. */
+.desk-ci-row {
+  padding-bottom: 4px;
+  background-image: repeating-linear-gradient(to right, var(--hair-strong) 0 1px, transparent 1px, transparent 4px);
+  background-position: 0 100%;
+  background-size: 4px 1px;
+  background-repeat: repeat-x;
+}
+.desk-ci-row .ci-val { font-variant-numeric: tabular-nums; }
+.desk-ci-panel { gap: 12px; }
+
+/* ---------- 11. Access console (settings › Access) ---------- */
+/* A small operations screen: chips for state, cards for audiences, a ledger
+   for the list itself. An active segment is marked with ink weight and an
+   inset rule — never a hue — so the monochrome scale keeps holding. */
+.desk-acc-warn {
+  background: var(--desk-card-sub);
+  border: 1px solid var(--desk-border-strong);
+  border-left: 3px solid var(--desk-ink);
+  border-radius: var(--radius-sm);
+  padding: 9px 12px;
+  font-size: 12px;
+  line-height: 1.5;
+  color: var(--desk-sub);
+  margin-bottom: 6px;
+}
+.desk-acc-warn code { font-family: var(--mono); font-size: 11px; }
+.desk-acc-modehint { font-size: 12px; color: var(--desk-muted); margin: -2px 0 10px; }
+.desk-chip-go { cursor: pointer; transition: border-color .15s ease, background .15s ease; }
+.desk-chip-go:hover { border-color: var(--desk-ink); background: #fff; }
+.desk-acc-status { font-size: 11px; color: var(--desk-muted); align-self: center; margin-left: auto; }
+
+/* Grant controls: the one row every bulk path (card, selection, paste) reads. */
+.desk-acc-opts {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: flex-end;
+  gap: 12px;
+  background: var(--desk-card-sub);
+  border: 1px solid var(--desk-border);
+  border-radius: var(--radius-sm);
+  padding: 10px 12px;
+  margin: 4px 0 14px;
+}
+.desk-acc-field {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  font-size: 10.5px;
+  text-transform: uppercase;
+  letter-spacing: .05em;
+  color: var(--desk-muted);
+}
+.desk-acc-field.grow { flex: 1 1 200px; min-width: 170px; }
+.desk-acc-field input,
+.desk-acc-field select {
+  padding: 7px 9px;
+  border: 1px solid var(--desk-border);
+  border-radius: 8px;
+  font-size: 12.5px;
+  text-transform: none;
+  letter-spacing: 0;
+  background: #fff;
+  color: var(--desk-ink);
+  font-family: inherit;
+}
+.desk-acc-field input[type="number"] { width: 96px; }
+.desk-acc-field em {
+  font-style: normal;
+  font-size: 10.5px;
+  text-transform: none;
+  letter-spacing: 0;
+  color: var(--desk-hint);
+}
+
+/* Audience cards */
+.desk-acc-cards {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(216px, 1fr));
+  gap: 9px;
+}
+.desk-acc-card {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  border: 1px solid var(--desk-border);
+  border-radius: var(--radius-sm);
+  background: var(--desk-card);
+  padding: 10px 11px;
+}
+.desk-acc-card.on { border-color: var(--desk-ink); box-shadow: inset 3px 0 0 var(--desk-ink); }
+.desk-acc-card .t { font-size: 12.5px; font-weight: 700; line-height: 1.3; }
+.desk-acc-card .n { font-size: 20px; font-weight: 800; line-height: 1; font-variant-numeric: tabular-nums; }
+.desk-acc-card .n em {
+  font-style: normal;
+  font-size: 10px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: .05em;
+  color: var(--desk-muted);
+  margin-left: 5px;
+}
+.desk-acc-card .h { font-size: 11.5px; color: var(--desk-muted); line-height: 1.45; flex: 1; }
+.desk-acc-card .a { display: flex; flex-wrap: wrap; gap: 4px; }
+.desk-acc-card .a .desk-btn-plain { padding: 3px 7px; font-size: 11px; }
+
+/* Preview and roster share one frame */
+.desk-acc-preview {
+  border: 1px solid var(--desk-border);
+  border-radius: var(--radius-sm);
+  background: var(--desk-card);
+  padding: 11px 12px;
+  margin-bottom: 6px;
+}
+.desk-acc-phead { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; }
+.desk-acc-phead > div:first-child { display: flex; align-items: baseline; gap: 8px; margin-right: auto; }
+.desk-acc-phead b { font-size: 13px; }
+.desk-acc-phead span { font-size: 11.5px; color: var(--desk-muted); }
+.desk-acc-phead .a { display: flex; gap: 6px; flex-wrap: wrap; }
+.desk-acc-filter { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin: 10px 0; }
+.desk-acc-filter .desk-input,
+.desk-acc-filter select {
+  padding: 6px 9px;
+  border: 1px solid var(--desk-border);
+  border-radius: 8px;
+  font-size: 12.5px;
+  background: #fff;
+  font-family: inherit;
+  margin-bottom: 0;
+}
+.desk-acc-filter .desk-input { max-width: 200px; }
+.desk-acc-bar {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-wrap: wrap;
+  background: var(--desk-card-sub);
+  border-top: 1px solid var(--desk-border);
+  border-bottom: 1px solid var(--desk-border);
+  padding: 7px 9px;
+  margin: 4px 0 8px;
+}
+.desk-acc-bar > span { font-size: 11.5px; color: var(--desk-muted); margin-right: 4px; }
+.desk-acc-bar b { color: var(--desk-ink); font-variant-numeric: tabular-nums; }
+.desk-acc-pager {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 10px;
+  font-size: 11.5px;
+  color: var(--desk-muted);
+  margin-top: 8px;
+}
+.desk-acc-views { display: inline-flex; gap: 4px; flex-wrap: wrap; margin-left: auto; }
+.desk-acc-clean { display: flex; gap: 6px; flex-wrap: wrap; }
+.desk-acc-import {
+  width: 100%;
+  min-height: 76px;
+  padding: 9px 11px;
+  border: 1px solid var(--desk-border);
+  border-radius: 9px;
+  font-family: var(--mono);
+  font-size: 12px;
+  line-height: 1.5;
+  resize: vertical;
+}
+.desk-acc-import::placeholder { color: var(--desk-hint); }
+.desk-acc-flags {
+  display: block;
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: .05em;
+  color: var(--desk-hint);
+}
+.desk-acc-on, .desk-acc-off { font-size: 11px; white-space: nowrap; }
+.desk-acc-on { font-weight: 800; border-bottom: 1px solid var(--desk-ink); }
+.desk-acc-off { color: var(--desk-hint); }
+
+/* Policy rows: switch left, rule and rationale right, hairline between. */
+.desk-acc-toggle {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  padding: 9px 2px;
+  border-bottom: 1px solid var(--hair);
+  font-size: 12.5px;
+  cursor: pointer;
+}
+.desk-acc-toggle input { width: 15px; height: 15px; margin: 2px 0 0; flex: 0 0 auto; accent-color: var(--desk-ink); }
+.desk-acc-toggle b { display: block; font-weight: 700; }
+.desk-acc-toggle em {
+  display: block;
+  font-style: normal;
+  font-size: 11.5px;
+  color: var(--desk-muted);
+  line-height: 1.45;
+  margin-top: 2px;
+}
+.desk-acc-toggle:hover em { color: var(--desk-sub); }
+
+/* Below the split breakpoint the workspace stacks; return to normal
+   document flow so nothing collapses inside the fixed shell */
+@media (max-width: 1240px) {
+  body { overflow: auto; }
+  .desk-shell { height: auto; min-height: 100dvh; }
+  .desk-main { flex: initial; }
+  .desk-detail { overflow: visible; min-height: 0; }
+  .desk-unified-head { position: static; }
+  .desk-context-col { overflow: visible; }
+  .desk-merged-card { min-height: 520px; }
+}
+
+/* ---------- Composer media attach + inline thread media ----------
+   Monochrome throughout, per the desk design language: status is carried by
+   the text label and border weight, never hue. */
+.desk-attach {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 6px 12px;
+  border: 1px dashed var(--desk-border-strong);
+  border-radius: 999px;
+  background: var(--desk-card);
+  color: var(--desk-sub);
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: .04em;
+  text-transform: uppercase;
+  cursor: pointer;
+  user-select: none;
+}
+.desk-attach:hover { background: var(--desk-card-sub); color: var(--desk-ink); }
+.desk-attach input[type="file"] { display: none; }
+.desk-attach-txt { line-height: 1; }
+
+.desk-composer-media { display: flex; flex-wrap: wrap; gap: 8px; }
+.desk-composer-media:empty { display: none; }
+.desk-media-chip {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 8px 6px 6px;
+  border: 1px solid var(--desk-border);
+  border-radius: var(--radius-sm);
+  background: var(--desk-card);
+  max-width: 240px;
+}
+.desk-media-chip.st-failed { border-style: dashed; border-color: var(--desk-border-strong); }
+.desk-chip-thumb {
+  position: relative;
+  width: 40px; height: 40px; flex-shrink: 0;
+  border-radius: 6px; overflow: hidden;
+  border: 1px solid var(--desk-border);
+  background: var(--desk-card-sub);
+  display: inline-flex; align-items: center; justify-content: center;
+}
+.desk-chip-thumb img { width: 100%; height: 100%; object-fit: cover; display: block; }
+.desk-chip-spin {
+  width: 16px; height: 16px; border-radius: 50%;
+  border: 2px solid var(--desk-fill-hover);
+  border-top-color: var(--desk-ink);
+  animation: desk-chip-rot .8s linear infinite;
+}
+.desk-chip-body { display: flex; flex-direction: column; gap: 4px; min-width: 0; flex: 1; }
+.desk-chip-name {
+  font-size: 11.5px; color: var(--desk-ink); font-weight: 600;
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 150px;
+}
+.desk-chip-bar {
+  height: 4px; border-radius: 2px; background: var(--desk-fill); overflow: hidden;
+  display: none;
+}
+.desk-media-chip.st-uploading .desk-chip-bar { display: block; }
+.desk-chip-fill { display: block; height: 100%; background: var(--desk-ink); transition: width .15s; }
+.desk-chip-status {
+  font-size: 10px; font-weight: 700; letter-spacing: .04em; text-transform: uppercase;
+  color: var(--desk-muted); white-space: nowrap;
+}
+.desk-media-chip.st-uploaded .desk-chip-status { color: var(--desk-ink); }
+.desk-media-chip.st-failed .desk-chip-status { color: var(--desk-ink); }
+.desk-chip-retry {
+  border: 1px solid var(--desk-border-strong); background: var(--desk-card);
+  color: var(--desk-ink); font-size: 10px; font-weight: 700; text-transform: uppercase;
+  letter-spacing: .04em; border-radius: 6px; padding: 3px 7px; cursor: pointer;
+}
+.desk-chip-retry:hover { background: var(--desk-ink); color: #FFFFFF; }
+.desk-chip-x {
+  border: none; background: transparent; color: var(--desk-hint);
+  font-size: 16px; line-height: 1; cursor: pointer; padding: 0 2px;
+}
+.desk-chip-x:hover { color: var(--desk-ink); }
+@keyframes desk-chip-rot { to { transform: rotate(360deg); } }
+
+/* ---------- photos in the thread: the picture IS the bubble ---------- */
+/* WhatsApp-style: no frame, no inner padding, the grid fills the bubble edge to
+   edge and the caption (when any) sits on top of it. Declared late so it beats
+   both bubble skins (base + detail-layer overrides). */
+.desk-msg-bubble.desk-bubble-photos {
+  padding: 0; background: transparent; border-color: transparent;
+  box-shadow: none; overflow: hidden;
+}
+.desk-bubble-photos .bubble-text {
+  padding: 12px 16px;
+  background: var(--desk-card-sub);
+  border: 1px solid var(--desk-border);
+  border-bottom: none;
+  border-radius: 10px 10px 0 0;
+  color: var(--desk-ink);
+}
+.desk-msg-bubble.agent-bubble.desk-bubble-photos .bubble-text {
+  background: var(--desk-ink); color: #FFFFFF; border-color: var(--desk-ink);
+}
+
+.desk-mb {
+  display: grid; gap: 3px;
+  width: min(320px, 100%);
+  border-radius: 10px; overflow: hidden;
+  background: var(--desk-border-strong);
+}
+.desk-mb-2, .desk-mb-3, .desk-mb-4 { grid-template-columns: 1fr 1fr; }
+.desk-mb-3 .desk-mb-tile:first-child { grid-row: 1 / span 2; aspect-ratio: auto; }
+.desk-mb-tile {
+  position: relative; display: block;
+  margin: 0; padding: 0; border: 0;
+  min-height: 96px; background: var(--desk-card-sub);
+  overflow: hidden; cursor: zoom-in;
+  -webkit-appearance: none; appearance: none;
+  text-align: inherit; color: inherit; font: inherit;
+}
+.desk-mb-2 .desk-mb-tile, .desk-mb-3 .desk-mb-tile, .desk-mb-4 .desk-mb-tile { aspect-ratio: 1 / 1; }
+.desk-mb-tile img { width: 100%; height: 100%; object-fit: cover; display: block; }
+.desk-mb-1 .desk-mb-tile { max-height: 380px; }
+.desk-mb-1 .desk-mb-tile img { max-height: 380px; }
+.desk-mb-tile.is-expired { cursor: default; }
+.desk-mb-tile:focus-visible { outline: 2px solid var(--desk-ink); outline-offset: -2px; }
+.desk-mb-gone {
+  display: flex; align-items: center; justify-content: center; gap: 5px;
+  width: 100%; height: 100%; min-height: 96px; padding: 0 10px; box-sizing: border-box;
+  background: repeating-linear-gradient(135deg, #F6F7F9, #F6F7F9 6px, #ECEEF1 6px, #ECEEF1 12px);
+  color: var(--desk-hint); font-size: 10px; font-weight: 700;
+  letter-spacing: .04em; text-transform: uppercase; text-align: center;
+}
+.desk-mb-pending {
+  display: flex; align-items: center; justify-content: center;
+  width: 100%; height: 100%; min-height: 96px;
+  color: var(--desk-hint); background: var(--desk-card-sub);
+}
+
+/* clock + tick set, bottom-right of the last tile */
+.desk-mb-receipt {
+  position: absolute; right: 6px; bottom: 6px;
+  display: inline-flex; align-items: center; gap: 5px;
+  padding: 3px 8px; border-radius: 999px;
+  background: rgba(17, 24, 39, 0.62); color: #FFFFFF;
+  pointer-events: none;
+}
+.desk-mb-time { font-family: var(--mono); font-size: 10px; letter-spacing: .02em; }
+.desk-mb-word { font-size: 9.5px; font-weight: 700; letter-spacing: .04em; text-transform: uppercase; }
+.desk-mb-receipt .desk-tick { display: block; }
+
+/* "+N" tile standing in for photos beyond the fourth */
+.desk-mb-more {
+  position: absolute; inset: 0;
+  display: flex; align-items: center; justify-content: center;
+  background: rgba(17, 24, 39, 0.45); color: #FFFFFF;
+  font-size: 18px; font-weight: 600; pointer-events: none;
+}
+
+/* viewer chrome: close, batch navigation, counter */
+.desk-lb-x {
+  position: absolute; top: 18px; right: 20px;
+  width: 36px; height: 36px; border: 0; border-radius: 9px;
+  background: rgba(255, 255, 255, 0.14); color: #FFFFFF;
+  font-size: 20px; line-height: 1; cursor: pointer;
+}
+.desk-lb-nav {
+  position: absolute; top: 50%; transform: translateY(-50%);
+  width: 40px; height: 56px; border: 0; border-radius: 10px;
+  background: rgba(255, 255, 255, 0.12); color: #FFFFFF;
+  font-size: 26px; line-height: 1; cursor: pointer;
+}
+.desk-lb-nav.prev { left: 14px; }
+.desk-lb-nav.next { right: 14px; }
+.desk-lb-x:hover, .desk-lb-nav:hover { background: rgba(255, 255, 255, 0.26); }
+.desk-lb-count {
+  position: absolute; bottom: 22px; left: 50%; transform: translateX(-50%);
+  font-family: var(--mono); font-size: 11px;
+  color: rgba(255, 255, 255, 0.85); letter-spacing: .08em;
+}
+
+/* Respect the OS-level motion preference */
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after {
+    animation-duration: .01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: .01ms !important;
+    scroll-behavior: auto !important;
+  }
+}

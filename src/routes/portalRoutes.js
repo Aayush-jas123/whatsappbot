@@ -4,8 +4,11 @@ const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
 const multer = require('multer');
 const whatsappService = require('../services/whatsappService');
+const Support = require('../services/supportService');
 const { dbAdapter } = require('../database/db');
 const { caches } = require('../utils/cache');
+const supportMedia = require('../services/supportMediaService');
+const supportCloudinary = require('../services/supportCloudinaryService');
 
 // Multer config: disk storage (avoids holding files in RAM)
 const upload = multer({
@@ -109,45 +112,76 @@ function timeRangeSqlClause(config, col = 'created_at') {
         : `(${mins} >= ${start} OR ${mins} < ${end})`;
 }
 
+// Every ticket column the portal consumes: the sidebar card in
+// public/portal/support/js/main.js reads id / ticket_number / customer_phone /
+// customer_name / message / status / is_read / channel / created_at /
+// follow_up_at / follow_up_note, and verifyPhoneInPortal() below needs
+// portal_id + ig_user_id. Same set the admin ticket list already ships
+// (adminRoutes buildDataSql), plus the two the ownership checks need.
+//
+// This replaces `SELECT *, LEFT(message, 600) AS message`, which looked like it
+// truncated the blob but did not: Postgres allows the duplicate output name and
+// the wire carries both columns, so every 15s poll still transferred the full
+// message text (128kB of the 175kB payload for a 200-row page) before the
+// driver threw the wide copy away.
+const PORTAL_TICKET_COLUMNS = `id, ticket_number, customer_phone, customer_name,
+        LEFT(message, 600) AS message, status, is_read, portal_id, ig_user_id, sentiment,
+        ai_scenario, ai_confidence, source, channel, follow_up_at, follow_up_note,
+        order_id, created_at, updated_at`;
+
 // Helper to get portal tickets (cached for 30s to reduce query frequency)
 async function getPortalTickets(portalId, portalType, portalConfig, status, channel) {
     const cacheKey = `portal_tickets_full:${portalId}:${status || 'all'}:${channel || 'all'}`;
     
     return await caches.tickets.getOrLoad(cacheKey, async () => {
-        let baseWhere = '';
-        const params = [portalId];
-
-        if (portalType === 'time_based') {
-            const config = portalConfig
-                ? (typeof portalConfig === 'string' ? JSON.parse(portalConfig) : portalConfig)
-                : {};
-            const rangeClause = timeRangeSqlClause(config);
-            if (rangeClause) {
-                baseWhere = `(portal_id = ? OR (portal_id IS NULL AND ${rangeClause}))`;
-            } else {
-                baseWhere = 'portal_id = ?';
-            }
-        } else {
-            baseWhere = 'portal_id = ?';
-        }
-
-        const conditions = [baseWhere];
+        const filterParams = [];
+        let filterSql = '';
         if (status) {
-            conditions.push('status = ?');
-            params.push(status);
+            filterSql += ' AND status = ?';
+            filterParams.push(status);
         }
         if (channel) {
-            conditions.push("(channel = ? OR (channel IS NULL AND ? = 'whatsapp'))");
-            params.push(channel, channel);
+            filterSql += " AND (channel = ? OR (channel IS NULL AND ? = 'whatsapp'))";
+            filterParams.push(channel, channel);
         }
 
-        const whereSql = conditions.join(' AND ');
-        // Prioritize tickets explicitly assigned to this portal first, then newest
+        const rangeClause = portalType === 'time_based'
+            ? timeRangeSqlClause(portalConfig
+                ? (typeof portalConfig === 'string' ? JSON.parse(portalConfig) : portalConfig)
+                : {})
+            : null;
+
+        if (!rangeClause) {
+            // Manual/auto portals only ever see their own tickets, so the
+            // "assigned first, then newest" ordering collapses to newest-first
+            // and idx_support_tickets_portal_created serves it without a sort.
+            return await dbAdapter.query(
+                `SELECT ${PORTAL_TICKET_COLUMNS} FROM support_tickets
+                 WHERE portal_id = ?${filterSql}
+                 ORDER BY created_at DESC LIMIT 200`,
+                [portalId, ...filterParams]
+            );
+        }
+
+        // Time-based portals see their assigned tickets PLUS unassigned ones
+        // created inside their shift window, assigned-first. Written as one OR'd
+        // predicate that ordering cannot come from an index, so Postgres fetched
+        // and top-N sorted every match (measured: 6367 rows, 434kB sort, 52ms).
+        // Splitting the branches lets each one stop at 200 rows through its own
+        // index; the outer pass then only re-orders <=400 slim rows (19ms) and
+        // reproduces the old order exactly, since the global top-200 under
+        // (assigned?, created_at DESC) must lie inside the two branch top-200s.
+        const branch = (where, grp) => `(SELECT ${PORTAL_TICKET_COLUMNS}, ${grp} AS __portal_group
+            FROM support_tickets WHERE ${where}${filterSql}
+            ORDER BY created_at DESC LIMIT 200)`;
+
         return await dbAdapter.query(
-            `SELECT * FROM support_tickets
-             WHERE ${whereSql}
-             ORDER BY (CASE WHEN portal_id = ? THEN 0 ELSE 1 END), created_at DESC LIMIT 200`,
-            [...params, portalId]
+            `SELECT ${PORTAL_TICKET_COLUMNS} FROM (
+                ${branch('portal_id = ?', 0)}
+                UNION ALL
+                ${branch(`portal_id IS NULL AND (${rangeClause})`, 1)}
+            ) u ORDER BY __portal_group, created_at DESC LIMIT 200`,
+            [portalId, ...filterParams, ...filterParams]
         );
     }, 30000); // 30 second TTL
 }
@@ -175,6 +209,35 @@ async function verifyPhoneInPortal(phone, portal) {
         const ticketPhone = t.customer_phone.replace(/\D/g, '');
         return possibleFormats.some(format => format.replace(/\D/g, '') === ticketPhone);
     });
+}
+
+// Ticket ownership rule, shared by every per-ticket route below. A ticket is in
+// the portal when portal_id matches; a time_based portal additionally sees
+// unassigned tickets created inside its shift window. Returns the row or null.
+// (Extracted from the identical blocks that PUT /tickets/:id and
+// PATCH /tickets/:id/mark-read each carried.)
+async function ticketInPortalOr403(portal, id) {
+    let ticketQuery = 'SELECT * FROM support_tickets WHERE id = ?';
+    const ticketParams = [id];
+
+    if (portal.type !== 'time_based') {
+        ticketQuery += ' AND portal_id = ?';
+        ticketParams.push(portal.id);
+    }
+
+    const tickets = await dbAdapter.query(ticketQuery, ticketParams);
+    if (!tickets || tickets.length === 0) return null;
+
+    const t = tickets[0];
+    if (portal.type === 'time_based') {
+        if (t.portal_id) {
+            if (String(t.portal_id) !== String(portal.id)) return null;
+        } else {
+            const config = portal.config ? JSON.parse(portal.config) : {};
+            if (!isTicketInTimeRange(t, config)) return null;
+        }
+    }
+    return t;
 }
 
 // Portal authentication
@@ -260,7 +323,16 @@ router.get('/:slug/tickets', verifyPortalToken, async (req, res) => {
         const { status, channel } = req.query;
         const tickets = await getPortalTickets(portal.id, portal.type, portal.config, status, channel);
 
-        res.json({ success: true, tickets });
+        // thread_mode is decided server-side from the same predicate the desk uses
+        // (Support.isStorefrontTicket), so the UI never re-derives which tickets are
+        // worked as a thread instead of a WhatsApp chat. Mapping a copy keeps the
+        // 30s cache entry free of the extra field.
+        const withMode = tickets.map(t => ({
+            ...t,
+            thread_mode: Support.isStorefrontTicket(t) ? 'thread' : 'chat'
+        }));
+
+        res.json({ success: true, tickets: withMode });
     } catch (error) {
         console.error('Portal tickets error:', error);
         res.status(500).json({ success: false, error: 'Failed to fetch tickets' });
@@ -531,34 +603,9 @@ router.put('/:slug/tickets/:id', verifyPortalToken, async (req, res) => {
         }
 
         const portal = portals[0];
-        let ticketQuery = 'SELECT * FROM support_tickets WHERE id = ?';
-        const ticketParams = [id];
-
-        if (portal.type !== 'time_based') {
-            ticketQuery += ' AND portal_id = ?';
-            ticketParams.push(portal.id);
-        }
-
-        const tickets = await dbAdapter.query(ticketQuery, ticketParams);
-
-        if (!tickets || tickets.length === 0) {
+        const ownedTicket = await ticketInPortalOr403(portal, id);
+        if (!ownedTicket) {
             return res.status(403).json({ error: 'Ticket not found in this portal' });
-        }
-
-        // For time-based, verify ownership: explicitly-assigned tickets (split/transfer)
-        // belong only to their portal; otherwise the ticket must fall in the time range.
-        if (portal.type === 'time_based') {
-            const t = tickets[0];
-            if (t.portal_id) {
-                if (String(t.portal_id) !== String(portal.id)) {
-                    return res.status(403).json({ error: 'Ticket not in this portal' });
-                }
-            } else {
-                const config = portal.config ? JSON.parse(portal.config) : {};
-                if (!isTicketInTimeRange(t, config)) {
-                    return res.status(403).json({ error: 'Ticket not in portal time range' });
-                }
-            }
         }
 
         // Build the status update. Marking follow-up stores the optional reminder
@@ -577,6 +624,13 @@ router.put('/:slug/tickets/:id', verifyPortalToken, async (req, res) => {
             }
         } else if (status === 'resolved' || status === 'closed') {
             updates.push('follow_up_at = NULL', 'follow_up_note = NULL');
+            // Canonical closure timestamp — the 45-day media retention timer
+            // reads resolution_at, so it must be stamped here (previously it
+            // was never set on the portal/admin path).
+            updates.push('resolution_at = CURRENT_TIMESTAMP');
+        } else if (status === 'open') {
+            // Reopening clears the closure stamp so retention can be cancelled.
+            updates.push('resolution_at = NULL');
         }
 
         updateParams.push(id);
@@ -584,6 +638,23 @@ router.put('/:slug/tickets/:id', verifyPortalToken, async (req, res) => {
             `UPDATE support_tickets SET ${updates.join(', ')} WHERE id = ?`,
             updateParams
         );
+
+        // Drive the media retention timer off the new status.
+        const closedNow = (status === 'resolved' || status === 'closed');
+        const reopened = (status === 'open' || status === 'follow_up');
+        if (closedNow || reopened) {
+            try {
+                const ticketNumber = tickets[0]?.ticket_number;
+                if (closedNow) {
+                    const fresh = await dbAdapter.query('SELECT resolution_at FROM support_tickets WHERE id = ?', [id]);
+                    await supportMedia.armRetention(ticketNumber, fresh?.[0]?.resolution_at);
+                } else {
+                    await supportMedia.clearRetention(ticketNumber);
+                }
+            } catch (retErr) {
+                console.error('[Portal] retention timer update failed:', retErr.message);
+            }
+        }
 
         // Invalidate portal ticket cache
         caches.tickets.keys().filter(k => k.startsWith('portal_tickets_full:')).forEach(k => caches.tickets.delete(k));
@@ -602,6 +673,138 @@ router.put('/:slug/tickets/:id', verifyPortalToken, async (req, res) => {
     } catch (error) {
         console.error('Portal update ticket error:', error);
         res.status(500).json({ success: false, error: 'Failed to update ticket' });
+    }
+});
+
+// ── Help & Tickets (storefront) thread ──
+// A storefront ticket's whole conversation lives in this row's `thread`, not in
+// `messages`, so /chat/:phone can neither show nor answer it: the team member got
+// the customer's unrelated WhatsApp history instead of the request. These routes
+// give the portal that lane. Widget (WDG-) tickets deliberately keep the chat view
+// - Support.isStorefrontTicket is the single switch, shared with the desk.
+
+// Read the ticket thread (staff view: internal events included).
+router.get('/:slug/tickets/:id/thread', verifyPortalToken, async (req, res) => {
+    try {
+        const { slug, id } = req.params;
+
+        if (slug !== req.portal.slug) {
+            return res.status(403).json({ error: 'Portal mismatch' });
+        }
+
+        const portals = await dbAdapter.query(
+            'SELECT * FROM support_portals WHERE slug = ?',
+            [slug]
+        );
+
+        if (!portals || portals.length === 0) {
+            return res.status(404).json({ error: 'Portal not found' });
+        }
+
+        const ticket = await ticketInPortalOr403(portals[0], id);
+        if (!ticket) {
+            return res.status(403).json({ error: 'Ticket not found in this portal' });
+        }
+
+        // Opening the thread counts as reading it, exactly like opening a chat
+        if (!ticket.is_read) {
+            await dbAdapter.run(
+                'UPDATE support_tickets SET is_read = true WHERE id = ? AND is_read = false',
+                [ticket.id]
+            );
+            // Invalidate portal ticket cache
+            caches.tickets.keys().filter(k => k.startsWith('portal_tickets_full:')).forEach(k => caches.tickets.delete(k));
+        }
+
+        const images = await Support.listTicketImages(ticket.id);
+
+        res.json({
+            success: true,
+            mode: Support.isStorefrontTicket(ticket) ? 'thread' : 'chat',
+            ticket: {
+                id: ticket.id, ticket_number: ticket.ticket_number, order_id: ticket.order_id,
+                reason_label: ticket.reason_label, sub_label: ticket.sub_label, other_text: ticket.other_text,
+                preference: ticket.preference, contact_via: ticket.contact_via,
+                new_address: ticket.new_address, video_url: ticket.video_url,
+                status: ticket.status, priority: ticket.priority, team: ticket.team,
+                created_at: ticket.created_at,
+                images
+            },
+            entries: Support.portalThreadView(ticket)
+        });
+    } catch (error) {
+        console.error('Portal ticket thread error:', error);
+        res.status(500).json({ success: false, error: 'Failed to fetch ticket thread' });
+    }
+});
+
+// Reply into the thread. Nothing is sent on WhatsApp: for a storefront ticket the
+// Help & Tickets tab the customer is already reading IS the delivery channel, and
+// an outbound template there would need an approved template outside the 24h window.
+router.post('/:slug/tickets/:id/reply', verifyPortalToken, async (req, res) => {
+    try {
+        const { slug, id } = req.params;
+        // The portal composer posts { message }; { text } is the desk's spelling.
+        const body = req.body || {};
+        const text = String(body.text != null ? body.text : (body.message || '')).trim();
+
+        if (slug !== req.portal.slug) {
+            return res.status(403).json({ error: 'Portal mismatch' });
+        }
+
+        if (!text) {
+            return res.status(400).json({ success: false, error: 'Reply text is required' });
+        }
+        if (text.length > 5000) {
+            return res.status(400).json({ success: false, error: 'Reply is too long (5000 characters max)' });
+        }
+
+        const portals = await dbAdapter.query(
+            'SELECT * FROM support_portals WHERE slug = ?',
+            [slug]
+        );
+
+        if (!portals || portals.length === 0) {
+            return res.status(404).json({ error: 'Portal not found' });
+        }
+
+        const ticket = await ticketInPortalOr403(portals[0], id);
+        if (!ticket) {
+            return res.status(403).json({ error: 'Ticket not found in this portal' });
+        }
+
+        const patch = Support.portalAgentReplyPatch(ticket, {
+            text,
+            agentId: 'portal:' + slug,
+            now: Date.now()
+        });
+        if (!patch) {
+            return res.status(400).json({ success: false, error: 'Reply text is required' });
+        }
+
+        const updated = await Support.updateTicket(ticket.id, patch);
+        if (!updated) {
+            return res.status(500).json({ success: false, error: 'Failed to save reply' });
+        }
+
+        // Invalidate portal ticket cache
+        caches.tickets.keys().filter(k => k.startsWith('portal_tickets_full:')).forEach(k => caches.tickets.delete(k));
+
+        // The ticket just left 'open', so refresh the portal's active-work counter
+        // the same way the status route does - auto-routing reads it for capacity.
+        const countResult = await dbAdapter.query(
+            `SELECT COUNT(*) as count FROM support_tickets WHERE portal_id = ? AND status IN ('open', 'follow_up')`,
+            [portals[0].id]
+        );
+        await dbAdapter.run(
+            'UPDATE support_portals SET assigned_count = ? WHERE id = ?',
+            [countResult[0]?.count || 0, portals[0].id]
+        );
+
+        res.json({ success: true, entries: Support.portalThreadView(updated) });
+    } catch (error) {
+        console.error('Portal ticket reply error:', error);
+        res.status(500).json({ success: false, error: 'Failed to send reply' });
     }
 });
 
@@ -625,34 +828,9 @@ router.patch('/:slug/tickets/:id/mark-read', verifyPortalToken, async (req, res)
         }
 
         const portal = portals[0];
-        let ticketQuery = 'SELECT * FROM support_tickets WHERE id = ?';
-        const ticketParams = [id];
-
-        if (portal.type !== 'time_based') {
-            ticketQuery += ' AND portal_id = ?';
-            ticketParams.push(portal.id);
-        }
-
-        const tickets = await dbAdapter.query(ticketQuery, ticketParams);
-
-        if (!tickets || tickets.length === 0) {
+        const ownedTicket = await ticketInPortalOr403(portal, id);
+        if (!ownedTicket) {
             return res.status(403).json({ error: 'Ticket not found in this portal' });
-        }
-
-        // Time-based ownership: assigned tickets (split/transfer) belong only to their portal;
-        // otherwise the ticket must fall within this portal's time range.
-        if (portal.type === 'time_based') {
-            const t = tickets[0];
-            if (t.portal_id) {
-                if (String(t.portal_id) !== String(portal.id)) {
-                    return res.status(403).json({ error: 'Ticket not in this portal' });
-                }
-            } else {
-                const config = portal.config ? JSON.parse(portal.config) : {};
-                if (!isTicketInTimeRange(t, config)) {
-                    return res.status(403).json({ error: 'Ticket not in portal time range' });
-                }
-            }
         }
 
         await dbAdapter.query(
@@ -921,7 +1099,40 @@ router.get('/:slug/attachments/:phone', verifyPortalToken, async (req, res) => {
 
         const mediaService = require('../services/mediaService');
         const attachments = await mediaService.getAttachmentsForPhone(phone, 100);
-        res.json({ success: true, attachments });
+
+        // Merge in Cloudinary-backed lifecycle media (with live delivery
+        // status) so the portal chat renders real status chips, not a
+        // hard-coded tick. Shaped like a legacy attachment so the existing
+        // chronological merge keeps working.
+        let lifecycle = [];
+        try {
+            const rows = await supportMedia.listForPortalPhone(phone);
+            lifecycle = rows.map(r => {
+                const v = supportMedia.publicView(r);
+                return {
+                    id: v.id,
+                    source: 'support_media',
+                    file_type: 'image',
+                    file_url: v.full_url,
+                    thumbnail_url: v.thumb_url,
+                    direction: r.direction,
+                    mime_type: r.mime_type,
+                    file_size: r.file_size,
+                    upload_status: v.upload_status,
+                    delivery_status: v.delivery_status,
+                    // dimensions let the chat lay the photo bubble out before
+                    // the picture finishes decoding (no layout jump)
+                    width: v.width,
+                    height: v.height,
+                    expired: v.expired,
+                    created_at: r.created_at
+                };
+            });
+        } catch (mediaErr) {
+            console.error('[Portal] lifecycle media merge skipped:', mediaErr.message);
+        }
+
+        res.json({ success: true, attachments, media: lifecycle });
     } catch (error) {
         console.error('Portal attachments error:', error);
         res.status(500).json({ error: 'Failed to fetch attachments' });
@@ -1029,6 +1240,173 @@ router.post('/:slug/chat/send-file', verifyPortalToken, upload.single('file'), a
     } catch (error) {
         console.error('Portal send file error:', error);
         res.status(500).json({ error: 'Failed to send file', details: error.message });
+    }
+});
+
+// ============================================================
+// Cloudinary signed browser direct-upload + send-media (portal)
+// ============================================================
+
+// 1. Signed upload intent for one image the agent is about to attach.
+router.post('/:slug/chat/media/intent', verifyPortalToken, async (req, res) => {
+    try {
+        const { slug } = req.params;
+        if (slug !== req.portal.slug) return res.status(403).json({ error: 'Portal mismatch' });
+        if (!supportCloudinary.isConfigured()) {
+            return res.status(503).json({ error: 'Image upload is not configured' });
+        }
+        const intent = await supportMedia.createIntent({
+            channel: req.body && req.body.channel ? req.body.channel : 'whatsapp',
+            ticketRef: (req.body && req.body.ticket_ref) || null,
+            direction: 'outgoing',
+            actor: `portal:${slug}`
+        });
+        res.json(intent);
+    } catch (error) {
+        console.error('Portal media intent error:', error.message);
+        res.status(500).json({ error: 'Failed to start upload' });
+    }
+});
+
+// 2. Confirm a browser upload landed in our Cloudinary before sending.
+router.post('/:slug/chat/media/:id/finalize', verifyPortalToken, async (req, res) => {
+    try {
+        const { slug } = req.params;
+        if (slug !== req.portal.slug) return res.status(403).json({ error: 'Portal mismatch' });
+        const row = await supportMedia.getById(req.params.id);
+        if (!row) return res.status(404).json({ error: 'Media not found' });
+        const updated = await supportMedia.finalize({ mediaId: row.id });
+        res.json({ media: supportMedia.publicView(updated) });
+    } catch (error) {
+        console.error('Portal media finalize error:', error.message);
+        res.status(400).json({ error: error.message || 'Failed to confirm upload' });
+    }
+});
+
+// 3. Retry a failed upload.
+router.post('/:slug/chat/media/:id/retry', verifyPortalToken, async (req, res) => {
+    try {
+        const { slug } = req.params;
+        if (slug !== req.portal.slug) return res.status(403).json({ error: 'Portal mismatch' });
+        const row = await supportMedia.getById(req.params.id);
+        if (!row) return res.status(404).json({ error: 'Media not found' });
+        const fresh = await supportMedia.retry({ mediaId: row.id });
+        res.json(fresh);
+    } catch (error) {
+        console.error('Portal media retry error:', error.message);
+        res.status(400).json({ error: error.message || 'Failed to retry upload' });
+    }
+});
+
+// 4. Send one or more already-finalized images to the customer over the
+//    ticket's own channel (WhatsApp or Instagram), correlating the WhatsApp
+//    message id so the async delivery webhook can advance the status.
+router.post('/:slug/chat/send-media', verifyPortalToken, async (req, res) => {
+    try {
+        const { slug } = req.params;
+        const { phone, caption = '', media_ids = [] } = req.body;
+
+        if (slug !== req.portal.slug) return res.status(403).json({ error: 'Portal mismatch' });
+        if (!phone || !Array.isArray(media_ids) || !media_ids.length) {
+            return res.status(400).json({ error: 'Phone and media_ids are required' });
+        }
+        if (media_ids.length > supportMedia.MAX_PER_MESSAGE) {
+            return res.status(400).json({ error: `Only ${supportMedia.MAX_PER_MESSAGE} images per message` });
+        }
+
+        const hasAccess = await verifyPhoneInPortal(phone, req.portal);
+        if (!hasAccess) return res.status(403).json({ error: 'Phone not associated with this portal' });
+
+        // Resolve the ticket's channel + identity.
+        const ticketRows = await dbAdapter.query(
+            `SELECT id, ticket_number, channel, ig_user_id FROM support_tickets
+             WHERE customer_phone = ? AND status != 'resolved'
+             ORDER BY created_at DESC LIMIT 1`,
+            [phone]
+        );
+        const ticket = ticketRows?.[0] || null;
+        const ticketChannel = ticket?.channel || 'whatsapp';
+        const igUserId = ticket?.ig_user_id;
+
+        const cleanPhone = phone.replace(/\D/g, '');
+        const formattedPhone = cleanPhone.startsWith('91') ? `+${cleanPhone}` : `+91${cleanPhone}`;
+
+        const rows = await supportMedia.getByIds(media_ids);
+        const results = [];
+
+        for (const row of rows) {
+            // Never send media that hasn't finalized into our account.
+            if (row.upload_status !== supportMedia.STATUS.UPLOADED) {
+                results.push({ id: row.id, status: 'failed', error: 'Not uploaded' });
+                continue;
+            }
+
+            await supportMedia.setStatus(row.id, supportMedia.STATUS.SENDING);
+            const url = supportCloudinary.optimizedUrl(row.public_id);
+
+            try {
+                if (ticketChannel === 'instagram' && igUserId) {
+                    const instagramService = require('../services/instagramService');
+                    const igResult = await instagramService.sendImage(igUserId, url, caption || null);
+                    if (igResult && igResult.blocked) {
+                        await supportMedia.markFailed(row.id, igResult.reason || 'IG window expired');
+                        results.push({ id: row.id, status: 'failed', error: igResult.reason });
+                        continue;
+                    }
+                    // Instagram has no delivery-receipt webhook → stay at 'sent'.
+                    // Persist ticket_ref too so listForPortalPhone can find the
+                    // row (the lifecycle chat list joins on ticket_number).
+                    await dbAdapter.run(
+                        `UPDATE support_media SET upload_status = 'sent', ticket_ref = ?, thread_entry_idx = NULL, updated_at = CURRENT_TIMESTAMP WHERE id = ?`,
+                        [ticket?.ticket_number || row.ticket_ref, row.id]
+                    );
+                    results.push({ id: row.id, status: 'sent', channel: 'instagram' });
+                } else {
+                    const wa = await whatsappService.sendImage(formattedPhone, url, caption || '', 'manual_reply');
+                    const waMsgId = wa?.messages?.[0]?.id || null;
+                    // Persist ticket_ref + correlate the wamid so the async
+                    // webhook resolves delivered/read/failed on this row.
+                    await dbAdapter.run(
+                        `UPDATE support_media SET ticket_ref = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?`,
+                        [ticket?.ticket_number || row.ticket_ref, row.id]
+                    );
+                    await supportMedia.recordWaMessageId(row.id, waMsgId);
+                    results.push({ id: row.id, status: 'sent', channel: 'whatsapp', wa_message_id: waMsgId });
+                }
+            } catch (sendErr) {
+                await supportMedia.markFailed(row.id, sendErr.message);
+                results.push({ id: row.id, status: 'failed', error: sendErr.message });
+            }
+        }
+
+        res.json({ success: true, sent: results });
+    } catch (error) {
+        console.error('Portal send media error:', error);
+        res.status(500).json({ error: 'Failed to send media', details: error.message });
+    }
+});
+
+// 5. Re-arm a media row that failed at the SEND stage (asset is already in
+//    Cloudinary) so the client can re-invoke send-media for it.
+router.post('/:slug/chat/retry-media/:id', verifyPortalToken, async (req, res) => {
+    try {
+        const { slug } = req.params;
+        if (slug !== req.portal.slug) return res.status(403).json({ error: 'Portal mismatch' });
+        const row = await supportMedia.getById(req.params.id);
+        if (!row) return res.status(404).json({ error: 'Media not found' });
+        if (row.upload_status !== supportMedia.STATUS.FAILED) {
+            return res.status(400).json({ error: 'Only failed media can be retried' });
+        }
+        // Only push back to 'uploaded' if the asset really made it to Cloudinary.
+        try {
+            const fresh = await supportMedia.finalize({ mediaId: row.id });
+            res.json({ media: supportMedia.publicView(fresh) });
+        } catch (e) {
+            res.status(400).json({ error: 'Asset missing from Cloudinary — re-upload required' });
+        }
+    } catch (error) {
+        console.error('Portal retry media error:', error.message);
+        res.status(400).json({ error: error.message || 'Failed to retry send' });
     }
 });
 

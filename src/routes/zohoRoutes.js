@@ -216,6 +216,40 @@ router.post('/cod/reconcile/:id', requireAdmin, async (req, res) => {
     }
 });
 
+// Reconcile straight from an order number — for delivered COD orders the live
+// hook never reached, so no log row exists to click "Reconcile" on.
+router.post('/cod/reconcile-order/:orderId', requireAdmin, async (req, res) => {
+    try {
+        const orderId = zohoCodService.normOrderId(req.params.orderId);
+        if (!/^\d+$/.test(orderId)) {
+            return res.status(400).json({ error: 'Order number must be digits' });
+        }
+        const result = await zohoCodService.handleCodDelivery(orderId, {
+            carrier: req.body?.carrier || 'manual',
+            awb: req.body?.awb || '',
+            force: true
+        });
+        res.json(result);
+    } catch (err) {
+        console.error('❌ Zoho COD reconcile-by-order error:', err.message);
+        res.status(500).json({ error: 'Failed to reconcile COD', detail: err.message });
+    }
+});
+
+// Drain the unreconciled-COD backlog. Dry run by default: it does every read
+// (Shopify order check, invoice lookup) and reports what it would pay.
+router.post('/cod/sweep', requireAdmin, async (req, res) => {
+    try {
+        const dryRun = req.query.dryRun !== 'false' && req.body?.dryRun !== false;
+        const limit = Math.min(200, parseInt(req.body?.limit || req.query.limit || '30', 10) || 30);
+        const result = await zohoCodService.sweepUnreconciledCod({ dryRun, limit });
+        res.json({ success: true, dryRun, ...result });
+    } catch (err) {
+        console.error('❌ Zoho COD sweep error:', err.message);
+        res.status(500).json({ error: 'Failed to sweep COD backlog', detail: err.message });
+    }
+});
+
 // ============================================================
 // CONFIGURATION — Bundle mapping, GST rates, connection test
 // ============================================================

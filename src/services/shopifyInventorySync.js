@@ -4,9 +4,11 @@
 // Hub sync workbench:
 //   • Pull  — Shopify bulk edits land in manual_inventory (adds + quantity
 //             updates), applied as batched SQL, no per-SKU round trips.
-//   • Push  — hub quantities (or Bulk In/Out deltas) written to Shopify via
-//             inventory_levels/adjust.json, one item per call through the
-//             shared 2 req/sec limiter, cancellable, progress-polled.
+//   • Push  — hub quantities (or Bulk In/Out projected targets) written to
+//             Shopify: batched GraphQL inventorySetQuantities (100 SKUs per
+//             call) when every task carries a target, otherwise per-SKU
+//             inventory_levels/adjust.json through the shared 2 req/sec
+//             limiter. Cancellable, progress-polled.
 // All Shopify/DB access goes through `deps` so the math is unit-testable
 // offline (test/testShopifyInventorySync.js).
 // ============================================================================
@@ -474,7 +476,11 @@ async function _persistRunFinish(db, job) {
 // decrease never strands more than one location in the negative); fall back
 // to the store's first location for fresh items.
 async function runPushJob({ client, db, tasks, reference, performedBy, mode, direction }) {
-    const work = (tasks || []).filter(t => t && t.inventory_item_id && Number(t.delta) !== 0);
+    // A task carrying a target stays in even when the hub-side delta is 0:
+    // Bulk Out clamps locally (0 − 5 = 0) yet Shopify may still hold stock the
+    // target has to clear. delta-only tasks keep the old "nothing to do" skip.
+    const work = (tasks || []).filter(t => t && t.inventory_item_id &&
+        (Number(t.delta) !== 0 || Number.isFinite(Number(t.target))));
     const skipped = (tasks || []).length - work.length;
 
     const job = {
@@ -537,13 +543,87 @@ async function runPushJob({ client, db, tasks, reference, performedBy, mode, dir
                 job.done = job.total;
             }
 
+            // Batched absolute write: when the client speaks GraphQL
+            // inventorySetQuantities and EVERY task carries a target, 100 SKUs
+            // go out per request instead of one REST adjust each. The per-item
+            // quantity lands the item's total across locations on the target —
+            // same arithmetic as the delta path, applied at the busiest
+            // location. A chunk Shopify rejects wholesale requeues into the
+            // per-SKU path below (which yields per-item results and keeps the
+            // existing failure guards); a scope rejection aborts immediately,
+            // because the per-SKU fallback would answer identically.
+            const batchable = !refuseToGuess
+                && work.length > 0
+                && work.every(t => Number.isFinite(Number(t.target)))
+                && typeof client.setInventoryQuantities === 'function';
+            let restTasks = refuseToGuess ? [] : work;
+            const BATCH_CHUNK = 100;
+            if (batchable) {
+                restTasks = [];
+                for (let i = 0; i < work.length; i += BATCH_CHUNK) {
+                    if (job.cancelRequested) { restTasks.push(...work.slice(i)); break; }
+                    const chunk = work.slice(i, i + BATCH_CHUNK);
+                    const prepared = [];
+                    for (const t of chunk) {
+                        const breakdown = levelsById.get(t.inventory_item_id) || [];
+                        const currentTotal = breakdown.length
+                            ? breakdown.reduce((s, l) => s + (Number(l.available) || 0), 0)
+                            : (totalsById.get(t.inventory_item_id) || 0);
+                        const delta = Number(t.target) - currentTotal;
+                        if (delta === 0) { job.skipped++; job.done++; continue; }
+                        const loc = breakdown.length
+                            ? breakdown.reduce((max, l) => (l.available > max.available ? l : max), breakdown[0])
+                            : { locationId: defaultLocationId, available: 0 };
+                        if (!loc.locationId) { restTasks.push(t); continue; } // per-SKU path records it
+                        prepared.push({ t, delta, locationId: loc.locationId, quantity: loc.available + delta });
+                    }
+                    if (prepared.length === 0) continue;
+                    let res;
+                    try {
+                        res = await client.setInventoryQuantities({
+                            quantities: prepared.map(p => ({
+                                inventoryItemId: p.t.inventory_item_id,
+                                locationId: p.locationId,
+                                quantity: p.quantity,
+                            })),
+                        });
+                    } catch (e) {
+                        res = { ok: false, error: e.message };
+                    }
+                    if (res.ok) {
+                        for (const p of prepared) {
+                            job.results.push({ sku_key: p.t.sku_key, product_name: p.t.product_name, size: p.t.size,
+                                delta: p.delta, locationId: p.locationId, ok: true,
+                                availableAfterChange: p.quantity, error: null });
+                            job.succeeded++; job.unitsDelta += p.delta; job.done++;
+                        }
+                        if (job.results.length > MAX_RESULTS_KEPT) job.results.splice(0, job.results.length - MAX_RESULTS_KEPT);
+                        continue;
+                    }
+                    if (res.permissionError || /merchant approval|scope/i.test(res.error || '')) {
+                        for (const p of prepared) {
+                            job.results.push({ sku_key: p.t.sku_key, product_name: p.t.product_name, size: p.t.size,
+                                delta: p.delta, locationId: p.locationId, ok: false,
+                                availableAfterChange: null, error: res.error });
+                            job.failed++; job.done++;
+                        }
+                        job.error = res.error;
+                        job.abortedRemaining = job.total - job.done;
+                        restTasks = [];
+                        break;
+                    }
+                    console.warn('[ShopifyInventorySync] batch chunk rejected, falling back to per-SKU writes:', res.error);
+                    restTasks.push(...prepared.map(p => p.t));
+                }
+            }
+
             // A deterministic Shopify rejection (missing scope, malformed body,
             // unusable location) answers identically for every remaining SKU, and
             // at ~2 writes/sec that is minutes of pointless calls. Stop early
             // instead of reporting 230 failures for one underlying mistake.
             let lastError = null;
             let sameErrorStreak = 0;
-            for (const task of refuseToGuess ? [] : work) {
+            for (const task of restTasks) {
                 if (job.cancelRequested) break;
                 const breakdown = levelsById.get(task.inventory_item_id) || [];
                 const currentTotal = breakdown.length
@@ -625,6 +705,11 @@ async function startAbsolutePushJob({ client, db, catalog, hubRows, selectedSkuK
 }
 
 // Delta push: apply known deltas (Bulk In/Out) onto Shopify directly.
+// An entry may also carry `target` — the bulk row's Projected figure, which is
+// what manual_inventory was just set to. The runner then lands Shopify ON the
+// target (recomputed against the live level) instead of adding the hub-side
+// delta onto whatever Shopify currently holds, so "Projected 40" means 40 in
+// Shopify even when the two sides started from different numbers.
 async function startDeltaPushJob({ client, db, catalog, deltas, reference, performedBy }) {
     const index = indexCatalog(catalog);
     const tasks = [];
@@ -632,12 +717,16 @@ async function startDeltaPushJob({ client, db, catalog, deltas, reference, perfo
     for (const d of deltas || []) {
         const m = matchHubRow(index, { sku_key: d.sku_key });
         if (!m || !m.entry.variant.inventory_item_id) { unmatched.push(d.sku_key); continue; }
+        const target = Number.isFinite(Number(d.target)) ? Number(d.target) : null;
         tasks.push({
             sku_key: d.sku_key, product_name: d.product_name, size: d.size,
-            inventory_item_id: m.entry.variant.inventory_item_id, delta: Number(d.delta) || 0,
+            inventory_item_id: m.entry.variant.inventory_item_id,
+            delta: Number(d.delta) || 0,
+            ...(target !== null ? { target } : {}),
         });
     }
-    const job = await runPushJob({ client, db, tasks, reference, performedBy, mode: 'delta', direction: 'push_delta' });
+    const absolute = tasks.length > 0 && tasks.every(t => Number.isFinite(t.target));
+    const job = await runPushJob({ client, db, tasks, reference, performedBy, mode: absolute ? 'absolute' : 'delta', direction: 'push_delta' });
     return { job, unmatched };
 }
 

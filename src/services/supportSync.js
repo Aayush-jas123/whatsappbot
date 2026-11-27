@@ -2,6 +2,7 @@ const crypto = require('crypto');
 const axios = require('axios');
 const { dbAdapter } = require('../database/db');
 const { getBreaker } = require('../utils/circuitBreaker');
+const SupportAccess = require('./supportAccessService');
 
 // ============================================================
 // SupportSync — keeps support_order_cache fresh from Shopify.
@@ -168,7 +169,9 @@ function slimOrderJson(order) {
         paid_via: (order.payment_gateway_names && order.payment_gateway_names[0]) || null,
         line_items: (order.line_items || []).map(i => ({
             name: i.name, title: i.title, variant_title: i.variant_title,
-            quantity: i.quantity, price: i.price
+            quantity: i.quantity, price: i.price,
+            // CDN URL only — the storefront picker shows product thumbnails
+            image: i.image || null
         })),
         shipping_address: addr ? {
             address1: addr.address1, address2: addr.address2, city: addr.city,
@@ -241,14 +244,11 @@ async function upsertOrder(order, phone, force = false) {
 // ---------- whitelist gate for the webhook firehose ----------
 // orders/updated fires for every order in the shop while the whitelist holds a
 // handful of phones, so the list is kept in memory (60s) to keep non-whitelisted
-// webhooks at zero database reads.
-let wlCache = null;
+// webhooks at zero database reads. The snapshot now lives in supportAccessService
+// so the customer gate, the theme probe and this filter all read one list — three
+// copies drifting apart was how revocations used to look like they had not landed.
 async function isWhitelistedCached(phone) {
-    if (!wlCache || Date.now() - wlCache.ts > 60 * 1000) {
-        const rows = await dbAdapter.query('SELECT phone FROM support_whitelist');
-        wlCache = { set: new Set(rows.map(r => r.phone)), ts: Date.now() };
-    }
-    return wlCache.set.has(phone);
+    return SupportAccess.isWhitelistedCached(phone);
 }
 
 // ---------- webhook entry ----------

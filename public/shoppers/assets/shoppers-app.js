@@ -92,6 +92,13 @@ function applyRolePermissions() {
     const teamBtn = document.getElementById('teamBtn');
     if (teamBtn) teamBtn.style.display = isAdmin ? 'flex' : 'none';
 
+    // Operator attribution is admin-only. Uses its own class rather than the
+    // shared `hidden` one because toggleInboxConfirmedFilters() owns that class
+    // per tab and would re-show the control on every tab switch.
+    document.querySelectorAll('.inbox-operator-only').forEach(el => {
+        el.classList.toggle('role-hidden', !isAdmin);
+    });
+
     // Logout — clears the session for both admin and operator accounts
     const logoutBtn = document.getElementById('hubLogoutBtn');
     if (logoutBtn) {
@@ -320,10 +327,26 @@ document.addEventListener('DOMContentLoaded', async () => {
         setupEventListeners();
         setupModalEvents();
         setupChatEvents();
+        // Deep link: /shoppers/?search=<order id> pre-fills the search box and
+        // then focuses the exact order's card (scroll + brief highlight), so a
+        // support-desk order click lands straight on that single order without
+        // opening any editor. The first fetch is already server-filtered on
+        // order_id — no extra roundtrip.
+        const searchParam = (urlParams.get('search') || '').trim();
+        if (searchParam) {
+            const searchEl = document.getElementById('searchInput');
+            if (searchEl) searchEl.value = searchParam;
+        }
         // Smart login: only load data for pages this identity may access
-        if (hubHasPerm('shoppers')) fetchShoppersData();
         if (hubHasPerm('analytics')) fetchAnalytics();
         if (hubHasPerm('inbox')) fetchInboxCounts();
+        if (hubHasPerm('shoppers')) fetchItemRequests();
+        if (hubHasPerm('shoppers')) {
+            // Awaited (unlike the fire-and-forget panels above) only because a
+            // deep link needs the filtered rows in hand before focusing.
+            await fetchShoppersData();
+            if (searchParam) autoFocusOrderCard(searchParam);
+        }
         console.log('✅ Dashboard Initialized Successfully');
     } catch (e) {
         console.error('❌ Dashboard Init Failed:', e);
@@ -517,6 +540,34 @@ function setupEventListeners() {
     document.getElementById('backToShoppersFromInbox')?.addEventListener('click', hideInboxView);
     document.getElementById('refreshInboxBtn')?.addEventListener('click', fetchInboxData);
 
+    const inboxList = document.getElementById('inboxListContainer');
+    if (inboxList) {
+        inboxList.addEventListener('click', (event) => {
+            const action = event.target.closest('[data-inbox-action]');
+            if (action) {
+                const item = action.closest('.inbox-item');
+                if (action.dataset.inboxAction === 'chat' && item) openInboxChatFromItem(item);
+                if (action.dataset.inboxAction === 'mark-read' && item) markInboxAsRead(item.dataset.phone);
+                if (action.dataset.inboxAction === 'retry') fetchInboxData(true);
+                if (action.dataset.inboxAction === 'clear') clearInboxFilters();
+                if (action.dataset.inboxAction === 'back') hideInboxView();
+                return;
+            }
+            if (event.target.closest('a, button, input, label, select')) return;
+            const item = event.target.closest('.inbox-item');
+            if (item) openInboxChatFromItem(item);
+        });
+        inboxList.addEventListener('change', (event) => {
+            if (event.target.matches('.inbox-item-checkbox')) onInboxItemCheck(event.target);
+        });
+        inboxList.addEventListener('keydown', (event) => {
+            if ((event.key === 'Enter' || event.key === ' ') && event.target.matches('.inbox-item')) {
+                event.preventDefault();
+                openInboxChatFromItem(event.target);
+            }
+        });
+    }
+
     // Multi Orders
     document.getElementById('multiOrdersBtn')?.addEventListener('click', showMultiOrdersView);
     document.getElementById('backToShoppersFromMultiOrders')?.addEventListener('click', hideMultiOrdersView);
@@ -693,13 +744,19 @@ function setupEventListeners() {
         tab.addEventListener('click', () => {
             currentInboxTab = tab.dataset.inboxTab;
             inboxPageOffset = 0;
-            document.querySelectorAll('.inbox-tab').forEach(t => t.classList.remove('active'));
+            document.querySelectorAll('.inbox-tab').forEach(t => {
+                t.classList.remove('active');
+                t.setAttribute('aria-selected', 'false');
+            });
             tab.classList.add('active');
+            tab.setAttribute('aria-selected', 'true');
             toggleInboxConfirmedFilters();
             inboxDeselectAll();
             fetchInboxData();
+            scheduleInboxAnalytics();
         });
     });
+    setupInboxAnalyticsEvents();
     document.getElementById('inboxPrevBtn')?.addEventListener('click', () => {
         inboxPageOffset = Math.max(0, inboxPageOffset - inboxLimitPerPage);
         fetchInboxData();
@@ -721,6 +778,7 @@ function setupEventListeners() {
     document.getElementById('inboxSearch')?.addEventListener('input', debounceInboxSearch);
     document.getElementById('inboxActionType')?.addEventListener('change', onInboxActionTypeChange);
     document.getElementById('inboxConfirmedBy')?.addEventListener('change', onInboxFilterChange);
+    document.getElementById('inboxOperatorFilter')?.addEventListener('change', onInboxFilterChange);
     document.getElementById('inboxPaymentMethod')?.addEventListener('change', onInboxFilterChange);
     document.getElementById('inboxDeliveryType')?.addEventListener('change', onInboxFilterChange);
     document.getElementById('inboxDateField')?.addEventListener('change', onInboxDateFieldChange);
@@ -793,10 +851,23 @@ function setupModalEvents() {
                 if (data.success) {
                     hideModal();
                     fetchShoppersData();
+                    // An opened-from-the-queue request is closed by the save itself:
+                    // the PUT above already mirrored items to Shopify + GoKwik
+                    let irmConfirmedNote = '';
+                    if (irmLinkedRequestId) {
+                        const linked = irmLinkedRequestId;
+                        irmLinkedRequestId = null;
+                        try {
+                            const closeRes = await apiCall(`/order-item-requests/${linked}/dismiss`, 'POST', { status: 'applied', note: 'Saved through order editor' });
+                            if (closeRes && closeRes.order_confirmed) irmConfirmedNote = 'Order moved to Confirmed ✔';
+                        } catch (irmErr) { /* request stays pending — admin can retry from the queue */ }
+                        fetchItemRequests();
+                    }
                     // Surface Shopify/GoKwik sync outcome (edits are pushed to both)
                     const sync = data.shopify_sync;
                     const gkSync = data.gokwik_sync;
                     const notes = [];
+                    if (irmConfirmedNote) notes.push(irmConfirmedNote);
                     if (sync && sync.warnings && sync.warnings.length) notes.push(...sync.warnings);
                     if (gkSync && !gkSync.success && !gkSync.skipped) notes.push(`GoKwik sync failed: ${gkSync.reason}`);
                     if (notes.length) {
@@ -1300,11 +1371,36 @@ let inboxEndDate = '';
 let inboxQuickDate = null;
 let inboxActionType = '';
 let inboxConfirmedBy = '';
+let inboxOperator = '';
 let inboxPaymentMethod = '';
 let inboxDeliveryType = '';
 let inboxSearch = '';
 let inboxSelectedItems = new Set();
 let inboxDateField = 'updated_at';
+
+const INBOX_ICON_PATHS = Object.freeze({
+    chat: '<path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/><path d="M8 9h8M8 13h5"/>',
+    check: '<polyline points="20 6 9 17 4 12"/>',
+    user: '<circle cx="12" cy="8" r="4"/><path d="M4 21a8 8 0 0 1 16 0"/>',
+    whatsapp: '<path d="M21 11.5a8.4 8.4 0 0 1-12.4 7.4L3 20l1.1-5.4A8.5 8.5 0 1 1 21 11.5z"/><path d="M8.2 7.8c.3-.7.6-.7.9-.7h.7c.2 0 .4.1.5.4l.9 2.1c.1.3.1.5-.1.7l-.7.8c-.2.2-.1.4 0 .6.6 1.1 1.5 2 2.6 2.6.2.1.4.2.6 0l.8-1c.2-.2.4-.3.7-.2l2.1.9c.3.1.4.3.4.5 0 .4-.2 1.6-.8 2.1-.5.5-1.3.8-2.2.7-1.1-.1-2.7-.6-4.7-2.2-2.4-1.9-3.8-4.2-3.9-5.7-.1-.8.2-1.5.5-1.9z"/>',
+    alert: '<path d="M12 9v4M12 17h.01"/><path d="M10.3 3.9 2.4 18a2 2 0 0 0 1.7 3h15.8a2 2 0 0 0 1.7-3L13.7 3.9a2 2 0 0 0-3.4 0z"/>',
+    'chevron-down': '<polyline points="6 9 12 15 18 9"/>',
+    'chevron-right': '<polyline points="9 6 15 12 9 18"/>'
+});
+
+function inboxIcon(name, size = 16) {
+    return `<svg width="${size}" height="${size}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">${INBOX_ICON_PATHS[name] || ''}</svg>`;
+}
+
+function openInboxChatFromItem(item) {
+    if (!item) return;
+    openChat(
+        item.dataset.phone || '',
+        encodeURIComponent(item.dataset.name || ''),
+        item.dataset.orderId || '',
+        item.dataset.status || 'pending'
+    );
+}
 
 async function fetchInboxCounts() {
     try {
@@ -1794,11 +1890,20 @@ function updateMoActiveFilters() {
     });
 }
 
-async function fetchInboxData() {
+async function fetchInboxData(forceFresh) {
     const container = document.getElementById('inboxListContainer');
     if (!container) return;
+    // Explicit refresh (click event or truthy flag) must bypass the analytics
+    // dedupe key so mutated rows are reflected immediately
+    if (forceFresh) inboxAnalyticsLastQs = null;
 
-    container.innerHTML = '<div style="display:flex;flex-direction:column;align-items:center;justify-content:center;padding:4rem;"><div class="spinner"></div><span style="font-family:\'Archivo Narrow\',sans-serif;letter-spacing:2px;font-weight:500;opacity:0.7;margin-top:1rem;">LOADING...</span></div>';
+    container.innerHTML = `
+        <div class="inbox-loading" role="status">
+            <div class="inbox-loading-spinner" aria-hidden="true"></div>
+            <div class="inbox-loading-title">Loading queue</div>
+            <div class="inbox-loading-text">Fetching the latest customer activity</div>
+        </div>
+    `;
 
     try {
         // Build query params
@@ -1811,6 +1916,7 @@ async function fetchInboxData() {
         }
         if (currentInboxTab === 'confirmed') {
             if (inboxConfirmedBy) qs.push(`confirmedBy=${inboxConfirmedBy}`);
+            if (inboxOperator) qs.push(`operator=${encodeURIComponent(inboxOperator)}`);
             if (inboxPaymentMethod) qs.push(`paymentMethod=${inboxPaymentMethod}`);
             if (inboxDeliveryType) qs.push(`deliveryType=${inboxDeliveryType}`);
             if (inboxDateField) qs.push(`dateField=${inboxDateField}`);
@@ -1825,12 +1931,20 @@ async function fetchInboxData() {
         if (data && data.success) {
             renderInboxList(data.shoppers, data.total);
             fetchInboxCounts(); // refresh counts/badges
+            if (currentInboxTab === 'confirmed') scheduleInboxAnalytics();
         } else {
             throw new Error(data?.error || 'Failed to fetch');
         }
     } catch (err) {
         console.error('Failed to fetch inbox data:', err);
-        container.innerHTML = '<div class="inbox-empty"><div class="inbox-empty-icon">⚠️</div><div class="inbox-empty-title">Error loading data</div><div class="inbox-empty-text">Please try again</div></div>';
+        container.innerHTML = `
+            <div class="inbox-empty inbox-error" role="alert">
+                <div class="inbox-empty-mark">${inboxIcon('alert', 30)}</div>
+                <div class="inbox-empty-title">The queue couldn’t load</div>
+                <div class="inbox-empty-text">Check your connection and try again.</div>
+                <button class="inbox-empty-action" data-inbox-action="retry">Try again</button>
+            </div>
+        `;
     }
 }
 
@@ -1840,39 +1954,39 @@ function renderInboxList(shoppers, total) {
     const prevBtn = document.getElementById('inboxPrevBtn');
     const nextBtn = document.getElementById('inboxNextBtn');
     const listTitle = document.getElementById('inboxListTitle');
+    const queueCount = document.getElementById('inboxQueueCount');
 
     if (!container) return;
 
     if (listTitle) {
-        listTitle.textContent = currentInboxTab === 'unread' ? 'Unread Customer Messages' : 'Recently Confirmed Orders';
+        listTitle.textContent = currentInboxTab === 'unread' ? 'Unread customer messages' : 'Recently confirmed orders';
+    }
+    if (queueCount) {
+        queueCount.textContent = `${total || 0} ${currentInboxTab === 'unread' ? 'conversation' : 'order'}${total === 1 ? '' : 's'}`;
     }
 
-    // Update date bar context label
     const dateBarLabel = document.getElementById('inboxDateBarLabel');
     if (dateBarLabel) {
-        if (currentInboxTab === 'unread') {
-            dateBarLabel.textContent = '📅 Messages from:';
-        } else {
-            dateBarLabel.textContent = inboxDateField === 'updated_at' ? '📅 Confirmed from:' : '📅 Ordered from:';
-        }
+        dateBarLabel.textContent = currentInboxTab === 'unread'
+            ? 'Message date'
+            : (inboxDateField === 'updated_at' ? 'Confirmation date' : 'Order date');
     }
 
-    // Update active filter chip
     updateInboxFilterChip();
 
     if (!shoppers || shoppers.length === 0) {
         const isUnread = currentInboxTab === 'unread';
         const hasDateFilter = inboxStartDate || inboxEndDate || inboxQuickDate;
-        const filterHint = hasDateFilter ? `<div class="inbox-empty-hint" style="margin-top:0.75rem;font-size:0.8rem;opacity:0.5;">A date filter is active — <a href="#" onclick="clearInboxFilters(); return false;" style="color:#25d366;text-decoration:underline;">Clear filter</a> to see all</div>` : '';
         container.innerHTML = `
             <div class="inbox-empty">
-                <div class="inbox-empty-icon">${isUnread ? '💬' : '✓'}</div>
+                <div class="inbox-empty-mark">${inboxIcon(isUnread ? 'chat' : 'check', 30)}</div>
                 <div class="inbox-empty-title">${isUnread ? 'No unread messages' : 'No recent confirmations'}</div>
-                <div class="inbox-empty-text">${isUnread ? 'All customer messages have been attended to' : 'Confirmed orders will appear here'}</div>
-                ${filterHint}
+                <div class="inbox-empty-text">${isUnread ? 'Your customer queue is clear. Nicely done.' : 'Confirmed orders will appear here as they come in.'}</div>
+                ${hasDateFilter ? '<div class="inbox-empty-hint">A date filter is active. Try a wider range to see more.</div>' : ''}
+                <button class="inbox-empty-action" data-inbox-action="${hasDateFilter ? 'clear' : 'back'}">${hasDateFilter ? 'Clear filters' : 'Back to shoppers'}</button>
             </div>
         `;
-        if (pageInfo) pageInfo.textContent = 'Showing 0-0 of 0';
+        if (pageInfo) pageInfo.textContent = 'Showing 0–0 of 0';
         if (prevBtn) prevBtn.disabled = true;
         if (nextBtn) nextBtn.disabled = true;
         return;
@@ -1883,48 +1997,58 @@ function renderInboxList(shoppers, total) {
         const avatarClass = currentInboxTab === 'unread' ? 'unread' : 'confirmed';
         const timeAgo = formatTimeAgo(s.last_message_at || s.last_response_at || s.updated_at);
         const absTime = formatDate(s.last_message_at || s.updated_at || s.created_at);
-    
-        // Confirmation method badge
+
         let methodBadge = '';
         if (s.confirmed_by === 'whatsapp') {
-            methodBadge = '<span class="inbox-method-badge whatsapp">WhatsApp</span>';
+            methodBadge = `<span class="inbox-method-badge whatsapp">${inboxIcon('whatsapp', 11)} WhatsApp</span>`;
         } else if (s.confirmed_by === 'manual') {
-            methodBadge = '<span class="inbox-method-badge manual">Manual</span>';
+            methodBadge = `<span class="inbox-method-badge manual">${inboxIcon('user', 11)} Manual</span>`;
         }
-    
-        // Preview content
+
+        let operatorBadge = '';
+        if (currentInboxTab !== 'unread' && s.confirmed_by_operator) {
+            const when = s.updated_at ? formatDate(s.updated_at) : '';
+            operatorBadge = `<span class="inbox-operator-badge" title="Confirmed by ${escapeHtml(s.confirmed_by_operator)}${when ? ` on ${escapeHtml(when)}` : ''}">By ${escapeHtml(operatorLabel(s.confirmed_by_operator))}</span>`;
+        } else if (currentInboxTab !== 'unread' && s.confirmed_by === 'manual') {
+            operatorBadge = '<span class="inbox-operator-badge unrecorded" title="Confirmed before operator tracking was switched on">Operator not recorded</span>';
+        }
+
         let preview = '';
         if (currentInboxTab === 'unread') {
             const msgText = s.latest_message || s.customer_message || '';
-            const shortMsg = msgText.split('\n')[0].substring(0, 100);
-            preview = `<span class="msg-prefix">MSG:</span> ${escapeHtml(shortMsg)}`;
+            const shortMsg = msgText.split('\n')[0].substring(0, 120);
+            preview = escapeHtml(shortMsg || 'New customer message');
             if (s.unread_count && s.unread_count > 1) {
-                preview += ` <span class="inbox-unread-count">${s.unread_count} unread</span>`;
+                preview += ` <span class="inbox-unread-count">${s.unread_count} new</span>`;
             }
         } else {
             let items = [];
-            try { items = JSON.parse(s.items_json || '[]'); } catch(e) {}
-            const itemNames = items.slice(0, 3).map(i => i.title || i.name).join(', ') + (items.length > 3 ? ` +${items.length - 3} more` : '');
+            try {
+                const parsed = JSON.parse(s.items_json || '[]');
+                items = Array.isArray(parsed) ? parsed : [];
+            } catch (e) {}
+            const itemNames = items.slice(0, 3).map(i => i.title || i.name).filter(Boolean).join(', ') + (items.length > 3 ? ` +${items.length - 3} more` : '');
             preview = escapeHtml(itemNames) || 'No items';
         }
-    
+
         const phoneVal = s.phone || '';
         const orderIdVal = s.order_id || s.shopper_id || '';
         const statusVal = s.status || 'pending';
+        const statusLabel = statusVal.replace(/_/g, ' ');
         const itemKey = orderIdVal || phoneVal;
-        const isChecked = inboxSelectedItems.has(itemKey) ? 'checked' : '';
-    
-        // Time display - different for unread vs confirmed
+        const isChecked = inboxSelectedItems.has(itemKey);
+        const numericTotal = Number(s.order_total || 0);
+        const amount = (Number.isFinite(numericTotal) ? numericTotal : 0).toLocaleString('en-IN', { maximumFractionDigits: 2 });
+
         let timeDisplay = '';
         if (currentInboxTab === 'unread') {
             timeDisplay = `
                 <div class="inbox-time">
-                    <div class="inbox-time-relative">${timeAgo}</div>
+                    <div class="inbox-time-relative">${timeAgo || 'Just now'}</div>
                     <div class="inbox-time-absolute">${absTime}</div>
                 </div>
             `;
         } else {
-            // Confirmed tab: show both created_at and updated_at
             const orderTime = s.created_at ? formatDate(s.created_at) : 'N/A';
             const confirmedTime = s.updated_at ? formatDate(s.updated_at) : 'N/A';
             const orderTimeAgo = s.created_at ? formatTimeAgo(s.created_at) : '';
@@ -1933,48 +2057,70 @@ function renderInboxList(shoppers, total) {
                 <div class="inbox-time inbox-time-dual">
                     <div class="inbox-time-block">
                         <div class="inbox-time-label">Ordered</div>
-                        <div class="inbox-time-relative">${orderTimeAgo}</div>
+                        <div class="inbox-time-relative">${orderTimeAgo || '—'}</div>
                         <div class="inbox-time-absolute">${orderTime}</div>
                     </div>
                     <div class="inbox-time-block">
                         <div class="inbox-time-label">Confirmed</div>
-                        <div class="inbox-time-relative">${confirmedTimeAgo}</div>
+                        <div class="inbox-time-relative">${confirmedTimeAgo || '—'}</div>
                         <div class="inbox-time-absolute">${confirmedTime}</div>
                     </div>
                 </div>
             `;
         }
-    
+
         return `
-            <div class="inbox-item" onclick="openChat('${phoneVal}', '${encodeURIComponent(s.name || '')}', '${orderIdVal}', '${statusVal}')">
-                <div class="inbox-item-checkbox-wrap" onclick="event.stopPropagation()">
-                    <input type="checkbox" class="inbox-item-checkbox" data-phone="${phoneVal}" data-order-id="${orderIdVal}" data-key="${itemKey}" ${isChecked} onchange="onInboxItemCheck(this)">
+            <div class="inbox-item ${currentInboxTab === 'unread' ? 'is-unread' : 'is-confirmed'}${isChecked ? ' selected' : ''}"
+                 role="button" tabindex="0"
+                 data-phone="${escapeHtml(phoneVal)}" data-name="${escapeHtml(s.name || 'Customer')}"
+                 data-order-id="${escapeHtml(orderIdVal)}" data-status="${escapeHtml(statusVal)}"
+                 aria-label="Open conversation with ${escapeHtml(s.name || 'Customer')}">
+                <div class="inbox-item-select">
+                    <input type="checkbox" class="inbox-item-checkbox" data-phone="${escapeHtml(phoneVal)}" data-order-id="${escapeHtml(orderIdVal)}" data-key="${escapeHtml(itemKey)}" ${isChecked ? 'checked' : ''} aria-label="Select ${escapeHtml(s.name || 'customer')}">
                 </div>
-                <div class="inbox-avatar ${avatarClass}">${initials}</div>
-                <div class="inbox-customer-info">
-                    <div class="inbox-customer-name">${currentInboxTab === 'unread' ? '<span class="unread-dot"></span>' : ''}${escapeHtml(s.name || 'Customer')} ${methodBadge}</div>
-                    <div class="inbox-customer-order">${orderIdVal || 'N/A'}</div>
-                    <span class="inbox-status ${statusVal}">${statusVal.toUpperCase()}</span>
+                <div class="inbox-identity">
+                    <div class="inbox-avatar ${avatarClass}">
+                        <span>${initials}</span>
+                        ${currentInboxTab === 'unread' ? '<span class="inbox-avatar-presence" aria-hidden="true"></span>' : ''}
+                    </div>
+                    <div class="inbox-customer-info">
+                        <div class="inbox-customer-name-row">
+                            <div class="inbox-customer-name">${escapeHtml(s.name || 'Customer')}</div>
+                            ${methodBadge}
+                        </div>
+                        <div class="inbox-customer-meta">
+                            <span class="inbox-customer-order">${escapeHtml(orderIdVal || 'N/A')}</span>
+                            <span class="inbox-meta-divider" aria-hidden="true"></span>
+                            <span class="inbox-status ${escapeHtml(statusVal)}">${escapeHtml(statusLabel)}</span>
+                        </div>
+                        ${operatorBadge}
+                    </div>
                 </div>
-                <div class="inbox-preview">${preview}</div>
-                <div>
-                    <div class="inbox-amount">\u20B9${s.order_total || '0'}</div>
-                    <div class="inbox-pay-method">${s.payment_method || 'COD'}</div>
+                <div class="inbox-message">
+                    <div class="inbox-message-label">${currentInboxTab === 'unread' ? 'Latest message' : 'Order items'}</div>
+                    <div class="inbox-preview">${preview}</div>
                 </div>
-                ${timeDisplay}
-                <div class="inbox-actions">
-                    ${currentInboxTab === 'unread' ? `<button class="inbox-action-btn mark-read" onclick="event.stopPropagation(); markInboxAsRead('${phoneVal}')" title="Mark as Read">\u2713 Read</button>` : ''}
-                    <button class="inbox-action-btn chat" onclick="event.stopPropagation(); openChat('${phoneVal}', '${encodeURIComponent(s.name || '')}', '${orderIdVal}', '${statusVal}')">Chat</button>
-                    <a class="inbox-action-btn wa" href="https://wa.me/${formatPhone(phoneVal)}" target="_blank" onclick="event.stopPropagation();">WA</a>
+                <div class="inbox-side">
+                    <div class="inbox-side-top">
+                        <div class="inbox-value">
+                            <div class="inbox-amount">₹${amount}</div>
+                            <div class="inbox-pay-method">${escapeHtml(s.payment_method || 'COD')}</div>
+                        </div>
+                        ${timeDisplay}
+                    </div>
+                    <div class="inbox-actions">
+                        ${currentInboxTab === 'unread' ? `<button class="inbox-action-btn mark-read" data-inbox-action="mark-read" title="Mark as read">${inboxIcon('check', 14)} Read</button>` : ''}
+                        <button class="inbox-action-btn chat" data-inbox-action="chat">${inboxIcon('chat', 14)} Chat</button>
+                        <a class="inbox-action-btn wa" href="https://wa.me/${formatPhone(phoneVal)}" target="_blank" rel="noopener" aria-label="Open WhatsApp chat" title="Open WhatsApp">${inboxIcon('whatsapp', 15)}</a>
+                    </div>
                 </div>
             </div>
         `;
     }).join('');
 
-    // Pagination
     const startNum = inboxPageOffset + 1;
     const endNum = Math.min(inboxPageOffset + inboxLimitPerPage, total);
-    if (pageInfo) pageInfo.textContent = `Showing ${startNum}-${endNum} of ${total}`;
+    if (pageInfo) pageInfo.textContent = `Showing ${startNum}–${endNum} of ${total}`;
     if (prevBtn) prevBtn.disabled = inboxPageOffset === 0;
     if (nextBtn) nextBtn.disabled = endNum >= total;
 }
@@ -2032,6 +2178,11 @@ function updateInboxFilterChip() {
         tags.push(`<span class="chip-tag" onclick="clearInboxFilter('confirmedBy')" title="Clear method filter">Method: ${methodLabel} <span class=\"chip-close\">\u2715</span></span>`);
     }
 
+    // Confirmed-by-operator chip (admin only)
+    if (inboxOperator && currentInboxTab === 'confirmed') {
+        tags.push(`<span class="chip-tag" onclick="clearInboxFilter('operator')" title="Clear operator filter">Operator: ${escapeHtml(operatorLabel(inboxOperator))} <span class=\"chip-close\">\u2715</span></span>`);
+    }
+
     // Payment method chip
     if (inboxPaymentMethod && currentInboxTab === 'confirmed') {
         tags.push(`<span class="chip-tag" onclick="clearInboxFilter('paymentMethod')" title="Clear payment filter">Payment: ${inboxPaymentMethod} <span class=\"chip-close\">\u2715</span></span>`);
@@ -2067,6 +2218,11 @@ function clearInboxFilter(filterName) {
             inboxConfirmedBy = '';
             const cbEl = document.getElementById('inboxConfirmedBy');
             if (cbEl) cbEl.value = '';
+            break;
+        case 'operator':
+            inboxOperator = '';
+            const opEl = document.getElementById('inboxOperatorFilter');
+            if (opEl) opEl.value = '';
             break;
         case 'paymentMethod':
             inboxPaymentMethod = '';
@@ -2153,6 +2309,12 @@ function clearInboxFilters() {
     inboxEndDate = '';
     inboxQuickDate = null;
     inboxActionType = '';
+    // The confirmed-tab dropdowns were never reset here, so "Clear" left the list
+    // filtered by method/payment/delivery/operator while the chip row went empty.
+    inboxConfirmedBy = '';
+    inboxOperator = '';
+    inboxPaymentMethod = '';
+    inboxDeliveryType = '';
 
     const startEl = document.getElementById('inboxStartDate');
     const endEl = document.getElementById('inboxEndDate');
@@ -2160,6 +2322,10 @@ function clearInboxFilters() {
     if (startEl) startEl.value = '';
     if (endEl) endEl.value = '';
     if (actionEl) actionEl.value = '';
+    ['inboxConfirmedBy', 'inboxOperatorFilter', 'inboxPaymentMethod', 'inboxDeliveryType'].forEach(id => {
+        const el = document.getElementById(id);
+        if (el) el.value = '';
+    });
 
     document.querySelectorAll('.inbox-quick-date').forEach(b => b.classList.remove('active'));
 
@@ -2212,6 +2378,7 @@ function debounceInboxSearch() {
 // Inbox dropdown filter change handler
 function onInboxFilterChange() {
     inboxConfirmedBy = document.getElementById('inboxConfirmedBy')?.value || '';
+    inboxOperator = document.getElementById('inboxOperatorFilter')?.value || '';
     inboxPaymentMethod = document.getElementById('inboxPaymentMethod')?.value || '';
     inboxDeliveryType = document.getElementById('inboxDeliveryType')?.value || '';
     inboxPageOffset = 0;
@@ -2233,11 +2400,324 @@ function onInboxDateFieldChange() {
     // Update the date bar label
     const dateBarLabel = document.getElementById('inboxDateBarLabel');
     if (dateBarLabel) {
-        dateBarLabel.textContent = inboxDateField === 'updated_at' ? '\uD83D\uDCC5 Confirmed from:' : '\uD83D\uDCC5 Ordered from:';
+        dateBarLabel.textContent = inboxDateField === 'updated_at' ? 'Confirmation date' : 'Order date';
     }
     inboxPageOffset = 0;
     fetchInboxData();
     updateInboxFilterChip();
+    scheduleInboxAnalytics();
+}
+
+// ==========================================
+// INBOX CONFIRMATION ANALYTICS (confirmed tab)
+// The backend aggregates day×method in one indexed pass; this panel only
+// renders the compact payload. Fetches are debounced and keyed so filter
+// churn doesn't stampede, and pagination is excluded from the key.
+// ==========================================
+
+let inboxAnalyticsCollapsed = false;
+let inboxAnalyticsTimer = null;
+let inboxAnalyticsLastQs = null;
+let inboxAnalyticsReqSeq = 0;
+
+function scheduleInboxAnalytics(force = false) {
+    if (currentInboxTab !== 'confirmed') return;
+    clearTimeout(inboxAnalyticsTimer);
+    inboxAnalyticsTimer = setTimeout(() => fetchInboxAnalytics(force), force ? 0 : 250);
+}
+
+// After a status mutation the backend cache may still hold pre-mutation counts
+// for up to its 60s TTL — drop the dedupe key and force a cache-bypassing fetch
+function invalidateInboxAnalytics() {
+    inboxAnalyticsLastQs = null;
+    if (currentInboxTab === 'confirmed') scheduleInboxAnalytics(true);
+}
+
+function inboxAnalyticsQs(recent) {
+    const qs = [];
+    if (inboxStartDate) qs.push(`startDate=${inboxStartDate}`);
+    if (inboxEndDate) qs.push(`endDate=${inboxEndDate}`);
+    if (inboxSearch) qs.push(`search=${encodeURIComponent(inboxSearch)}`);
+    if (inboxConfirmedBy) qs.push(`confirmedBy=${inboxConfirmedBy}`);
+    if (inboxOperator) qs.push(`operator=${encodeURIComponent(inboxOperator)}`);
+    if (inboxPaymentMethod) qs.push(`paymentMethod=${inboxPaymentMethod}`);
+    if (inboxDeliveryType) qs.push(`deliveryType=${inboxDeliveryType}`);
+    if (inboxDateField) qs.push(`dateField=${inboxDateField}`);
+    if (recent) qs.push('recent=true');
+    return qs.join('&');
+}
+
+async function fetchInboxAnalytics(recent = false) {
+    if (currentInboxTab !== 'confirmed') return;
+    const body = document.getElementById('inboxAnalyticsBody');
+    if (!body) return;
+    const qs = inboxAnalyticsQs(recent);
+    // Same filter already loaded and fresh — don't re-hit the API on pagination
+    if (!recent && inboxAnalyticsLastQs === qs) return;
+    if (!inboxAnalyticsLastQs && !recent) body.innerHTML = '<div class="inbox-analytics-loading">Loading analytics…</div>';
+    const seq = ++inboxAnalyticsReqSeq;
+    try {
+        const data = await apiCall(`/inbox/confirmation-analytics${qs ? `?${qs}` : ''}`);
+        if (seq !== inboxAnalyticsReqSeq) return; // a newer request won the race
+        if (!data || !data.success) throw new Error(data?.error || 'Failed to fetch');
+        renderInboxAnalytics(data);
+        inboxAnalyticsLastQs = qs;
+    } catch (err) {
+        console.error('Inbox analytics error:', err);
+        if (seq === inboxAnalyticsReqSeq) body.innerHTML = '<div class="inbox-analytics-loading">Couldn’t load analytics. Use refresh to try again.</div>';
+    }
+}
+
+function fmtAnalyticsDay(iso) {
+    const d = new Date(`${iso}T00:00:00Z`);
+    if (isNaN(d)) return iso;
+    return d.toLocaleDateString('en-IN', { day: '2-digit', month: 'short', timeZone: 'UTC' });
+}
+
+// Hub logins are stored as-is ('pooja.desk', 'shopper_admin'). Show the readable
+// stem; the raw handle stays in the title/tooltip so nothing is lost.
+function operatorLabel(actor) {
+    if (!actor) return '—';
+    if (actor === 'shopper_admin' || actor === 'admin') return 'Admin';
+    const first = String(actor).split('.')[0].replace(/[_-]/g, ' ').trim();
+    if (!first) return actor;
+    return first.charAt(0).toUpperCase() + first.slice(1);
+}
+
+// Rank order is stable within a render, so bars keep the same tonal treatment
+// between refreshes as long as nobody changes position in the leaderboard.
+const OPERATOR_COLORS = ['rgba(255,255,255,0.92)', 'rgba(255,255,255,0.72)', 'rgba(255,255,255,0.54)', 'rgba(255,255,255,0.38)', 'rgba(255,255,255,0.82)', 'rgba(255,255,255,0.64)', 'rgba(255,255,255,0.46)', 'rgba(255,255,255,0.30)'];
+const SYNTHETIC_ACTORS = { automated: 'Auto', unrecorded: '—' };
+
+// The operator dropdown is built from data rather than hardcoded, so a new hub
+// account needs no code change to become filterable.
+function syncOperatorOptions(operators) {
+    const sel = document.getElementById('inboxOperatorFilter');
+    if (!sel) return;
+    const named = (operators || []).filter(o => o.actor && !SYNTHETIC_ACTORS[o.actor]);
+    const previous = sel.value;
+    sel.innerHTML = '<option value="">All Operators</option>' + named.map(o =>
+        `<option value="${escapeHtml(o.actor)}">${escapeHtml(operatorLabel(o.actor))} (${o.count})</option>`
+    ).join('');
+    // Keep the active filter even if that person has no confirms in this window
+    if (previous && !named.some(o => o.actor === previous)) {
+        sel.insertAdjacentHTML('afterbegin', `<option value="${escapeHtml(previous)}">${escapeHtml(operatorLabel(previous))} (0)</option>`);
+    }
+    sel.value = previous || '';
+}
+
+function analyticsChangeHtml(pct) {
+    if (pct === null || pct === undefined) return '<span class="inbox-analytics-delta flat">—</span>';
+    const cls = pct > 0 ? 'up' : (pct < 0 ? 'down' : 'flat');
+    const sign = pct > 0 ? '+' : (pct < 0 ? '−' : '');
+    return `<span class="inbox-analytics-delta ${cls}">${sign}${Math.abs(pct)}%</span>`;
+}
+
+function analyticsCard(cls, value, label, sub) {
+    return `<div class="inbox-analytics-card ${cls}"><div class="iac-value">${value}</div><div class="iac-label">${label}</div>${sub ? `<div class="iac-sub">${sub}</div>` : ''}</div>`;
+}
+
+function renderInboxAnalytics(data) {
+    const body = document.getElementById('inboxAnalyticsBody');
+    const rangeEl = document.getElementById('inboxAnalyticsRange');
+    if (!body) return;
+
+    const s = data.summary || {};
+    const range = data.range || {};
+    if (rangeEl) rangeEl.textContent = range.startDate
+        ? `${fmtAnalyticsDay(range.startDate)} → ${fmtAnalyticsDay(range.endDate)}${range.clamped ? ` (capped at last ${range.spanDays} days)` : ''}`
+        : '';
+
+    if (!s.total) {
+        body.innerHTML = '<div class="inbox-analytics-loading">No confirmations in this period</div>';
+        return;
+    }
+
+    const ch = s.change_pct || {};
+    const cards = [
+        analyticsCard('total', s.total, 'Confirmed', `${analyticsChangeHtml(ch.total)} vs prev ${range.spanDays || ''}d`.trim()),
+        analyticsCard('whatsapp', `${s.whatsapp}<i>${s.whatsapp_pct}%</i>`, 'WhatsApp', analyticsChangeHtml(ch.whatsapp)),
+        analyticsCard('manual', `${s.manual}<i>${s.manual_pct}%</i>`, 'Manual', analyticsChangeHtml(ch.manual))
+    ];
+    if (s.other) cards.push(analyticsCard('other', `${s.other}<i>${s.other_pct}%</i>`, 'Other', ''));
+    cards.push(analyticsCard('avg', s.avg_per_day, 'Per Day', s.peak_day ? `Peak ${s.peak_day.total} · ${fmtAnalyticsDay(s.peak_day.date)}` : ''));
+
+    // Method mix bar (each confirmed_by value gets a segment)
+    const METHOD_COLORS = { whatsapp: 'rgba(255,255,255,0.92)', manual: 'rgba(255,255,255,0.48)' };
+    const OTHER_COLOR = 'rgba(255,255,255,0.22)';
+    const methods = (data.methods || []).filter(m => m.count > 0);
+    const mixBar = methods.length > 0 ? `
+        <div class="inbox-analytics-mix">
+            <div class="iac-mix-label">Method mix</div>
+            <div class="iac-mix-bar">${methods.map(m =>
+                `<span class="iac-mix-seg" style="width:${m.pct}%;background:${METHOD_COLORS[m.method] || OTHER_COLOR}" title="${escapeHtml(m.method)}: ${m.count} (${m.pct}%)"></span>`
+            ).join('')}</div>
+            <div class="iac-mix-legend">${methods.map(m =>
+                `<span><i style="background:${METHOD_COLORS[m.method] || OTHER_COLOR}"></i>${escapeHtml(m.method)} ${m.count} · ${m.pct}%</span>`
+            ).join('')}</div>
+        </div>` : '';
+
+    // Daily stacked bars, oldest → newest
+    const days = (data.daily || []).slice().sort((a, b) => (a.date > b.date ? 1 : -1));
+    const maxTotal = days.reduce((m, d) => Math.max(m, d.total), 0) || 1;
+    const chart = `
+        <div class="inbox-analytics-chart">
+            <div class="iac-chart-label">Daily confirmations${days.length > 31 ? ` (last 31 days)` : ''}</div>
+            <div class="iac-bars">${days.slice(-31).map(d => {
+                const parts = [['whatsapp', METHOD_COLORS.whatsapp], ['manual', METHOD_COLORS.manual], ['other', OTHER_COLOR]]
+                    .map(([k, color]) => d[k] > 0
+                        ? `<span class="iac-bar-seg" style="height:${(d[k] / maxTotal) * 100}%;background:${color}" title="${k}: ${d[k]}"></span>`
+                        : '')
+                    .join('');
+                const title = `${fmtAnalyticsDay(d.date)} — ${d.total} confirmed\nWhatsApp ${d.whatsapp} · Manual ${d.manual}${d.other ? ` · Other ${d.other}` : ''}`;
+                return `<div class="iac-bar-col" title="${escapeHtml(title)}"><div class="iac-bar-total">${d.total}</div><div class="iac-bar">${parts}</div><div class="iac-bar-day">${d.date.slice(8, 10)}</div></div>`;
+            }).join('')}</div>
+        </div>`;
+
+    body.innerHTML = `<div class="inbox-analytics-cards">${cards.join('')}</div>${mixBar}${chart}${renderOperatorSection(data)}${renderDateSection(data)}`;
+}
+
+// "Confirmed by which operator" — ranked bars over human confirms only, so the
+// bot does not dwarf the people. share_pct comes from the backend against the
+// human total; the delta is versus the previous equal-length window.
+function renderOperatorSection(data) {
+    const operators = (data.operators || []).filter(o => o.count > 0);
+    if (!operators.length) return '';
+
+    syncOperatorOptions(operators);
+
+    const named = operators.filter(o => !SYNTHETIC_ACTORS[o.actor]);
+    const synthetic = operators.filter(o => SYNTHETIC_ACTORS[o.actor]);
+    if (!named.length && !synthetic.length) return '';
+
+    const max = named.reduce((m, o) => Math.max(m, o.count), 0) || 1;
+    const rows = named.map((o, i) => {
+        const color = OPERATOR_COLORS[i % OPERATOR_COLORS.length];
+        const title = `${o.actor} — ${o.count} confirmed · ${o.days_active} day(s) active\n` +
+            `Avg ${o.avg_per_day}/day · Peak ${o.peak_day ? o.peak_day.count : 0} on ${o.peak_day ? fmtAnalyticsDay(o.peak_day.date) : '—'}\n` +
+            `Last confirmation ${o.last_date ? fmtAnalyticsDay(o.last_date) : '—'}`;
+        return `
+            <div class="iac-op-row${inboxOperator === o.actor ? ' active' : ''}" data-analytics-operator="${escapeHtml(o.actor)}" title="${escapeHtml(title.trim())}">
+                <span class="iac-op-name">${escapeHtml(operatorLabel(o.actor))}</span>
+                <span class="iac-op-track"><span class="iac-op-fill" style="width:${Math.max(2, (o.count / max) * 100)}%;background:${color}"></span></span>
+                <span class="iac-op-count">${o.count}<i>${o.share_pct}%</i></span>
+                <span class="iac-op-meta">${analyticsChangeHtml(o.change_pct)} · ${o.days_active}d · ${o.avg_per_day}/d</span>
+            </div>`;
+    }).join('');
+
+    const foot = synthetic.map(o =>
+        `<span class="iac-op-synthetic">${SYNTHETIC_ACTORS[o.actor]}: ${o.count}</span>`
+    ).join('');
+    const att = data.attribution;
+    const caveat = att && att.unrecorded > 0
+        ? `<div class="iac-note">${att.unrecorded} manual confirm${att.unrecorded === 1 ? '' : 's'} in this window predate operator tracking — ${att.coverage_pct}% of manual work is attributed.</div>`
+        : '';
+
+    return `
+        <div class="inbox-analytics-ops">
+            <div class="iac-section-title">Confirmed by operator${att ? ` <span class="iac-section-sub">${att.attributed} of ${att.human_total} manual</span>` : ''}</div>
+            ${rows || '<div class="iac-note">No named operator confirmations in this period.</div>'}
+            ${foot ? `<div class="iac-op-synthetic-row">${foot}</div>` : ''}
+            ${caveat}
+        </div>`;
+}
+
+// "Confirmed orders of which date" — one row per IST day with that day's
+// operator split. Rows are clickable: they scope the list to the single day, and
+// the operator chips scope it to that person on that day.
+function renderDateSection(data) {
+    const daily = (data.daily || []).slice(0, 14);
+    if (!daily.length) return '';
+    const hasOperators = daily.some(d => d.byActor && Object.keys(d.byActor).length);
+
+    const rows = daily.map(d => {
+        const actors = Object.entries(d.byActor || {}).sort((a, b) => b[1] - a[1]);
+        const chips = actors.map(([actor, n]) =>
+            SYNTHETIC_ACTORS[actor]
+                ? `<span class="iac-day-chip synthetic" title="${actor}">${SYNTHETIC_ACTORS[actor]} ${n}</span>`
+                : `<span class="iac-day-chip" data-analytics-operator="${escapeHtml(actor)}" title="${escapeHtml(actor)} on ${d.date}">${escapeHtml(operatorLabel(actor))} ${n}</span>`
+        ).join('');
+        return `
+            <tr class="iac-date-row${inboxStartDate === d.date && inboxEndDate === d.date ? ' active' : ''}" data-analytics-date="${d.date}" title="Show only ${fmtAnalyticsDay(d.date)}">
+                <td class="iac-day-date">${fmtAnalyticsDay(d.date)}</td>
+                <td class="iac-day-total">${d.total}</td>
+                <td>${d.whatsapp}</td>
+                <td>${d.manual}</td>
+                ${hasOperators ? `<td class="iac-day-actors">${chips || '<span class="iac-day-chip synthetic">—</span>'}</td>` : ''}
+            </tr>`;
+    }).join('');
+
+    return `
+        <div class="inbox-analytics-dates">
+            <div class="iac-section-title">Confirmed by date <span class="iac-section-sub">${daily.length === 14 ? 'latest 14 days · ' : ''}click a day to filter</span></div>
+            <table class="iac-date-table${hasOperators ? ' with-operators' : ''}">
+                <thead><tr><th>Date</th><th>Total</th><th>WhatsApp</th><th>Manual</th>${hasOperators ? '<th>Operators</th>' : ''}</tr></thead>
+                <tbody>${rows}</tbody>
+            </table>
+        </div>`;
+}
+
+// Clicking an operator in the panel applies the same filter the dropdown would,
+// and clicking again removes it — the table is a control, not just a readout.
+function applyInboxOperatorFilter(actor) {
+    if (!actor) return;
+    inboxOperator = inboxOperator === actor ? '' : actor;
+    const sel = document.getElementById('inboxOperatorFilter');
+    if (sel) sel.value = inboxOperator;
+    inboxPageOffset = 0;
+    fetchInboxData();
+    updateInboxFilterChip();
+    scheduleInboxAnalytics(true);
+}
+
+// Clicking a date row scopes the list to that single IST day (toggle off on the
+// second click). Uses the existing date inputs so the bar above stays truthful
+// about what is applied.
+function applyInboxDayDrill(date) {
+    if (!date) return;
+    const isActive = inboxStartDate === date && inboxEndDate === date;
+    inboxStartDate = isActive ? '' : date;
+    inboxEndDate = isActive ? '' : date;
+    inboxQuickDate = null;
+    const startEl = document.getElementById('inboxStartDate');
+    const endEl = document.getElementById('inboxEndDate');
+    if (startEl) startEl.value = inboxStartDate;
+    if (endEl) endEl.value = inboxEndDate;
+    document.querySelectorAll('.inbox-quick-date').forEach(b => b.classList.remove('active'));
+    inboxPageOffset = 0;
+    fetchInboxData();
+    updateInboxFilterChip();
+}
+
+function setupInboxAnalyticsEvents() {
+    const toggleBtn = document.getElementById('inboxAnalyticsToggle');
+    const panel = document.getElementById('inboxAnalyticsPanel');
+    const refreshBtn = document.getElementById('inboxAnalyticsRefresh');
+    if (toggleBtn && panel) {
+        toggleBtn.addEventListener('click', () => {
+            inboxAnalyticsCollapsed = !inboxAnalyticsCollapsed;
+            panel.classList.toggle('collapsed', inboxAnalyticsCollapsed);
+            toggleBtn.innerHTML = inboxIcon(inboxAnalyticsCollapsed ? 'chevron-right' : 'chevron-down', 14);
+            toggleBtn.setAttribute('aria-expanded', String(!inboxAnalyticsCollapsed));
+        });
+    }
+    if (refreshBtn) {
+        refreshBtn.addEventListener('click', () => {
+            inboxAnalyticsLastQs = null;
+            scheduleInboxAnalytics(true);
+        });
+    }
+    // Delegated once: renderInboxAnalytics replaces the panel body on every fetch,
+    // so per-row listeners would be dropped (or stacked) on each refresh.
+    const panelBody = document.getElementById('inboxAnalyticsBody');
+    if (panelBody) {
+        panelBody.addEventListener('click', (e) => {
+            const opEl = e.target.closest('[data-analytics-operator]');
+            if (opEl) { applyInboxOperatorFilter(opEl.dataset.analyticsOperator); return; }
+            const dayEl = e.target.closest('[data-analytics-date]');
+            if (dayEl) applyInboxDayDrill(dayEl.dataset.analyticsDate);
+        });
+    }
 }
 
 // Checkbox change handler for individual items
@@ -2248,6 +2728,7 @@ function onInboxItemCheck(checkbox) {
     } else {
         inboxSelectedItems.delete(key);
     }
+    checkbox.closest('.inbox-item')?.classList.toggle('selected', checkbox.checked);
     updateInboxBulkBar();
 }
 
@@ -2257,6 +2738,7 @@ function inboxSelectAll() {
     const allChecked = [...checkboxes].every(cb => cb.checked);
     checkboxes.forEach(cb => {
         cb.checked = !allChecked;
+        cb.closest('.inbox-item')?.classList.toggle('selected', !allChecked);
         const key = cb.dataset.key;
         if (!allChecked) {
             inboxSelectedItems.add(key);
@@ -2265,22 +2747,23 @@ function inboxSelectAll() {
         }
     });
     const selectAllBtn = document.getElementById('inboxSelectAllBtn');
-    if (selectAllBtn) {
-        selectAllBtn.textContent = allChecked ? 'Select All' : 'Deselect All';
-        selectAllBtn.classList.toggle('active', !allChecked);
-    }
+    const selectAllLabel = document.getElementById('inboxSelectAllLabel');
+    if (selectAllBtn) selectAllBtn.classList.toggle('active', !allChecked);
+    if (selectAllLabel) selectAllLabel.textContent = allChecked ? 'Select all' : 'Deselect all';
     updateInboxBulkBar();
 }
 
 // Deselect all items
 function inboxDeselectAll() {
     inboxSelectedItems.clear();
-    document.querySelectorAll('.inbox-item-checkbox').forEach(cb => cb.checked = false);
+    document.querySelectorAll('.inbox-item-checkbox').forEach(cb => {
+        cb.checked = false;
+        cb.closest('.inbox-item')?.classList.remove('selected');
+    });
     const selectAllBtn = document.getElementById('inboxSelectAllBtn');
-    if (selectAllBtn) {
-        selectAllBtn.textContent = 'Select All';
-        selectAllBtn.classList.remove('active');
-    }
+    const selectAllLabel = document.getElementById('inboxSelectAllLabel');
+    if (selectAllBtn) selectAllBtn.classList.remove('active');
+    if (selectAllLabel) selectAllLabel.textContent = 'Select all';
     updateInboxBulkBar();
 }
 
@@ -2333,6 +2816,7 @@ async function exportInboxOrders(selectedOnly) {
 
     if (currentInboxTab === 'confirmed') {
         if (inboxConfirmedBy) qs.push(`confirmedBy=${inboxConfirmedBy}`);
+        if (inboxOperator) qs.push(`operator=${encodeURIComponent(inboxOperator)}`);
         if (inboxPaymentMethod) qs.push(`paymentMethod=${inboxPaymentMethod}`);
         if (inboxDeliveryType) qs.push(`deliveryType=${inboxDeliveryType}`);
         if (inboxDateField) qs.push(`dateField=${inboxDateField}`);
@@ -2591,6 +3075,7 @@ async function bulkUpdateStatus(status) {
     clearSelection();
     fetchShoppersData();
     fetchInboxCounts()
+    invalidateInboxAnalytics();
 }
 
 async function bulkDelete() {
@@ -2891,8 +3376,27 @@ function renderCards(shoppers, total, append = false) {
     }
 }
 
+// Focus one order's card in the already-rendered grid: used by the ?search=
+// deep link after the filtered fetch renders. Scrolls the exact order-id match
+// into view and pulses a highlight; silently no-ops when there is no match.
+function autoFocusOrderCard(orderNum) {
+    const want = String(orderNum || '').replace(/\D/g, '');
+    if (!want) return;
+    const row = allLoadedShoppers.find(s => String(s.order_id || '').replace(/\D/g, '') === want);
+    if (!row) return;
+    const card = document.getElementById(`card-${row.id}`);
+    if (!card) return;
+    card.scrollIntoView({ behavior: 'smooth', block: 'center' });
+    card.classList.add('deep-link-focus');
+    setTimeout(() => card.classList.remove('deep-link-focus'), 4000);
+}
+
 function openEditModal(id, nameEnc, phone, orderId, addressEnc, itemsEnc, messageEnc, msgTime, paymentEnc, orderTotal) {
     if (!hubRequirePerm('edit_orders', 'edit shopper details')) return;
+    // Fresh open — this save must not auto-close a queue request unless the
+    // admin explicitly previews one (irmOpenInEditor sets it afterwards)
+    irmLinkedRequestId = null;
+    renderEditReqBanner(orderId);
     document.getElementById('editShopperId').value = id;
     document.getElementById('editName').value = nameEnc ? decodeURIComponent(nameEnc) : '';
     document.getElementById('editPhone').value = phone;
@@ -4035,6 +4539,7 @@ async function updateStatus(id, status) {
             }
             fetchShoppersData();
             fetchInboxCounts()
+            invalidateInboxAnalytics();
         } else {
             alert('Failed to update status');
         }
@@ -6880,6 +7385,7 @@ async function confirmCancelWithReason() {
     fetchShoppersData();
     fetchInboxCounts();
     if (typeof fetchMultiOrdersData === 'function') fetchMultiOrdersData();
+    invalidateInboxAnalytics();
 }
 
 window.openCancelReasonModal = openCancelReasonModal;
@@ -9227,4 +9733,267 @@ function getStatusClass(status) {
     if (['pending', 'initiated', 'pickup_pending'].includes(s)) return 'ctx-status-warning';
     return 'ctx-status-neutral';
 }
+
+// ════════════════════════════════════════════════════════════════
+// Item change requests — the queue behind the website edit panel's
+// "change size / qty / remove / add a product from the store"
+// requests. Applying one writes the final items onto the hub row
+// and mirrors them to Shopify AND GoKwik server-side (same trio the
+// edit-modal save performs), then acks the customer on WhatsApp.
+// ════════════════════════════════════════════════════════════════
+let irmPending = [];
+let irmAll = null;                 // history-tab cache, dropped on every fetch
+let irmActiveStatus = 'pending';
+let irmLinkedRequestId = null;     // set when the editor was opened FROM a request
+let irmBusy = false;
+
+async function fetchItemRequests() {
+    try {
+        const data = await apiCall('/order-item-requests?status=pending');
+        irmPending = (data && data.success) ? (data.requests || []) : [];
+    } catch (err) {
+        irmPending = [];
+    }
+    irmAll = null;
+    irmUpdateBadge();
+    const modal = document.getElementById('itemRequestsModal');
+    if (modal && modal.classList.contains('active')) renderItemRequests();
+}
+
+function irmUpdateBadge() {
+    const badge = document.getElementById('itemReqBadge');
+    if (!badge) return;
+    const n = irmPending.filter(r => !r.shipped).length;
+    badge.textContent = n;
+    badge.style.display = n > 0 ? 'inline-flex' : 'none';
+}
+
+function irmItemsListHtml(items, highlightAdds) {
+    if (!Array.isArray(items) || !items.length) return '<div class="irm-empty">no items</div>';
+    return items.map(i => {
+        const size = i.size || i.variant_title || '';
+        const added = highlightAdds && i.requested_add;
+        return `<div class="irm-item${added ? ' irm-item-added' : ''}">`
+            + `<span class="irm-item-name">${escapeHtml(i.title || i.name || 'Product')}${size ? ` · ${escapeHtml(String(size))}` : ''}</span>`
+            + `<span class="irm-item-qty">×${parseInt(i.quantity, 10) || 1}</span>`
+            + `<span class="irm-item-price">₹${(Math.round((parseFloat(i.price) || 0) * (parseInt(i.quantity, 10) || 1) * 100) / 100).toLocaleString('en-IN')}</span>`
+            + (added ? '<span class="irm-item-tag">new</span>' : '')
+            + '</div>';
+    }).join('');
+}
+
+function irmRequestCardHtml(r) {
+    const pending = r.status === 'pending';
+    const locked = pending && r.shipped;
+    const req = r.request || {};
+    const lines = [];
+    (req.items || []).forEach((ch) => {
+        if (ch.remove) lines.push(`Remove <strong>${escapeHtml(ch.title)}</strong>`);
+        else {
+            const bits = [];
+            if (ch.toVariantTitle) bits.push(`size → ${escapeHtml(ch.toVariantTitle)}`);
+            if (ch.qty != null) bits.push(`qty → ${ch.qty}`);
+            if (bits.length) lines.push(`${escapeHtml(ch.title)}: ${bits.join(', ')}`);
+        }
+    });
+    (req.adds || []).forEach((ad) => {
+        lines.push(`Add <strong>${escapeHtml(ad.title)}${ad.variantTitle ? ` · ${escapeHtml(ad.variantTitle)}` : ''}</strong> ×${ad.quantity || 1} (₹${(parseFloat(ad.price) || 0).toLocaleString('en-IN')} each)`);
+    });
+    if (req.note) lines.push(`Customer note: “${escapeHtml(req.note)}”`);
+    const actions = pending ? `
+        <div class="irm-actions">
+            <button type="button" class="btn btn-primary irm-btn-apply" data-irm-apply="${r.id}" ${locked ? 'disabled' : ''}>✔ Apply &amp; Sync GoKwik</button>
+            <button type="button" class="btn btn-outline" data-irm-edit="${r.id}" ${locked ? 'disabled' : ''}>Open in Editor</button>
+            <button type="button" class="btn btn-outline irm-btn-dismiss" data-irm-dismiss="${r.id}" ${locked ? 'disabled' : ''}>Dismiss</button>
+        </div>` : `
+        <div class="irm-resolved">${r.status === 'applied' ? '✔ Applied' : '✕ Dismissed'} by ${escapeHtml(r.resolved_by || 'team')}${r.resolved_at ? ` · ${formatDate(r.resolved_at)}` : ''}${r.resolution_note ? ` · ${escapeHtml(r.resolution_note)}` : ''}</div>`;
+    return `
+    <div class="irm-card${locked ? ' irm-locked' : ''}">
+        <div class="irm-card-head">
+            <div>
+                <span class="irm-order">${escapeHtml(r.order_id || '')}</span>
+                <span class="irm-customer">${escapeHtml(r.customer_name || 'Customer')} · ${escapeHtml(r.phone || '')}</span>
+            </div>
+            <div class="irm-head-right">
+                ${pending && String(r.shopper_status || '') === 'edit_details' ? '<span class="irm-queue-chip" title="Applying this request moves the order to Confirmed">in Edits queue</span>' : ''}
+                <span class="badge badge-status ${pending ? 'pending' : (r.status === 'applied' ? 'confirmed' : 'cancelled')}">${pending ? 'PENDING' : r.status.toUpperCase()}</span>
+                <span class="irm-time">${formatDate(r.created_at)}</span>
+            </div>
+        </div>
+        <div class="irm-lines">${lines.map(l => `<div class="irm-line">→ ${l}</div>`).join('')}</div>
+        ${r.unmatched_titles && r.unmatched_titles.length ? `<div class="irm-warn">⚠ Not found on the current order (apply by hand): ${r.unmatched_titles.map(t => escapeHtml(t)).join(', ')}</div>` : ''}
+        ${locked ? '<div class="irm-warn">⚠ Order already shipped — actions are closed.</div>' : ''}
+        <div class="irm-cols">
+            <div class="irm-col"><div class="irm-col-title">Current items · ₹${(parseFloat(r.order_total) || 0).toLocaleString('en-IN')}</div>${irmItemsListHtml(r.current_items, false)}</div>
+            <div class="irm-col"><div class="irm-col-title">After applying · ₹${(parseFloat(r.proposed_total) || 0).toLocaleString('en-IN')}</div>${irmItemsListHtml(r.proposed_items, true)}</div>
+        </div>
+        ${actions}
+    </div>`;
+}
+
+async function renderItemRequests() {
+    const listEl = document.getElementById('irmList');
+    if (!listEl) return;
+    const countEl = document.getElementById('irmCountPending');
+    if (countEl) countEl.textContent = irmPending.length ? `(${irmPending.length})` : '';
+    if (irmActiveStatus === 'pending') {
+        listEl.innerHTML = irmPending.length
+            ? irmPending.map(irmRequestCardHtml).join('')
+            : '<div class="irm-none">No pending item change requests. 🎉</div>';
+        return;
+    }
+    if (!irmAll) {
+        listEl.innerHTML = '<div class="table-loading"><div class="spinner"></div><span>Loading history…</span></div>';
+        try {
+            const data = await apiCall('/order-item-requests?status=all');
+            irmAll = (data && data.success) ? (data.requests || []) : [];
+        } catch (err) {
+            listEl.innerHTML = '<div class="irm-none">Failed to load history.</div>';
+            return;
+        }
+    }
+    listEl.innerHTML = irmAll.length
+        ? irmAll.map(irmRequestCardHtml).join('')
+        : '<div class="irm-none">No requests yet.</div>';
+}
+
+function openItemRequestsModal() {
+    const modal = document.getElementById('itemRequestsModal');
+    if (!modal) return;
+    modal.classList.add('active');
+    renderItemRequests();
+    fetchItemRequests();
+}
+
+function closeItemRequestsModal() {
+    document.getElementById('itemRequestsModal')?.classList.remove('active');
+}
+
+async function irmApply(id) {
+    if (!hubRequirePerm('edit_orders', 'apply item change requests')) return;
+    if (irmBusy) return;
+    const r = irmPending.find(x => String(x.id) === String(id));
+    if (!r) return;
+    const total = (parseFloat(r.proposed_total) || 0).toLocaleString('en-IN');
+    const confirmHead = String(r.shopper_status || '') === 'edit_details'
+        ? 'Apply this request — the order moves to Confirmed and syncs Shopify + GoKwik?'
+        : 'Apply this request and sync Shopify + GoKwik?';
+    if (!confirm(`${confirmHead}\n\n${r.summary || 'Item changes'}\n\nNew order total: ₹${total}`)) return;
+    irmBusy = true;
+    try {
+        const data = await apiCall(`/order-item-requests/${id}/apply`, 'POST', {});
+        if (data && data.success) {
+            const notes = [];
+            if (data.order_status === 'confirmed') notes.push('Order moved to Confirmed ✔');
+            if (data.shopify_sync && data.shopify_sync.warnings && data.shopify_sync.warnings.length) notes.push(...data.shopify_sync.warnings);
+            const gk = data.gokwik_sync;
+            if (gk && gk.success) notes.push('GoKwik synced ✔');
+            else if (gk && gk.skipped) notes.push(`GoKwik sync skipped (${gk.reason || 'not configured'}) — GoKwik follows the Shopify order`);
+            else if (gk && !gk.success) notes.push(`⚠ GoKwik sync failed: ${gk.reason}`);
+            alert(`Request applied for ${r.order_id}. New total ₹${(parseFloat(data.order_total) || 0).toLocaleString('en-IN')}.\n\n${notes.join('\n') || 'Shopify sync OK.'}`);
+            await fetchItemRequests();
+            fetchShoppersData();
+        } else {
+            alert((data && data.error) || 'Failed to apply request');
+        }
+    } catch (err) {
+        alert('Error applying request');
+    } finally {
+        irmBusy = false;
+    }
+}
+
+async function irmDismiss(id) {
+    if (!hubRequirePerm('edit_orders', 'close item change requests')) return;
+    const note = prompt('Close this request without applying. Reason (optional, kept for the audit trail):', '');
+    if (note === null) return;
+    try {
+        const data = await apiCall(`/order-item-requests/${id}/dismiss`, 'POST', { note });
+        if (data && data.success) {
+            await fetchItemRequests();
+        } else {
+            alert((data && data.error) || 'Failed to close request');
+        }
+    } catch (err) {
+        alert('Error closing request');
+    }
+}
+
+// Open the request in the normal order editor with the proposed items
+// pre-loaded; saving the editor syncs Shopify + GoKwik (existing PUT) and
+// auto-closes the request as applied.
+function irmOpenInEditor(id) {
+    if (!hubRequirePerm('edit_orders', 'edit order details')) return;
+    const r = irmPending.find(x => String(x.id) === String(id));
+    if (!r || !r.shopper_id) { alert('Shopper row not found for this request'); return; }
+    closeItemRequestsModal();
+    openEditModal(
+        r.shopper_id,
+        encodeURIComponent(r.customer_name || ''),
+        r.phone || '',
+        r.order_id || '',
+        '', // address is filled by fillEditAddressFields(id)
+        encodeURIComponent(JSON.stringify(r.proposed_items || [])),
+        '', '',
+        encodeURIComponent(r.payment_method || ''),
+        r.proposed_total || r.order_total || 0
+    );
+    irmLinkedRequestId = r.id;
+}
+
+// "Preview in editor" from the banner inside the edit modal — swaps the rows
+// already mounted without re-opening the modal.
+function irmPreviewInEditor(id) {
+    const r = (irmPending || []).find(x => String(x.id) === String(id));
+    if (!r) return;
+    mountOrderEditor('editOrderEditor', {
+        items: JSON.stringify(r.proposed_items || []),
+        orderTotal: r.proposed_total || 0,
+        paymentMethod: oeState ? oeState.originalPayment : ''
+    });
+    irmLinkedRequestId = r.id;
+    renderEditReqBanner(document.getElementById('editOrderId')?.value);
+}
+
+// Banner inside the edit modal: pending requests attached to this order
+function renderEditReqBanner(orderId) {
+    const el = document.getElementById('editReqBanner');
+    if (!el) return;
+    const want = String(orderId || '').replace(/\D/g, '');
+    const reqs = (irmPending || []).filter(x => String(x.order_id || '').replace(/\D/g, '') === want && x.status === 'pending');
+    if (!reqs.length) { el.innerHTML = ''; return; }
+    el.innerHTML = reqs.map(x => `
+        <div class="irm-edit-banner">
+            <span>🔧 Customer requested (website): <strong>${escapeHtml(x.summary || 'item changes')}</strong> — new total ₹${(parseFloat(x.proposed_total) || 0).toLocaleString('en-IN')}</span>
+            <button type="button" class="btn btn-outline" onclick="irmPreviewInEditor(${x.id})">Preview in editor</button>
+        </div>`).join('');
+}
+
+// Queue interactions (delegated — cards re-render constantly)
+(function initItemRequests() {
+    const modal = document.getElementById('itemRequestsModal');
+    const btn = document.getElementById('itemRequestsBtn');
+    if (!modal || !btn) return;
+    btn.addEventListener('click', openItemRequestsModal);
+    document.getElementById('irmCloseBtn')?.addEventListener('click', closeItemRequestsModal);
+    document.getElementById('irmRefreshBtn')?.addEventListener('click', () => fetchItemRequests());
+    modal.addEventListener('click', (e) => {
+        if (e.target === modal) { closeItemRequestsModal(); return; }
+        const tab = e.target.closest('.irm-tab');
+        if (tab) {
+            modal.querySelectorAll('.irm-tab').forEach(t => t.classList.remove('active'));
+            tab.classList.add('active');
+            irmActiveStatus = tab.dataset.irmStatus || 'pending';
+            renderItemRequests();
+            return;
+        }
+        const applyBtn = e.target.closest('[data-irm-apply]');
+        if (applyBtn) { irmApply(applyBtn.dataset.irmApply); return; }
+        const editBtn = e.target.closest('[data-irm-edit]');
+        if (editBtn) { irmOpenInEditor(editBtn.dataset.irmEdit); return; }
+        const dismissBtn = e.target.closest('[data-irm-dismiss]');
+        if (dismissBtn) irmDismiss(dismissBtn.dataset.irmDismiss);
+    });
+})();
+
 

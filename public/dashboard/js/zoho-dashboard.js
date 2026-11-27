@@ -533,6 +533,15 @@ async function loadCodLog(page = 1, userInitiated = false) {
             document.getElementById('statCodPending').textContent = codStats.pending || 0;
             document.getElementById('statCodReconciled').textContent = codStats.reconciledToday?.count || 0;
             document.getElementById('statCodAmount').textContent = `₹${(codStats.reconciledToday?.amount || 0).toLocaleString('en-IN')}`;
+            // Delivered orders with no payment recorded — the number that
+            // actually says "Zoho still shows these as unpaid".
+            const pill = document.getElementById('codBacklogPill');
+            if (pill) {
+                const n = codStats.backlog || 0;
+                pill.textContent = `${(n || 0).toLocaleString('en-IN')} awaiting reconciliation`;
+                pill.style.display = n ? '' : 'none';
+                pill.style.color = n ? 'var(--bad)' : '';
+            }
         }
 
         if (logResult.status === 'fulfilled' && logResult.value && logResult.value.success) {
@@ -561,7 +570,7 @@ async function loadCodLog(page = 1, userInitiated = false) {
                         <td>${row.awb || '<span style="color:var(--text-faint)">—</span>'}</td>
                         <td>${escHtml(row.carrier || '—')}</td>
                         <td>₹${parseFloat(row.amount || 0).toLocaleString('en-IN')}</td>
-                        <td><span class="badge badge-${row.payment_status === 'reconciled' ? 'reconciled' : row.payment_status}">${row.payment_status}</span></td>
+                        <td><span class="badge badge-${row.payment_status === 'reconciled' ? 'reconciled' : row.payment_status}" title="${escHtml(row.error_message || '')}">${row.payment_status}${row.attempts > 1 ? ` · ${row.attempts} tries` : ''}</span></td>
                         <td style="white-space:nowrap">${time}</td>
                         <td>${row.payment_status === 'pending' || row.payment_status === 'failed' ? `<button class="btn btn-xs btn-primary" data-action="reconcile-cod" data-id="${row.id}">Reconcile</button>` : ''}</td>
                     </tr>`;
@@ -588,6 +597,32 @@ async function reconcileCod(id) {
         loadCodLog(codState.page);
     } catch (err) {
         toast('Reconcile error: ' + err.message, 'err');
+    }
+}
+
+/**
+ * Drains the delivered-but-unpaid backlog the hourly sweep would otherwise
+ * chew through a tick at a time. Dry run first so the list can be reviewed
+ * before anything is written to Zoho.
+ */
+async function sweepCod() {
+    const btn = document.getElementById('btnSweepCod');
+    try {
+        if (btn) btn.disabled = true;
+        const plan = await apiFetch('/cod/sweep', { method: 'POST', body: JSON.stringify({ dryRun: true, limit: 50 }) });
+        if (plan.skipped) { toast(`Sweep skipped: ${plan.skipped}`, 'err'); return; }
+        const would = plan.wouldPay || [];
+        if (!would.length) { toast('Nothing to reconcile — no delivered COD order is missing a payment', 'ok'); return; }
+        const total = would.reduce((s, w) => s + (parseFloat(w.amount) || 0), 0);
+        const list = would.slice(0, 12).map(w => `#${w.order_id} (₹${w.amount})`).join(', ');
+        if (!confirm(`${would.length} delivered order(s) have no payment in Zoho, totalling ₹${total.toLocaleString('en-IN')}:\n${list}${would.length > 12 ? ' …' : ''}\n\nRecord these payments now?`)) return;
+        const res = await apiFetch('/cod/sweep', { method: 'POST', body: JSON.stringify({ dryRun: false, limit: 50 }) });
+        toast(`Sweep done: ${res.reconciled} reconciled, ${res.alreadyPaid} already paid, ${res.failed} failed`, res.failed ? 'err' : 'ok');
+        loadCodLog(1);
+    } catch (err) {
+        toast('Sweep error: ' + err.message, 'err');
+    } finally {
+        if (btn) btn.disabled = false;
     }
 }
 
@@ -1094,6 +1129,7 @@ document.addEventListener('click', (e) => {
         }
         case 'search-cod': loadCodLog(1); break;
         case 'reconcile-cod': reconcileCod(id); break;
+        case 'sweep-cod': sweepCod(); break;
 
         // Bundle & Config actions
         case 'test-connection': testConnection(); break;
