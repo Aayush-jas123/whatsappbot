@@ -170,6 +170,11 @@ const caches = {
   
   // Inventory movements (expensive JSONB scans on store_shoppers, cache to reduce load)
   inventory: new LRUCache(20, 120 * 1000),      // 20 entries, 2min TTL
+
+  // Open return/exchange feed from the returns server. The feed is global —
+  // not per-phone — so one fetch serves every customer-context rebuild inside
+  // the TTL instead of one upstream call per cold customer.
+  returnsFeed: new LRUCache(2, 60 * 1000),      // keys are only open:60 / open:90
 };
 
 // Cache key generator for queries

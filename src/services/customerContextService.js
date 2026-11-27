@@ -2,6 +2,7 @@ const axios = require('axios');
 const { dbAdapter } = require('../database/db');
 const { cachedQuery } = require('../utils/cache');
 const { getBreaker } = require('../utils/circuitBreaker');
+const { extractItemSize } = require('../utils/orderItems');
 
 // ============================================================
 // customerContextService — the Shoppers Hub "customer context"
@@ -36,6 +37,100 @@ async function fetchReturnsServerPipeline(windowDays) {
         console.warn(`⚠️ Returns server pipeline fetch failed: ${err.message}`);
         return { connected: false, reason: err.message, requests: [] };
     }
+}
+
+// ── Open-request feed (shared, projected) ────────────────────────────────
+// The returns server answers with a newest-first slice capped at 1000 rows
+// and every row carries its own item JSON. That feed is global, not
+// per-phone, so refetching it inside every cold customer-context rebuild
+// was the most expensive part of the build — and kept the raw blobs alive in
+// each per-phone cache entry.
+//
+// openRequestsIndex() fetches once per TTL and keeps only the fields the
+// desk and the storefront render, indexed by order number, so matching a
+// customer is a Map.get instead of a 1000-row scan.
+// ─────────────────────────────────────────────────────────────────────────
+const FEED_ROW_CAP = 1000;          // the endpoint's .range(0, 999)
+const FEED_WINDOW_DAYS = 90;
+const FEED_ITEM_LINES = 2;          // per request; the card shows two lines
+
+// Every spelling the feed and the hub use for the same order ("#55197").
+function orderKeys(value) {
+    const raw = String(value == null ? '' : value).trim();
+    if (!raw) return [];
+    const bare = raw.replace(/^#/, '');
+    return [...new Set([raw, bare, bare.replace(/\D/g, '')].filter(Boolean))];
+}
+
+// [{ n, v, q }] — the same compact item shape the desk order rows use.
+// Accepts an array, a JSON string or a single object; unknown shapes read
+// as no items rather than throwing.
+function projectItems(items) {
+    let list = items;
+    if (typeof list === 'string') {
+        try { list = JSON.parse(list); } catch (_) { list = null; }
+    }
+    if (!Array.isArray(list)) list = list ? [list] : [];
+    return list.slice(0, FEED_ITEM_LINES).map(i => {
+        const item = i || {};
+        const name = String(item.name || item.title || item.product || item.product_title || '').trim();
+        return {
+            n: (name || 'Item').slice(0, 90),
+            // extractItemSize already walks the variant fallback chain and
+            // returns null for Shopify's "Default Title", so nothing is shown
+            // for products with no real options.
+            v: extractItemSize(item) || '',
+            q: Number(item.quantity != null ? item.quantity : item.qty) || 1
+        };
+    });
+}
+
+// One request, projected. Reads both the snake_case pipeline rows and the
+// camelCase ai-data rows; keeps request_id alongside id because existing
+// consumers (support desk payload, AI reply engine) key on it.
+function projectRequest(r) {
+    const requestId = r.request_id || r.requestId || null;
+    return {
+        id: requestId,
+        request_id: requestId,
+        order_number: r.order_number != null ? r.order_number : (r.orderNumber != null ? r.orderNumber : null),
+        type: r.type === 'exchange' ? 'exchange' : 'return',
+        status: r.status || null,
+        reason: r.reason || r.customerReason || null,
+        created_at: r.created_at || r.createdAt || null,
+        items: projectItems(r.items)
+    };
+}
+
+function emptyFeed() {
+    return { connected: false, reason: 'unavailable', count: 0, truncated: true, index: new Map() };
+}
+
+async function openRequestsIndex(windowDays = FEED_WINDOW_DAYS) {
+    return await cachedQuery('returnsFeed', `open:${windowDays}`, async () => {
+        const res = await fetchReturnsServerPipeline(windowDays);
+        const rows = Array.isArray(res.requests) ? res.requests : [];
+        const index = new Map();
+        for (const row of rows) {
+            // One projected object shared by every key spelling of the order.
+            const entry = projectRequest(row);
+            for (const key of orderKeys(entry.order_number)) {
+                const bucket = index.get(key);
+                if (bucket) bucket.push(entry);
+                else index.set(key, [entry]);
+            }
+        }
+        return {
+            connected: res.connected,
+            reason: res.reason || null,
+            count: rows.length,
+            // At the cap the feed is only a newest-first slice, so a customer's
+            // own request may be missing from it — build() then falls back to
+            // the targeted per-order lookup.
+            truncated: rows.length >= FEED_ROW_CAP,
+            index
+        };
+    });
 }
 
 async function build(rawPhone) {
@@ -88,84 +183,84 @@ async function build(rawPhone) {
     ]);
     if (!ordersRows) throw new Error('customer context order scan failed');
 
-    // 4) External returns server pipeline (Shopify portal submissions)
-    let rsRequests = [];
+    // 4) External returns server pipeline (Shopify portal submissions).
+    //    Shared feed keyed by order number, so this is a handful of Map
+    //    lookups per customer instead of a 1000-row scan per cold build.
+    let feed;
     try {
-        const rsData = await fetchReturnsServerPipeline(90);
-        rsRequests = rsData.requests || [];
+        feed = await openRequestsIndex();
     } catch (rsErr) {
         console.warn('[customer-context] Returns server unavailable, skipping portal data:', rsErr.message);
+        feed = emptyFeed();
     }
 
-    // Filter returns-server requests to this customer's orders.
-    // Normalize by stripping '#' — the returns server stores Shopify format
-    // ("#55197") while store_shoppers stores bare order ids ("55197").
+    // Match on the bare order id — the returns server stores Shopify format
+    // ("#55197") while store_shoppers stores "55197", and orderKeys() indexes
+    // every spelling so either side finds the other.
     const normOrderId = v => String(v || '').replace(/^#/, '');
     const customerOrderIds = new Set(ordersRows.map(r => normOrderId(r.order_id)));
     const portalReturns = [];
     const portalExchanges = [];
-    for (const req of rsRequests) {
-        if (!customerOrderIds.has(normOrderId(req.order_number))) continue;
-        const target = req.type === 'exchange' ? portalExchanges : portalReturns;
-        target.push({
-            request_id: req.request_id,
-            order_number: req.order_number,
-            type: req.type,
-            status: req.status,
-            reason: req.reason || null,
-            items: req.items || [],
-            created_at: req.created_at
-        });
+    const seenRsIds = new Set();
+    const collectPortal = (orderId, bucket) => {
+        for (const row of bucket) {
+            // The same projected object is shared by several keys; take it once.
+            if (row.id && seenRsIds.has(row.id)) continue;
+            if (row.id) seenRsIds.add(row.id);
+            // Re-stamp with this customer's own spelling of the id so local and
+            // portal rows key identically downstream.
+            (row.type === 'exchange' ? portalExchanges : portalReturns).push({ ...row, order_number: orderId });
+        }
+    };
+    for (const id of customerOrderIds) {
+        for (const key of orderKeys(id)) {
+            const bucket = feed.index.get(key);
+            if (bucket) { collectPortal(id, bucket); break; }
+        }
     }
 
     // 4b) Targeted per-order lookup via the returns server's ai-data search.
-    // The global pipeline list above is capped at 1000 rows (newest first),
-    // so a specific customer's request can be truncated out of it entirely.
-    // The per-order search always finds that customer's own records.
-    const seenRsIds = new Set([...portalReturns, ...portalExchanges].map(r => r.request_id));
-    const lookupOrderIds = ordersRows.slice(0, 8).map(r => normOrderId(r.order_id)).filter(Boolean);
-    if (lookupOrderIds.length && process.env.RETURNS_SERVER_URL) {
-        try {
-            const rsBase = process.env.RETURNS_SERVER_URL.replace(/\/$/, '');
-            const rsToken = process.env.WHATSAPP_INTERNAL_TOKEN || '';
-            const lookups = await Promise.all(lookupOrderIds.map(id =>
-                getBreaker('internal', 'READ', 'returnsOrderLookup', request => request()).fire(() =>
-                    axios.get(`${rsBase}/api/internal/ai-data`, {
-                        params: { resource: 'requests', query: id, limit: 10 },
-                        headers: { 'x-internal-token': rsToken },
-                        timeout: 8000
-                    })
-                ).catch(() => null)
-            ));
-            for (const lk of lookups) {
-                const reqs = Array.isArray(lk?.data?.requests) ? lk.data.requests : [];
-                for (const r of reqs) {
-                    // ai-data returns camelCase; the pipeline returns snake_case
-                    const requestId = r.requestId || r.request_id;
-                    if (!requestId || seenRsIds.has(requestId)) continue;
-                    // The returns server's ai-data search uses substring/ILIKE
-                    // matching, so it can surface requests belonging to OTHER
-                    // customers whose order numbers share digits with ours.
-                    // Only keep requests whose order_number actually belongs
-                    // to this customer — otherwise the sidebar falsely shows
-                    // R&E for customers who have none.
-                    const rn = normOrderId(r.orderNumber || r.order_number);
-                    if (!rn || !customerOrderIds.has(rn)) continue;
-                    seenRsIds.add(requestId);
-                    const entry = {
-                        request_id: requestId,
-                        order_number: r.orderNumber || r.order_number,
-                        type: r.type,
-                        status: r.status,
-                        reason: r.reason || r.customerReason || null,
-                        items: r.items || [],
-                        created_at: r.createdAt || r.created_at
-                    };
-                    (entry.type === 'exchange' ? portalExchanges : portalReturns).push(entry);
+    // Worth the roundtrips only when the shared feed could not have contained
+    // this customer's request: it is a newest-first slice capped at 1000 rows,
+    // so past the cap a record can be truncated out entirely, and a failed
+    // feed fetch indexed nothing at all. Otherwise the index above is complete.
+    if ((feed.truncated || !feed.connected) && process.env.RETURNS_SERVER_URL) {
+        const lookupOrderIds = ordersRows.slice(0, 8).map(r => normOrderId(r.order_id)).filter(Boolean);
+        if (lookupOrderIds.length) {
+            try {
+                const rsBase = process.env.RETURNS_SERVER_URL.replace(/\/$/, '');
+                const rsToken = process.env.WHATSAPP_INTERNAL_TOKEN || '';
+                const lookups = await Promise.all(lookupOrderIds.map(id =>
+                    getBreaker('internal', 'READ', 'returnsOrderLookup', request => request()).fire(() =>
+                        axios.get(`${rsBase}/api/internal/ai-data`, {
+                            params: { resource: 'requests', query: id, limit: 10 },
+                            headers: { 'x-internal-token': rsToken },
+                            timeout: 8000
+                        })
+                    ).catch(() => null)
+                ));
+                for (const lk of lookups) {
+                    const reqs = Array.isArray(lk?.data?.requests) ? lk.data.requests : [];
+                    for (const r of reqs) {
+                        // ai-data returns camelCase; projectRequest reads both
+                        const requestId = r.requestId || r.request_id;
+                        if (!requestId || seenRsIds.has(requestId)) continue;
+                        // The returns server's ai-data search uses substring/ILIKE
+                        // matching, so it can surface requests belonging to OTHER
+                        // customers whose order numbers share digits with ours.
+                        // Only keep requests whose order_number actually belongs
+                        // to this customer — otherwise the sidebar falsely shows
+                        // R&E for customers who have none.
+                        const rn = normOrderId(r.orderNumber || r.order_number);
+                        if (!rn || !customerOrderIds.has(rn)) continue;
+                        seenRsIds.add(requestId);
+                        const entry = projectRequest(r);
+                        (entry.type === 'exchange' ? portalExchanges : portalReturns).push(entry);
+                    }
                 }
+            } catch (lkErr) {
+                console.warn('[customer-context] Targeted RNX lookup failed:', lkErr.message);
             }
-        } catch (lkErr) {
-            console.warn('[customer-context] Targeted RNX lookup failed:', lkErr.message);
         }
     }
 
@@ -215,13 +310,16 @@ async function build(rawPhone) {
             delivered_at: r.delivered_at
         })),
         returns: [
-            ...localReturns.map(r => ({ ...r, source: 'local' })),
-            ...portalReturns.map(r => ({ ...r, source: 'portal' }))
+            ...localReturns.map(r => ({ ...r, items: projectItems(r.items), source: 'local' })),
+            ...portalReturns
         ],
         exchanges: [
-            ...localExchanges.map(r => ({ ...r, source: 'local' })),
-            ...portalExchanges.map(r => ({ ...r, source: 'portal' }))
-        ]
+            // old_items is what the customer is sending back — the same line the
+            // portal card shows — so it projects into `items` for both sources.
+            ...localExchanges.map(r => ({ ...r, items: projectItems(r.old_items), source: 'local' })),
+            ...portalExchanges
+        ],
+        returnsConnected: feed.connected
     };
 }
 
@@ -233,4 +331,4 @@ async function buildCached(rawPhone) {
     return await cachedQuery('shoppers', `ctx:${phone}`, () => build(phone));
 }
 
-module.exports = { build, buildCached, fetchReturnsServerPipeline };
+module.exports = { build, buildCached, fetchReturnsServerPipeline, openRequestsIndex, projectRequest, projectItems, orderKeys };

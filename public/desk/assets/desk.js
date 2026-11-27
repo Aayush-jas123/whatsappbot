@@ -516,12 +516,6 @@
       +   '<div class="desk-action-col">'
       +     issueAndConversationCard(d, t)
       +   '</div>'
-      +   '<div class="desk-context-col">'
-      +     customerCard(d, t, h, o)
-      +     orderHistoryCard(d, t, o)
-      +     returnsExchangesCard(d)
-      +     riskCard(d)
-      +   '</div>'
       +   '<div class="desk-context-col" id="DeskContextCol">' + contextColHtml() + '</div>'
       + '</div>';
 
@@ -566,6 +560,7 @@
     var t = d.ticket, o = d.order || {}, h = d.history || {};
     return customerCard(d, t, h, o)
       + orderHistoryCard(d, t, o)
+      + returnsExchangesCard(d)
       + riskCard(d);
   }
   function renderContextCol() {
@@ -836,28 +831,6 @@
         + '</div>';
     }).join('');
 
-    var totalPastCount = (ctx.orders || []).length;
-    // Open/past returns & exchanges
-    var ctx = d.context || {};
-    var reqs = [];
-    (ctx.returns || []).forEach(function (r) { reqs.push({ kind: 'Return', r: r }); });
-    (ctx.exchanges || []).forEach(function (r) { reqs.push({ kind: 'Exchange', r: r }); });
-    reqs.sort(function (a, b) { return new Date(b.r.created_at || 0) - new Date(a.r.created_at || 0); });
-
-    var reqRows = reqs.map(function (x) {
-      return '<div class="desk-history-row req-row">'
-        + '<div class="history-main">'
-        +   '<span class="desk-tag request">' + x.kind + '</span>'
-        +   orderAnchor(hubOrderHref(x.r.order_id), '<span class="history-id">#' + esc(x.r.order_id) + '</span>')
-        +   '<span class="desk-pill">' + esc(String(x.r.status || '').replace(/_/g, ' ')) + '</span>'
-        + '</div>'
-        + '<div class="history-sub">'
-        +   '<span class="history-src">' + (x.r.source === 'portal' ? 'Portal request' : 'Support request') + '</span> &middot; '
-        +   '<span class="history-date">' + fmtTime(x.r.created_at) + '</span>'
-        + '</div>'
-        + '</div>';
-    }).join('');
-
     var isExpanded = !!S.orderExpanded;
     var orderNum = (o && o.id) || t.order_id;
     var stageLabel = o && o.stage ? (STAGE_LABELS[o.stage] || o.stage) : '';
@@ -876,49 +849,31 @@
       +     '<span class="desk-collapse-arrow">' + IC.chevron + '</span>'
       +   '</div>'
       + '</div>'
-      // Collapsible Order Details Body
+      // Collapsible Order Details Body: the one list that matters. The ticket
+      // order leads and is open by default, so its full detail (courier, AWB,
+      // payment, address, itemised lines) already renders through
+      // orderRowDetail; there is no separate "current order" panel to keep.
       + '<div class="desk-order-body" id="DeskOrderBody">'
-      // Current Order Details Subsection
-      +   '<div class="desk-current-order-box">'
-      +     '<div class="desk-order-header-row">'
-      +       '<div class="order-id-group">'
-      +         '<span class="order-prefix">Order</span>'
-      +         '<span class="order-num">#' + esc(o.id || t.order_id || '\u2013') + '</span>'
-      +         '<span class="desk-pill stage">' + esc(STAGE_LABELS[o.stage] || o.stage || 'Processing') + '</span>'
-      +       '</div>'
-      +       '<div class="order-finance-group">'
-      +         '<span class="desk-payment-pill">' + esc(o.payment || 'COD') + '</span>'
-      +         '<span class="order-total-price">' + money(o.total) + '</span>'
-      +       '</div>'
-      +     '</div>'
-      +     '<div class="desk-order-details-grid">'
-      +       '<div class="desk-kv"><span class="k">Courier &amp; AWB</span><span class="v">' + esc(o.courier || 'Courier') + ' &middot; ' + track + '</span></div>'
-      +       (o.placed ? '<div class="desk-kv"><span class="k">Order Placed</span><span class="v">' + fmtTime(o.placed) + '</span></div>' : '')
-      +       (o.address ? '<div class="desk-kv full-w"><span class="k">Shipping Address</span><span class="v">&#128205; ' + esc(o.address) + '</span></div>' : '')
-      +     '</div>'
-      +     (items ? '<div class="desk-items-wrap"><div class="desk-items-title">Ordered Items</div><table class="desk-items"><thead><tr><th>Item Details</th><th class="num">Qty</th><th class="num">Price</th><th class="num">Subtotal</th></tr></thead><tbody>' + items + '</tbody></table></div>' : '')
-      +   '</div>'
-      // Past Order History Subsection (hidden when only 1 order exists)
-      +   (totalPastCount > 1 && pastOrders ? (
-            '<div class="desk-past-orders-section">'
-            + '<div class="desk-section-subhead">Past Orders <span class="desk-muted">(' + totalPastCount + ' recorded)</span></div>'
-            + '<div class="desk-history-list">' + pastOrders + '</div>'
-            + '</div>'
-          ) : '')
       +   '<div class="desk-section-subhead">All Orders <span class="desk-muted">(' + orders.length + ' \u2014 ticket order first)</span></div>'
       +   '<div class="desk-history-list">' + (rows || '<div class="desk-set-sub">No orders on record for this customer.</div>') + '</div>'
-      +   (reqs.length ? '<div class="desk-past-orders-section"><div class="desk-sub-section-title">Returns &amp; Exchanges</div><div class="desk-history-list">' + reqRows + '</div></div>' : '')
-      +   '</div>'
       + '</div>';
   }
 
   // ── 3b. Returns & Exchanges Portal Card (Collapsible, directly under Order History) ──
+  // Host comes from the context payload (server-side RETURNS_SERVER_URL) so a
+  // non-production deployment does not deep-link into the production returns
+  // admin; the literal below is only the fallback when the server says nothing.
   var RETURNS_PORTAL_URL = 'https://exchange-return-tracking.onrender.com/admin';
+  function returnsPortalBase() {
+    var fromServer = S.detail && S.detail.returnsAdminUrl;
+    return String(fromServer || RETURNS_PORTAL_URL).replace(/\/$/, '');
+  }
   function toggleReturnsExchanges(forceExpand) {
     toggleCollapsible('returnsExpanded', 'DeskReturnsCard', '.desk-ret-collapse-hint', forceExpand, false);
   }
   function openReturnPortal(requestId) {
-    var url = requestId ? RETURNS_PORTAL_URL + '#requestId=' + encodeURIComponent(requestId) : RETURNS_PORTAL_URL;
+    var base = returnsPortalBase();
+    var url = requestId ? base + '#requestId=' + encodeURIComponent(requestId) : base;
     window.open(url, '_blank', 'noopener,noreferrer');
   }
   function returnsExchangesCard(d) {
@@ -930,6 +885,11 @@
 
     var count = reqs.length;
     var isExpanded = (S.returnsExpanded !== false);
+    // An empty list is a fact about the customer only when the returns server
+    // was actually reachable; otherwise it may simply be unread.
+    var offlineNote = (count && d.returnsConnected === false)
+      ? '<div class="desk-re-offline">Returns server not connected \u2014 portal requests may be missing.</div>'
+      : '';
 
     var itemsHtml = count ? reqs.map(function (x) {
       var r = x.r || {};
@@ -940,6 +900,15 @@
       var reqId = String(r.id || r.request_id || '');
       var typeCls = x.kind === 'EXCHANGE' ? 'type-exchange' : 'type-return';
       var statusCls = /^(completed|delivered|approved|credited)$/.test(String(r.status || '').toLowerCase()) ? 'status-done' : 'status-active';
+      // Items arrive already projected to at most two { n, v, q } lines.
+      var lines = (Array.isArray(r.items) ? r.items : []).map(function (i) {
+        i = i || {};
+        return '<div class="desk-re-line">'
+          + '<span class="desk-re-name">' + esc(i.n || 'Item') + '</span>'
+          + (i.v ? ' <span class="desk-item-var">(' + esc(i.v) + ')</span>' : '')
+          + '<span class="desk-re-qty">\u00d7' + (i.q || 1) + '</span>'
+          + '</div>';
+      }).join('');
       return '<div class="desk-re-item" role="button" tabindex="0"'
         + ' onclick="DESK.openReturnPortal(\'' + esc(reqId) + '\')"'
         + ' onkeydown="if(event.key===\'Enter\'||event.key===\' \'){event.preventDefault();DESK.openReturnPortal(\'' + esc(reqId) + '\');}"'
@@ -954,8 +923,13 @@
         +   '<span class="desk-re-source">' + esc(srcLabel) + '</span>'
         + '</div>'
         + (r.reason ? '<div class="desk-re-reason" title="' + esc(r.reason) + '">' + esc(r.reason) + '</div>' : '')
+        + (lines ? '<div class="desk-re-items">' + lines + '</div>' : '')
         + '</div>';
-    }).join('') : '<div class="desk-re-empty">No return or exchange requests recorded for this customer.</div>';
+    }).join('') : '<div class="desk-re-empty">'
+        + (d.returnsConnected === false
+            ? 'Nothing on record and the returns server is not connected.'
+            : 'No return or exchange requests recorded for this customer.')
+        + '</div>';
 
     return '<div class="desk-card desk-returns-card' + (isExpanded ? ' is-expanded' : ' is-collapsed') + '" id="DeskReturnsCard">'
       + '<div class="desk-card-head desk-collapsible-bar" onclick="DESK.toggleReturnsExchanges()" role="button" tabindex="0"'
@@ -973,6 +947,7 @@
       + '</div>'
       + '<div class="desk-returns-body" id="DeskReturnsBody">'
       +   '<div class="desk-re-list">' + itemsHtml + '</div>'
+      +   offlineNote
       + '</div>'
       + '</div>';
   }

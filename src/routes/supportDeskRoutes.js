@@ -291,9 +291,14 @@ router.get('/tickets/:id/context', async (req, res) => {
             Support.countTicketsByPhone(t.customer_phone)
         ]);
         const enriched = { ...t, history };
-        const trimReq = r => ({
+        // Compact request row for the desk's Returns / Exchanges card. `items`
+        // is already projected to { n, v, q } lines by customerContextService,
+        // so no raw item JSON crosses to the browser here.
+        const trimReq = (r, kind) => ({
             id: r.request_id || r.return_id || r.exchange_id, order_id: r.order_id || r.order_number,
-            status: r.status, reason: r.reason || null, created_at: r.created_at, source: r.source
+            type: r.type || kind,
+            status: r.status, reason: r.reason || null, created_at: r.created_at, source: r.source,
+            items: r.items || []
         });
         res.json({
             order,
@@ -301,10 +306,15 @@ router.get('/tickets/:id/context', async (req, res) => {
             history,
             ticketCount,
             context: ctx ? {
-                returns: (ctx.returns || []).slice(0, 10).map(trimReq),
-                exchanges: (ctx.exchanges || []).slice(0, 10).map(trimReq),
+                returns: (ctx.returns || []).slice(0, 10).map(r => trimReq(r, 'return')),
+                exchanges: (ctx.exchanges || []).slice(0, 10).map(r => trimReq(r, 'exchange')),
                 rto: (ctx.rto || []).slice(0, 10).map(o => ({ order_id: o.order_id, awb: o.awb, status: o.status }))
             } : null,
+            // "No requests" and "returns server unreachable" must read
+            // differently, and the deep link is built from config rather than
+            // a hardcoded host as the portal panel does.
+            returnsConnected: ctx ? ctx.returnsConnected !== false : false,
+            returnsAdminUrl: `${(process.env.RETURNS_SERVER_URL || 'https://exchange-return-tracking.onrender.com').replace(/\/$/, '')}/admin`,
             risk: order ? Support.riskOf(enriched, order, costCfg, ticketCount) : null,
             econ: order ? Support.econOf(t, order, costCfg) : null,
             requestNote: t.sub ? (Support.REQUEST_NOTES[t.sub] || (() => null))(order || {}) : null

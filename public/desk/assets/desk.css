@@ -1366,6 +1366,43 @@ button, input, select, textarea {
   padding: 8px 4px;
 }
 
+/* Item lines inside a request row. The server projects each request down to
+   two { n, v, q } entries, so this only renders what is already bounded. */
+.desk-re-items {
+  margin-top: 7px;
+  padding-top: 7px;
+  border-top: 1px dashed var(--desk-border);
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+}
+.desk-re-line {
+  display: flex;
+  align-items: baseline;
+  gap: 4px;
+  font-size: 12px;
+  line-height: 1.4;
+}
+.desk-re-name {
+  font-family: 'JetBrains Mono', monospace;
+  font-weight: 700;
+  color: var(--desk-ink);
+  word-break: break-word;
+}
+.desk-re-qty {
+  margin-left: auto;
+  font-family: 'JetBrains Mono', monospace;
+  font-weight: 700;
+  color: var(--desk-sub);
+  flex-shrink: 0;
+}
+.desk-re-offline {
+  margin-top: 8px;
+  font-size: 11.5px;
+  color: var(--desk-muted);
+  text-align: center;
+}
+
 /* ---------- Current Order Details Box ---------- */
 .desk-current-order-box {
   background: var(--desk-card-sub);
