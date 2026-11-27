@@ -1150,8 +1150,9 @@ button, input, select, textarea {
   background: var(--desk-fill);
 }
 
-/* ---------- Collapsible Order History Card ---------- */
-.desk-order-card {
+/* ---------- Collapsible Order History & Returns / Exchanges Cards ---------- */
+.desk-order-card,
+.desk-returns-card {
   padding: 0;
   overflow: hidden;
   transition: border-color .15s ease, box-shadow .15s ease;
@@ -1173,7 +1174,8 @@ button, input, select, textarea {
 .desk-collapsible-bar:hover {
   background: var(--desk-fill);
 }
-.desk-order-card.is-expanded .desk-collapsible-bar {
+.desk-order-card.is-expanded .desk-collapsible-bar,
+.desk-returns-card.is-expanded .desk-collapsible-bar {
   border-bottom: 1px solid var(--desk-border);
 }
 .desk-collapse-hint {
@@ -1214,10 +1216,12 @@ button, input, select, textarea {
   color: var(--desk-sub);
   transition: transform .25s ease;
 }
-.desk-order-card.is-expanded .desk-collapse-arrow {
+.desk-order-card.is-expanded .desk-collapse-arrow,
+.desk-returns-card.is-expanded .desk-collapse-arrow {
   transform: rotate(180deg);
 }
-.desk-order-body {
+.desk-order-body,
+.desk-returns-body {
   padding: 16px 18px;
   max-height: 3000px;
   opacity: 1;
@@ -1225,13 +1229,141 @@ button, input, select, textarea {
   transition: max-height .35s cubic-bezier(0.4, 0, 0.2, 1), opacity .25s ease, padding .35s ease;
   will-change: max-height, opacity;
 }
-.desk-order-card.is-collapsed .desk-order-body {
+.desk-returns-body {
+  padding: 12px 16px;
+  max-height: 1200px;
+}
+.desk-order-card.is-collapsed .desk-order-body,
+.desk-returns-card.is-collapsed .desk-returns-body {
   max-height: 0;
   opacity: 0;
   padding-top: 0;
   padding-bottom: 0;
   overflow: hidden;
   pointer-events: none;
+}
+
+/* ---------- Returns / Exchanges Portal Items (Monochrome) ---------- */
+.desk-head-svg {
+  color: var(--desk-ink);
+  flex-shrink: 0;
+}
+.desk-re-count {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 20px;
+  height: 18px;
+  padding: 0 6px;
+  border-radius: 999px;
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 10.5px;
+  font-weight: 700;
+  background: var(--desk-fill);
+  color: var(--desk-sub);
+  border: 1px solid var(--desk-border);
+}
+.desk-re-count.has-items {
+  background: var(--desk-ink);
+  color: #FFFFFF;
+  border-color: var(--desk-ink);
+}
+.desk-re-list {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+.desk-re-item {
+  background: var(--desk-card-sub);
+  border: 1px solid var(--desk-border);
+  border-radius: var(--radius-sm);
+  padding: 10px 12px;
+  cursor: pointer;
+  transition: background .15s ease, border-color .15s ease;
+}
+.desk-re-item:hover {
+  background: var(--desk-fill);
+  border-color: var(--desk-border-strong);
+}
+.desk-re-top {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  margin-bottom: 6px;
+}
+.desk-re-type {
+  font-size: 10px;
+  font-weight: 800;
+  letter-spacing: .05em;
+  text-transform: uppercase;
+  padding: 2px 7px;
+  border-radius: 4px;
+}
+.desk-re-type.type-exchange {
+  background: var(--desk-ink);
+  color: #FFFFFF;
+}
+.desk-re-type.type-return {
+  background: var(--desk-fill);
+  color: var(--desk-ink);
+  border: 1px solid var(--desk-border-strong);
+}
+.desk-re-status {
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: .03em;
+  text-transform: uppercase;
+  padding: 2px 7px;
+  border-radius: 4px;
+}
+.desk-re-status.status-active {
+  background: var(--desk-card);
+  color: var(--desk-ink);
+  border: 1px solid var(--desk-border-strong);
+}
+.desk-re-status.status-done {
+  background: var(--desk-fill);
+  color: var(--desk-sub);
+  border: 1px solid var(--desk-border);
+}
+.desk-re-meta {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  font-size: 12px;
+  color: var(--desk-sub);
+}
+.desk-re-ord {
+  font-family: 'JetBrains Mono', monospace;
+  font-weight: 700;
+  color: var(--desk-ink);
+}
+.desk-re-source {
+  font-size: 10.5px;
+  font-weight: 600;
+  padding: 1px 6px;
+  border-radius: 4px;
+  background: var(--desk-card);
+  color: var(--desk-sub);
+  border: 1px solid var(--desk-border);
+}
+.desk-re-reason {
+  margin-top: 5px;
+  font-size: 11.5px;
+  color: var(--desk-muted);
+  font-style: italic;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.desk-re-empty {
+  font-size: 12px;
+  color: var(--desk-muted);
+  text-align: center;
+  padding: 8px 4px;
 }
 
 /* ---------- Current Order Details Box ---------- */
